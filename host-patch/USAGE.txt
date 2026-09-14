@@ -1,0 +1,231 @@
+OPENCLAW AGENT HARNESS PIN -- OPTIONAL EXPERIMENTAL HOST PATCH
+DSH Native 0.3.0
+
+Project: https://github.com/ericzhaouu/dsh-native
+Author: https://github.com/ericzhaouu
+MIT; Copyright (c) 2026 ericzhaouu.
+
+This is an explicit HOST EXTENSION, NOT a stock OpenClaw 2026.9.2 SDK
+configuration field and not a plugin that silently patches a live Gateway.
+The plugin can also use legacy per-model selection without this patch.
+
+EXACT ARTIFACT IDENTITY
+
+  OpenClaw version: 2026.9.2
+  Source commit: 3928bad9badfcb6c7d140530435e806fb8092190
+  Patch ID: openclaw-agent-harness-pin-v1
+  Upstream: https://github.com/openclaw/openclaw
+  Source: https://github.com/openclaw/openclaw/commit/3928bad9badfcb6c7d140530435e806fb8092190
+
+spec.mjs pins exact filenames and SHA-256 hashes for 12 changed files: five
+runtime JS modules and seven public type declarations. It also defines the
+exact replacement anchors. Package name/version, target hashes and anchors
+must match; unknown builds and subsequent local changes are refused.
+
+This is NOT a tarball checksum, full-installation hash, dependency signature or
+independent verification of the declared source commit. Obtain and verify the
+genuine official artifact; the same version string or a self-built checkout at
+the same commit is insufficient. No npm registry availability is assumed.
+
+The plugin's declared SDK/peer range is not a promise of patch compatibility
+with all releases in that range. Do not use latest, skip hashes or rewrite
+the spec to force application. An OpenClaw update requires maintenance and
+revalidation/rebasing, or replacement by an upstream-supported contract.
+
+WHAT THE CONFIGURATION MEANS
+
+  agents.entries.dsh-experiment.runtime:
+    type: embedded
+    harness: dsh-native
+
+This pin selects a harness, not a model. OpenClaw continues resolving the
+Agent's current/default model, provider, authentication, parameters and limits.
+Do not change global defaults, credentials or policies merely to select DSH.
+If the Agent has no model override, it inherits the normal default.
+
+The pin takes precedence over model/provider runtime selection, including
+fallback candidates. That DOES NOT add provider support. DSH Native 0.3.0
+supports only deepseek / openai-completions and github-copilot GPT /
+openai-responses. Unsupported pins fail with a typed error, not a substitute
+model or an escape to the built-in runtime.
+
+- The pinned harness must exist and support the host-prepared route/auth.
+- A harness-declared fallbackRuntime=openclaw cannot override the Agent pin.
+- Existing-session or explicit-runtime ownership conflicts fail visibly.
+- Listing unsupported models does not make them executable by the harness.
+- Model fallback/replay policy stays host-owned; DSH may refuse replay after
+  consuming a native turn or after potential external effects.
+- Unpinned Agents retain existing behavior, including prior model policies.
+- ACP runtime entries cannot carry this embedded harness field.
+- Use an explicit lowercase harness id; auto/default are invalid pin values.
+
+Model inheritance does NOT migrate a same-session transcript. Use /new after
+runtime, model/provider, account/token, endpoint, request identity or session
+ownership changes. Never reinterpret old native history as a different route.
+
+READ-ONLY CHECK
+
+Run from the dsh-native project/package root. Commands below are PowerShell;
+replace the placeholder with an absolute path to the actual Gateway host:
+
+  $HostRoot = "C:\PATH\TO\openclaw-package"
+  node .\host-patch\apply.mjs --root $HostRoot --check
+
+The root is the OpenClaw PACKAGE containing openclaw.mjs, package.json and dist,
+not user state, the executable shim/bin directory or an unrelated development
+SDK copy. From inside host-patch, use node .\apply.mjs with the same arguments.
+Omitting the action defaults to check; select only one action.
+
+Check derives unpatched/applied/partial from actual target files. Already
+patched files require a matching receipt, valid original backups and the
+recomputed transformation; a receipt alone is not evidence of correct state.
+An initial check can be read-only while online, but it grants no permission
+to mutate a running installation.
+
+MAINTENANCE: STOP BEFORE INSTALL / PATCH / CONFIGURATION
+
+1. Review the plugin code, declared capabilities and spec.mjs. Back up the
+   existing configuration, plugin artifact and host installation.
+2. Complete/cancel active work and verify host tools/children have stopped.
+   One Gateway affects ALL of its connections, not just dsh-experiment.
+3. Stop the correct installation/profile and prevent supervisor respawn:
+
+     openclaw gateway stop --force
+     openclaw gateway status --no-probe
+
+   The operator must verify actual shutdown; service status does not prove
+   every old child/tool has exited. Cooperative suspension is not shutdown.
+   Default hybrid configuration reload can restart the shared
+   Gateway after plugin/runtime changes. Do not write live config first.
+4. Install the reviewed plugin while Gateway remains stopped:
+
+     openclaw plugins install "C:\PATH\TO\openclaw-dsh-native-0.3.0.tgz" --force --accept-capabilities
+
+   --force confirms the local source/overwrite; official --accept-capabilities
+   accepts declared capabilities of reviewed code, not a policy bypass.
+   If managed npm optional-peer reconciliation fails, use the prepared-directory
+   option documented in the project README.md / USAGE.txt. That directory
+   must already contain built output and complete runtime dependencies; the
+   directory install path does not build or install dependencies itself.
+5. Recheck and apply to the stopped host:
+
+     node .\host-patch\apply.mjs --root $HostRoot --check
+     node .\host-patch\apply.mjs --root $HostRoot --apply --offline-confirmed
+     node .\host-patch\apply.mjs --root $HostRoot --check
+
+   Require applied before proceeding. Stop on any hash mismatch or partial
+   transaction; do not start Gateway with a partial patch.
+6. Merge examples\openclaw.agent-pinned.json into only the intended existing
+   Agent. Preserve its workspace, global/default model, authentication, tool
+   policies and every other Agent. Remove only this Agent's obsolete
+   models[...].agentRuntime leaves, preserving other fields in those entries.
+   Do not rewrite global model/provider runtime policies.
+7. Enable and start, then use /new in the target Agent's chat:
+
+     openclaw plugins enable dsh-native
+     openclaw gateway start
+     openclaw gateway status
+
+The patch tool NEVER stops/restarts/reloads/signals Gateway, changes config,
+or proves the installation offline. --offline-confirmed is an OPERATOR
+ASSERTION required for writes. Do not pass it for a running Gateway.
+There is no supported live-patching procedure.
+
+The compiled region sources affected are:
+  src\config\zod-schema.agent-runtime.ts
+  src\agents\model-runtime-policy.ts
+  src\agents\harness\availability.ts
+  src\agents\harness\selection.ts
+  src\agents\model-fallback-attempt.ts
+
+Public bundled AgentRuntimeConfig declarations are updated with runtime
+schema/logic. spec.mjs is an exact, reviewable artifact patch, not a
+version-agnostic search-and-replace tool.
+
+UNPIN / DISABLE WITHOUT RESTORING HOST CODE
+
+Stop active work and Gateway before configuration maintenance. To remove
+only the target Agent's pin:
+
+  openclaw config unset agents.entries.dsh-experiment.runtime.harness
+
+Or replace its WHOLE runtime object with {"type":"embedded"}. Merely merging
+an object that omits harness, including the unpinned example, does NOT delete
+the existing field. Unpin restores normal host selection, not necessarily
+the built-in runtime: older model-level pins may become effective again.
+
+To explicitly require the built-in runtime on the still-patched host:
+
+  openclaw config set agents.entries.dsh-experiment.runtime.harness openclaw
+
+Do not disable dsh-native globally if other Agents still select it. Plugin
+enable/disable does not clear runtime selection or migrate native histories.
+Handle remaining intended selections, start Gateway, and use /new.
+
+RESTORE ORIGINAL HOST
+
+1. Stop active work and Gateway, preventing automatic respawn.
+2. FIRST remove all configuration fields introduced by this patch, including
+   runtime.harness="openclaw", and restore intended pre-patch runtime choices.
+   The stock strict schema rejects runtime.harness rather than ignoring it.
+3. Run:
+
+     node .\host-patch\apply.mjs --root $HostRoot --restore --offline-confirmed
+     node .\host-patch\apply.mjs --root $HostRoot --check
+
+4. Require unpatched, then start Gateway and use fresh conversations.
+
+Backups and receipt.json remain beneath the host installation's
+.dsh-agent-harness-patch directory. They record original/patched hashes,
+file modes and transaction identity/status. Never delete them before restore.
+Restore refuses to overwrite unexpected modifications or use corrupt required
+backups. Successful restore retains backups/receipt with restored status.
+
+TRANSACTIONS / INTERRUPTIONS / STALE PATCH LOCKS
+
+Apply saves original bytes and an applying receipt before replacing files.
+Individual file replacements are atomic; the whole multi-file patch is NOT
+atomic, and failure does NOT automatically roll everything back. Applying an
+already fully applied, validated patch is a no-op.
+
+If interrupted, keep Gateway stopped. Run --check and inspect the receipt
+and originals. For a recognized partial state, complete --apply or roll back
+with --restore. Unknown modifications/corrupt required backups are refused;
+do not start Gateway or delete records to hide the problem.
+
+Only after confirming a stale PATCH lock and offline installation, use:
+
+  node .\host-patch\apply.mjs --root $HostRoot --apply --offline-confirmed --recover-stale-lock
+
+Or roll back instead:
+
+  node .\host-patch\apply.mjs --root $HostRoot --restore --offline-confirmed --recover-stale-lock
+
+This is a flag, not a separate recover command. Recovery requires a recorded
+same-machine owner process that has exited. Live owners, unknown ownership
+and foreign-machine locks are refused; the old owner record is retained.
+A crashed recovery guard itself requires operator inspection.
+
+The owner check concerns the patch transaction process, NOT whether Gateway
+is stopped. --recover-stale-lock does not shut down anything and cannot unlock
+a DSH native-session owner.lock. Native uncertain outcomes still require
+effect inspection and a new conversation, not automatic replay/deletion.
+
+MAINTENANCE AND TEST CLAIMS
+
+Host updates can overwrite patch targets; preserve the original installation
+and rollback plan, recheck exact artifacts and maintain/rebase this patch.
+Do not force it onto an unrecognized release or assume latest compatible.
+
+The repository contains isolated real-SDK and copied-host integration fixtures
+for hashes, restoration, Agent inheritance, unpinned behavior and fallback
+ownership. They do not prove live account entitlements or production Gateway
+readiness. Run the tests against the chosen commit and record the actual
+Node/SDK artifacts rather than treating historical results as a current pass.
+
+PUBLIC INFORMATION HYGIENE
+
+This public guide contains no deployment instructions tied to a private host.
+Do not publish installation-local backups, receipts, configs, logs, native
+state, real paths, accounts, IPs or session identifiers. Share only sanitized
+reproductions. Upstream copyrights and URLs retain their genuine owners.

@@ -1,0 +1,33 @@
+{
+  "plugins": {
+    "entries": {
+      "dsh-native": {
+        "enabled": true,
+        "config": {
+          "startupTimeoutMs": 120000,
+          "allowedCopilotBaseUrls": ["https://api.individual.githubcopilot.com"]
+        }
+      }
+    }
+  },
+  "agents": {
+    "entries": {
+      "dsh-copilot-experiment": {
+        "model": { "primary": "github-copilot/gpt-6-astra" },
+        "models": {
+          "github-copilot/gpt-6-astra": {
+            "agentRuntime": { "id": "dsh-native" }
+          },
+          "github-copilot/gpt-5.6-sol": {
+            "agentRuntime": { "id": "dsh-native" }
+          }
+        },
+        "sandbox": { "mode": "off" },
+        "tools": {
+          "profile": "coding",
+          "exec": { "host": "gateway" }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "plugins": {
+    "entries": {
+      "dsh-native": {
+        "enabled": true,
+        "config": {
+          "startupTimeoutMs": 60000,
+          "shutdownTimeoutMs": 15000,
+          "streamIdleTimeoutMs": 120000,
+          "allowedBaseUrls": ["https://api.deepseek.com"]
+        }
+      }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "models": {
+        "deepseek/deepseek-v4-pro": {
+          "agentRuntime": { "id": "dsh-native" }
+        }
+      }
+    }
+  }
+}

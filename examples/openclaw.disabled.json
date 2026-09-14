@@ -1,0 +1,16 @@
+{
+  "plugins": {
+    "entries": {
+      "dsh-native": { "enabled": false }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "models": {
+        "deepseek/deepseek-v4-pro": {
+          "agentRuntime": { "id": "openclaw" }
+        }
+      }
+    }
+  }
+}

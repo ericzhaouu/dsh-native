@@ -1,0 +1,17 @@
+{
+  "plugins": {
+    "entries": {
+      "dsh-native": { "enabled": true }
+    }
+  },
+  "agents": {
+    "entries": {
+      "dsh-experiment": {
+        "runtime": {
+          "type": "embedded",
+          "harness": "dsh-native"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "agents": {
+    "entries": {
+      "dsh-experiment": {
+        "runtime": {
+          "type": "embedded"
+        }
+      }
+    }
+  }
+}

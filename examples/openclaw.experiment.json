@@ -1,0 +1,25 @@
+{
+  "plugins": {
+    "entries": {
+      "dsh-native": { "enabled": true }
+    }
+  },
+  "agents": {
+    "entries": {
+      "dsh-experiment": {
+        "workspace": "C:\\PATH\\TO\\EXPERIMENT",
+        "model": { "primary": "deepseek/deepseek-v4-pro" },
+        "models": {
+          "deepseek/deepseek-v4-pro": {
+            "agentRuntime": { "id": "dsh-native" }
+          }
+        },
+        "sandbox": { "mode": "off" },
+        "tools": {
+          "profile": "coding",
+          "exec": { "host": "gateway" }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,41 @@
+{
+  "id": "dsh-native",
+  "name": "DeepSeek Harness Native",
+  "description": "Explicitly selected native DSH runtime with OpenClaw-owned tools.",
+  "activation": {
+    "onStartup": false,
+    "onAgentHarnesses": ["dsh-native"]
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "stateDir": {
+        "type": "string",
+        "description": "Absolute directory for private DSH sessions; default ~/.openclaw/dsh-native."
+      },
+      "startupTimeoutMs": { "type": "integer", "minimum": 100, "maximum": 3600000, "default": 60000 },
+      "shutdownTimeoutMs": { "type": "integer", "minimum": 100, "maximum": 3600000, "default": 15000 },
+      "streamIdleTimeoutMs": { "type": "integer", "minimum": 100, "maximum": 3600000, "default": 120000 },
+      "allowedBaseUrls": {
+        "type": "array",
+        "minItems": 1,
+        "items": { "type": "string" },
+        "default": ["https://api.deepseek.com"],
+        "description": "Exact prepared model endpoints the DSH adapter may use. HTTP is restricted to loopback."
+      },
+      "allowedCopilotBaseUrls": {
+        "type": "array",
+        "minItems": 1,
+        "items": { "type": "string" },
+        "default": [
+          "https://api.individual.githubcopilot.com",
+          "https://api.business.githubcopilot.com",
+          "https://api.enterprise.githubcopilot.com",
+          "https://api.githubcopilot.com"
+        ],
+        "description": "Exact Copilot account endpoints; separately scoped from DeepSeek. Custom or Enterprise tenant endpoints require explicit configuration."
+      }
+    }
+  }
+}

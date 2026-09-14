@@ -1,0 +1,389 @@
+DSH NATIVE FOR OPENCLAW -- EXPERIMENTAL 0.3.0
+
+Source: https://github.com/ericzhaouu/dsh-native
+Author: https://github.com/ericzhaouu
+Package name: openclaw-dsh-native
+Plugin / harness ID: dsh-native
+Example Agent: dsh-experiment
+License: MIT; Copyright (c) 2026 ericzhaouu.
+The Chinese README.md contains the complete guide.
+
+WHAT THIS IS
+
+A native OpenClaw AgentHarnessV2 plugin, NOT an ACP target or model provider.
+OpenClaw prepares the current/default model, authentication, workspace and
+policy-bound coding tools. Official DSH runs one model/tool-loop attempt in a
+child process, connected by private piped JSON-RPC. Model-callable tools return
+to OpenClaw callbacks and its policy/approval/execution hooks.
+
+DSH's own shell/editor/filesystem tools and stock SDK server are disabled;
+ambient MCP, subagents and product integrations are not enabled. The effective
+tool catalogue is audited. No acpx, separate global DSH installation, DSH web
+server or model-weight download is required.
+
+This is TRUSTED NATIVE CODE, not an OS sandbox. Merely enabling the plugin does
+not auto-select it or replace other Agents' runtimes.
+
+SUPPORTED BASELINE
+
+- Node.js: >=22.23.1 <23 || >=24.15.0. Node 23 is not included.
+  Historical actual testing includes Linux Node 22.23.1. Some tests import
+  TypeScript directly and use type stripping and node:module.registerHooks.
+  Native Windows uses node.exe with structured subprocess argv; this is not a
+  claim that every platform/Node combination has been rerun.
+- Exact official OpenClaw 2026.9.2 experimental AgentHarnessV2 SDK artifact.
+  Declared pluginApi/optional-peer range >=2026.9.2 <2026.10.0 does not prove
+  every build in that range compatible. Do not substitute "latest".
+- DSH package group pinned to 0.1.2-alpha.2.
+- ONLY deepseek / openai-completions and github-copilot GPT / openai-responses.
+  A model appearing in a catalogue does not prove execution support or account
+  entitlement. This is not arbitrary-provider support.
+
+BUILD FROM CLONED SOURCE
+
+No npm publication or downloadable project Release archive is assumed.
+PowerShell examples follow; C:\PATH\TO values are placeholders.
+
+  git clone https://github.com/ericzhaouu/dsh-native.git
+  Set-Location .\dsh-native
+  node --version
+  npm.cmd ci
+
+Confirm package.json version 0.3.0. OpenClaw is an optional peer to avoid
+bundling a second production host. Development still needs the genuine SDK.
+If it is absent, obtain and verify the exact official 2026.9.2 artifact from
+the OpenClaw release workflow, then install it locally:
+
+  npm.cmd install --no-save --package-lock=false "C:\PATH\TO\openclaw-2026.9.2.tgz"
+  $DevHost = (Resolve-Path .\node_modules\openclaw).Path
+  node .\host-patch\apply.mjs --root $DevHost --check
+  npm.cmd run build
+  npm.cmd pack
+
+If the configured registry lacks that SDK, use the verified official artifact,
+not speculative npm versions, a newer preview or hand-written replacement SDK
+types. The check is read-only; it should report unpatched for the stock pinned
+artifact. npm pack runs prepack/build and creates openclaw-dsh-native-0.3.0.tgz.
+Use npm.cmd if PowerShell blocks npm.ps1; do not change execution policy.
+
+MAINTENANCE BEFORE INSTALL / PATCH / CONFIGURATION
+
+Review the code, dependencies and declared capabilities. Back up configuration,
+the previous plugin package and the host installation. Complete or cancel active
+work and confirm tools/children have stopped BEFORE maintenance.
+
+One Gateway serves multiple connections. Default hybrid configuration reload
+can restart the shared Gateway after plugin/runtime changes, affecting
+all connections, not only dsh-experiment. STOP BEFORE installation, host patching
+or config edits; do not live-patch or mistake cooperative suspension for shutdown.
+Use the correct installation/profile and keep its supervisor from respawning it.
+
+  openclaw gateway stop --force
+  openclaw gateway status --no-probe
+  openclaw plugins install "C:\PATH\TO\openclaw-dsh-native-0.3.0.tgz" --force --accept-capabilities
+
+The operator must verify shutdown; service status alone is not proof that all
+old processes/tools have exited. For gateway stop, --force confirms a
+non-interactive stop; it does not prove idle. The stop/start sequence here is for
+offline installation between those steps, not an ordinary restart substitute.
+For plugins install, --force acknowledges local sources/overwrite.
+Official --accept-capabilities accepts declared capabilities of REVIEWED code,
+not a security-policy bypass. Do not blindly accept untrusted packages.
+
+If managed npm optional-peer reconciliation fails, do not repair it by guessing
+a host version or rewriting shared host dependencies. A prepared-directory
+installation is an alternative, still with Gateway stopped:
+
+  New-Item -ItemType Directory -Path .\artifacts\prepared-dsh-native
+  tar -xf .\openclaw-dsh-native-0.3.0.tgz -C .\artifacts\prepared-dsh-native
+  Push-Location .\artifacts\prepared-dsh-native\package
+  npm.cmd ci --omit=dev
+  Pop-Location
+  $PreparedPlugin = (Resolve-Path .\artifacts\prepared-dsh-native\package).Path
+  openclaw plugins install $PreparedPlugin --force --accept-capabilities
+
+Use a fresh preparation directory. It must contain built dist, manifest,
+lockfile and complete target-platform runtime node_modules, not a development
+copy of node_modules\openclaw. The directory install path does NOT build or
+install dependencies for you. It is not equivalent to an unprepared checkout.
+Keep required runtime peers from the shipped lockfile: --omit=peer would also
+remove dependencies required by DSH, not just the optional OpenClaw SDK.
+
+OPTIONAL AGENT-LEVEL SELECTION (0.3 HOST PATCH)
+
+  agents.entries.dsh-experiment.runtime:
+    type: embedded
+    harness: dsh-native
+
+runtime.harness is an explicit HOST EXTENSION, NOT a stock 2026.9.2 SDK field.
+The patch is pinned to the official 2026.9.2 artifact and source commit:
+  3928bad9badfcb6c7d140530435e806fb8092190
+
+host-patch\spec.mjs fixes 12 target-file SHA-256 hashes and exact edits. This is
+not a whole-release tarball checksum or validation of every host dependency.
+The recorded source commit is not a substitute for artifact provenance.
+Unrecognized builds/local edits fail without being overwritten.
+
+Keep Gateway stopped. The root must be the actual Gateway's OpenClaw package
+containing openclaw.mjs, package.json and dist, not user state or a bin shim:
+
+  $HostRoot = "C:\PATH\TO\openclaw-package"
+  node .\host-patch\apply.mjs --root $HostRoot --check
+  node .\host-patch\apply.mjs --root $HostRoot --apply --offline-confirmed
+  node .\host-patch\apply.mjs --root $HostRoot --check
+
+--offline-confirmed is an OPERATOR ASSERTION, not automatic shutdown or Gateway
+detection. The patch tool never stops/restarts/reloads/signals Gateway or edits
+config. Read host-patch\USAGE.txt for receipts, partial state and restoration.
+
+Merge examples\openclaw.agent-pinned.json only for the intended existing Agent.
+Use an existing dedicated absolute workspace. Preserve default model, auth,
+other Agents and security policy. If plugins.allow exists, add dsh-native
+without replacing the list.
+
+Do NOT set agents.defaults.model or an Agent model merely to select DSH.
+OpenClaw resolves its normal current/default model, account, parameters and
+limits. When no Agent-specific model overrides exist, normal defaults apply.
+Remove ONLY that Agent's obsolete models[...].agentRuntime leaves; preserve
+other fields in those entries. Do not change global model/default policies.
+
+Model/provider runtime entries cannot override an Agent pin. Every fallback
+candidate retains the same harness; unsupported routes fail with a typed
+incompatibility, not a substitute model or escape to the built-in runtime.
+An ACP runtime cannot carry this embedded harness field.
+
+  openclaw plugins enable dsh-native
+  openclaw gateway start
+  openclaw gateway status
+
+Use /new in the target Agent's chat/Dashboard before the next task.
+Model inheritance is NOT migration of an existing native session.
+
+STOCK HOST COMPATIBILITY
+
+Without the optional patch, use explicit per-model agentRuntime.id instead of
+runtime.harness. examples\openclaw.experiment.json and openclaw.copilot.json
+illustrate that mode. Each selected model needs its own runtime entry.
+The model must already be configured, selected and authenticated by OpenClaw.
+
+examples\openclaw.enabled.json / openclaw.disabled.json affect model DEFAULTS,
+not just one Agent. Do not copy them over unrelated defaults. The experiment
+examples select coding/local Gateway execution and sandbox off; do not disable
+a required sandbox or policy to make them run. Use the built-in runtime when
+the session's requirements are incompatible.
+
+FIRST TASK AND VERIFICATION
+
+In a dedicated disposable workspace, create a non-secret smoke-input.txt and
+ensure smoke-output.txt does not exist. In a NEW conversation ask:
+
+  Only within this workspace, read smoke-input.txt. Stop if smoke-output.txt
+  exists; otherwise use the host write tool to copy the input there, then read
+  it back to verify. Do not run commands, use the network, access other
+  directories or modify existing files/config/credentials. Stop on missing
+  permission. Report only actual tool results.
+
+CLI users can select a fresh key rather than reuse existing native ownership:
+
+  $SmokeSession = "dsh-smoke-" + [guid]::NewGuid().ToString("N")
+  openclaw agent --agent dsh-experiment --session-key $SmokeSession --message "Read smoke-input.txt in this workspace. Stop if smoke-output.txt exists; otherwise copy it with write and verify with read. No commands, network, other directories or existing-file changes. Stop on missing permission." --json
+
+This uses the real model account and may incur charges. A model's self-claim,
+or a particular response phrase, does not prove DSH activation. Check the actual
+host runtime selection/progress, callback results, output file and local binding.
+Do not publish unsanitized diagnostics. CLI --message "/new" does not invoke the
+chat slash-command dispatcher; use chat /new or an explicit new session key.
+
+MODELS / AUTHENTICATION
+
+DeepSeek requires a concrete deepseek Chat Completions model and host-prepared
+API key. Thinking off disables thinking; minimal/low/medium/high map to high;
+xhigh/max map to max. Unsupported custom mappings/transport/sampling fail.
+
+Copilot requires a concrete github-copilot gpt-* Responses model. Keep the
+ordinary OpenClaw login. OpenClaw/service own account validation, tenant
+discovery, entitlements and resolved endpoint. No second OAuth, token export,
+DeepSeek key or OpenAI API subscription is required for that route.
+
+Model id, context/output limits and reasoning capabilities come from OpenClaw,
+not the old bundled pi-ai catalogue. off/minimal/low/medium/high/xhigh/max work
+only when representable and supported by that model; adaptive, ultra and
+arbitrary parameter overrides are rejected. Copilot off omits reasoning.
+
+Allowed prepared integration/editor/organization headers are retained;
+X-Initiator is computed for user versus tool-follow-up requests. DSH owns its
+product User-Agent; authored custom User-Agent is rejected. This is not an
+identical reimplementation of OpenClaw's HTTP stack.
+
+Copilot native persistence strips encrypted reasoning signatures, response ids
+and opaque item ids while retaining tool/result correlation. Unsigned reasoning
+remains reasoning locally and is omitted by Responses replay, never changed
+into assistant text. Invalid/imported unsanitized history is rejected. Trailing
+reasoning whitespace is delayed until canonical closure; real rewrites fail.
+
+CONFIGURATION DEFAULTS
+
+Scope: plugins.entries.dsh-native.config. Unknown fields are rejected.
+Authoritative definitions: openclaw.plugin.json and src\config.ts.
+
+  stateDir              user's home + .openclaw\dsh-native; absolute path only
+  startupTimeoutMs      60000
+  shutdownTimeoutMs     15000
+  streamIdleTimeoutMs    120000
+  allowedBaseUrls       ["https://api.deepseek.com"]
+  allowedCopilotBaseUrls:
+    https://api.individual.githubcopilot.com
+    https://api.business.githubcopilot.com
+    https://api.enterprise.githubcopilot.com
+    https://api.githubcopilot.com
+
+Timeouts are integers from 100 to 3600000 milliseconds. Stream idle timeout is
+not the total attempt deadline. Both endpoint lists must be nonempty and use
+exact normalized URLs, not wildcards. The lists are independent. Add only a
+trusted host-resolved custom tenant/data-residency HTTPS endpoint to the right
+list. Credentials, query and fragment in URLs are forbidden; plaintext remote
+HTTP is forbidden. Explicit HTTP loopback entries are for local fixtures only.
+
+CAPABILITIES / DASHBOARD
+
+Text input and text coding-tool results only. The allowed core family is:
+  read edit write apply_patch exec process grep glob find ls
+Actual availability remains host-policy filtered; not all tools are promised.
+
+The ONLY absent-session-tool safe-deny exceptions are:
+  sessions_list sessions_history sessions_send session_status
+Neither callback host nor DSH exposes these. Existing denies remain in force;
+other explicit native-surface restrictions fail before inference/tool setup.
+Do not delete required security rules to use the experiment.
+
+No workboard, browser, MCP, messaging, plugin-tool grants, subagents/delegation,
+skill-library authoring, custom context engines, native compaction, migration/
+fork, media, Code Mode, live steering, session permission overrides, remote/
+node/sandbox placement or detached durable scheduled jobs. Use legacy context
+and ordinary foreground coding work. Reading host-provided skill instructions
+cannot grant unavailable tools.
+
+Ordinary human Dashboard chat.send turns may carry
+taskSuggestionDeliveryMode="gateway" and optional skillLibraryAuthoring.
+The known delivery mode and active-handle metadata are accepted, but authoring
+authority is neither invoked nor forwarded. No task-suggestion, messaging or
+skill-management tools are added. Unknown delivery modes and explicit Skill
+Workshop workflows still fail closed.
+
+STATE / FAILURE / SECURITY
+
+Each host session has a hashed state directory, private DSH_HOME and binding.
+A fresh child resumes native history each turn. Success flushes persistence,
+drains the bridge and closes the child before making the binding reusable.
+OpenClaw's mirror does not replace native DSH history.
+
+Credentials pass only in a narrowed child environment, not argv or plaintext
+plugin config/profile/binding. The child and sufficiently privileged local code
+can still inspect them: this is NOT secret isolation from malicious native code.
+The binding stores a route/account fingerprint, not the usable token. Only
+approved non-secret request identity headers may persist; Authorization/Cookie
+and arbitrary headers are rejected.
+
+Runtime/model/provider/account/token/endpoint/request-identity/workspace or
+session ownership changes require /new, not reinterpretation of an old binding.
+0.1 bindings lack later model/account fingerprints and are not silently migrated.
+
+The exclusive owner.lock prevents concurrent owners. Running/blocked bindings,
+consumed attempts, uncertain outcomes and mirror/native mismatches fail closed.
+There is no automatic deletion, unlock, migration or replay after a crash.
+Confirm old host, child and tools have stopped, inspect possible side effects,
+then start a new conversation. Do not edit binding status or delete native
+history to force a retry. Reset/disable retains old state for inspection.
+
+Private config, histories, logs, receipts, real paths/accounts/IPs/session ids
+must not enter the public repository or Issues. Fingerprints are not tokens,
+but the surrounding metadata is still private. Provider token counters are not
+authoritative billing; zero cost means unpriced, not free inference.
+
+DISABLE / UNPIN / RESTORE / UPGRADE
+
+Stop active work and the shared Gateway first. To remove only the Agent pin:
+
+  openclaw config unset agents.entries.dsh-experiment.runtime.harness
+
+Or replace the WHOLE runtime object with {"type":"embedded"}. Merging an object
+that merely omits harness does not delete it; this also applies to the unpinned
+example. Unpin restores ordinary host policy, which can expose older model pins.
+On the patched host, explicitly require the built-in runtime with:
+
+  openclaw config set agents.entries.dsh-experiment.runtime.harness openclaw
+
+auto/default are not pin values. For legacy mode, remove or change only the
+intended Agent's old agentRuntime leaves, preserving other model fields.
+Do not disable the plugin globally while other Agents still select DSH.
+
+  openclaw plugins disable dsh-native
+  openclaw gateway start
+
+Use /new. Re-enabling also requires deliberate selection and a new conversation;
+disabling alone does not rewrite selection or migrate bound native history.
+Provider authentication stays independent; do not delete it or private state.
+
+To restore stock host code, keep Gateway stopped and FIRST remove all added
+runtime.harness fields (including "openclaw"), restoring the intended prior
+configuration. Then:
+
+  node .\host-patch\apply.mjs --root $HostRoot --restore --offline-confirmed
+  node .\host-patch\apply.mjs --root $HostRoot --check
+
+Start only after a successful unpatched check. Preserve installation-local
+.dsh-agent-harness-patch backups/receipt. For partial state or patch-lock recovery
+read host-patch\USAGE.txt; --recover-stale-lock is NOT a native-session unlock.
+
+For upgrades, retain a known-good plugin archive/config, stop before reinstall,
+recheck the exact host artifact and use /new. Host updates can replace patched
+files; maintenance/rebasing is required. Do not apply this patch to new builds
+or replace individual live JS files. 0.3.0 includes the prior streaming fix.
+
+DEVELOPMENT / TEST LIMITS
+
+After supplying the exact optional peer:
+
+  npm.cmd run typecheck
+  npm.cmd run build
+  npm.cmd test
+  npm.cmd pack
+
+Tests use Node's built-in runner with test concurrency 1; some need built dist.
+They cover configuration, bridge/worker, native state/locks/replay, actual
+OpenClaw 2026.9.2 SDK exports/local-agent CLI and host read tool, local DSH
+HTTP/SSE fixtures, second-turn continuation and plugin disabling. Exact
+official host copies exercise the hash patch, Agent model inheritance,
+unpinned Agents and fallback ownership. Isolated Dashboard chat.send fixtures
+exercise ordinary-user metadata compatibility.
+
+Local synthetic credentials/model fixtures do not test real GitHub login,
+subscription, entitlements or a live provider request. They are not production
+Gateway acceptance tests. Historical test counts are not a current pass report;
+run the commands against the selected commit and record the actual SDK/Node versions.
+
+TROUBLESHOOTING
+
+- Unknown runtime.harness: stock/wrong/partially patched host; check actual root.
+- Missing openclaw/plugin-sdk exports: provide exact official optional peer SDK.
+- Requires explicit selection: enabled plugin alone is insufficient; use /new.
+- Pinned route incompatibility: only the two documented routes work; no escape.
+- Host-prepared auth failure: fix normal OpenClaw login, not plugin key settings.
+- Endpoint denied: review exact URL in the provider-specific allowlist.
+- Policy/non-core tool/placement rejection: keep policy; use built-in runtime.
+- Changed fingerprint/ownership or missing/mismatched native history: /new.
+- owner.lock/uncertain outcome/already submitted: inspect stopped owners and
+  effects; do not automatically unlock or replay.
+- Unconfirmed termination/startup timeout: check Node/dependencies/processes in
+  maintenance; do not blindly resubmit work.
+- INVALID_ARGS/HOST_TOOL_ERROR: inspect actual schema, authorization and result.
+
+UPSTREAM / LICENSE
+
+OpenClaw: https://github.com/openclaw/openclaw
+DeepSeek Harness: https://github.com/deepseek-ai/deepseek-harness
+GitHub Copilot documentation: https://docs.github.com/en/copilot
+
+This is an independent experimental integration, not upstream endorsement.
+Project MIT license and ericzhaouu authorship do not replace upstream copyrights
+or third-party licenses. Share only sanitized reproductions.
