@@ -8,14 +8,60 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { t as GatewayClient } from "../../node_modules/openclaw/dist/client-I-RoP1Al.js";
 import { s as resolveRuntimeServiceBuildId, t as OPENCLAW_VERSION } from "../../node_modules/openclaw/dist/version-v1kuAkGj.js";
 import { startResponsesServer } from "./responses-server.mjs";
-import { createPatchedHostFixture } from "./patched-host.mjs";
+import { createPatchedHostFixture, createPluginFixture } from "./patched-host.mjs";
 
 const packageRoot = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
-const pluginRoot = process.env.DSH_NATIVE_PACKAGED_ROOT ?? packageRoot;
 const TOKEN = "dashboard-gateway-fixture-token";
+const AGENT_ID = "dashboard-fixture";
 const MODEL_ID = "gpt-6-astra";
 const MODEL_REF = `github-copilot/${MODEL_ID}`;
 const CORE_TOOLS = ["read", "write", "edit", "apply_patch", "exec", "process", "grep", "glob", "find", "ls"];
+
+export function messageText(message) {
+  if (typeof message?.content === "string") return message.content;
+  if (Array.isArray(message?.content)) return message.content
+    .filter((block) => block?.type === "text" && typeof block.text === "string")
+    .map((block) => block.text).join("");
+  return typeof message?.text === "string" ? message.text : "";
+}
+
+async function createNetworkGuard(root) {
+  const path = join(root, "dashboard-loopback-only.mjs");
+  // Cover sockets as well as fetch, including the native Node child whose env drops NODE_OPTIONS.
+  await writeFile(path, `
+import net from "node:net";
+import dgram from "node:dgram";
+import childProcess from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
+const connect = net.Socket.prototype.connect;
+net.Socket.prototype.connect = function (...args) {
+  const values = Array.isArray(args[0]) ? args[0] : args;
+  const options = typeof values[0] === "object" ? { ...values[0] }
+    : { port: values[0], host: typeof values[1] === "string" ? values[1] : "127.0.0.1" };
+  if (typeof values[0] === "string" && !Number.isFinite(Number(values[0]))) return connect.apply(this, args);
+  if (!options.path) {
+    const host = options.host ?? "127.0.0.1";
+    if (!["127.0.0.1", "::1", "::ffff:127.0.0.1", "localhost"].includes(host)) {
+      throw new Error("Offline integration forbids external socket: " + host);
+    }
+    if (host === "localhost") options.host = "127.0.0.1";
+  }
+  return connect.call(this, options, values.find((value) => typeof value === "function"));
+};
+for (const method of ["connect", "send"]) dgram.Socket.prototype[method] = function () {
+  throw new Error("Offline integration forbids datagram traffic");
+};
+const spawn = childProcess.spawn;
+childProcess.spawn = function (command, args, options) {
+  if (command === process.execPath && Array.isArray(args)) {
+    return spawn.call(this, command, ["--import", import.meta.url, ...args], options);
+  }
+  return spawn.apply(this, arguments);
+};
+syncBuiltinESMExports();
+`);
+  return path;
+}
 
 async function reserveLoopbackPort() {
   const server = createServer();
@@ -28,18 +74,21 @@ async function reserveLoopbackPort() {
   return port;
 }
 
-async function waitForPort(port, timeoutMs = 180000) {
-  await waitFor(() => new Promise((resolve) => {
-    const socket = createConnection({ host: "127.0.0.1", port });
-    const finish = (value) => {
-      socket.removeAllListeners();
-      socket.destroy();
-      resolve(value);
-    };
-    socket.once("connect", () => finish(true));
-    socket.once("error", () => finish(false));
-    socket.setTimeout(1000, () => finish(false));
-  }), timeoutMs, 250);
+async function waitForPort(port, assertHealthy, timeoutMs = 180000) {
+  await waitFor(() => {
+    assertHealthy();
+    return new Promise((resolve) => {
+      const socket = createConnection({ host: "127.0.0.1", port });
+      const finish = (value) => {
+        socket.removeAllListeners();
+        socket.destroy();
+        resolve(value);
+      };
+      socket.once("connect", () => finish(true));
+      socket.once("error", () => finish(false));
+      socket.setTimeout(1000, () => finish(false));
+    });
+  }, timeoutMs, 250);
 }
 
 function envSubset() {
@@ -66,22 +115,8 @@ async function withTimeout(promise, ms, message) {
   } finally { clearTimeout(timer); }
 }
 
-async function waitForAssistantText(client, events, sessionKey, matcher, timeoutMs = 120000) {
-  return waitFor(async () => {
-    const failed = events.find((frame) => frame.event === "chat" &&
-      frame.payload?.sessionKey === sessionKey && ["error", "aborted"].includes(frame.payload.state));
-    if (failed) throw new Error(`Dashboard turn failed: ${JSON.stringify(failed.payload)}`);
-    const history = await client.request("chat.history", { sessionKey, limit: 20 });
-    const messages = Array.isArray(history?.messages) ? history.messages : [];
-    const assistant = messages.findLast?.((message) =>
-      message?.role === "assistant" && matcher.test(JSON.stringify(message.content ?? message.text ?? message))) ??
-      [...messages].reverse().find((message) =>
-        message?.role === "assistant" && matcher.test(JSON.stringify(message.content ?? message.text ?? message)));
-    return assistant || false;
-  }, timeoutMs);
-}
-
-export async function startDashboardGateway(responder, { agentPinned = false } = {}) {
+export async function startDashboardGateway(responder, { agentPinned = true, redactTranscriptIdentity = false } = {}) {
+  assert.equal(OPENCLAW_VERSION, "2026.9.2", "Dashboard fixture must use the inspected genuine SDK");
   const root = join(packageRoot, "artifacts", `dashboard-gateway-${randomUUID()}`);
   const workspace = join(root, "workspace");
   const home = join(root, "home");
@@ -94,8 +129,40 @@ export async function startDashboardGateway(responder, { agentPinned = false } =
   let stdout = "";
   let stderr = "";
   const events = [];
+  let fixtureFailure;
+  let stopping = false;
+  let readyReject;
   let closed = Promise.resolve();
+  const failFixture = (error) => {
+    if (stopping) return;
+    fixtureFailure ??= error;
+    readyReject?.(fixtureFailure);
+  };
+  const eventsForRun = (sessionKey, runId) => events.filter((frame) =>
+    frame.payload?.sessionKey === sessionKey && frame.payload?.runId === runId);
+  const assertHealthy = () => {
+    if (fixtureFailure) throw fixtureFailure;
+  };
+  const assertTurnHealthy = (sessionKey, runId) => {
+    assertHealthy();
+    const failed = eventsForRun(sessionKey, runId).find((frame) =>
+      (frame.event === "chat" && ["error", "aborted"].includes(frame.payload.state)) ||
+      (frame.event === "agent" && frame.payload.stream === "lifecycle" &&
+        (["error", "aborted"].includes(frame.payload.data?.phase) || frame.payload.data?.aborted === true)));
+    if (failed) throw new Error(`Dashboard turn failed: ${JSON.stringify(failed.payload)}`);
+  };
+  const readDshBindings = async () => {
+    const bindings = [];
+    for (const directory of await readdir(dshState, { withFileTypes: true })) {
+      if (!directory.isDirectory()) continue;
+      const path = join(dshState, directory.name, "binding.json");
+      try { bindings.push({ path, value: JSON.parse(await readFile(path, "utf8")) }); }
+      catch (error) { if (error.code !== "ENOENT") throw error; }
+    }
+    return bindings;
+  };
   const stopPartial = async () => {
+    stopping = true;
     const results = await Promise.allSettled([chat?.stopAndWait?.({ timeoutMs: 5000 })]);
     if (child && child.exitCode === null && child.signalCode === null) child.kill();
     try { await withTimeout(closed, 15000, "Gateway shutdown timeout"); }
@@ -111,21 +178,30 @@ export async function startDashboardGateway(responder, { agentPinned = false } =
   };
   try {
     await Promise.all([root, workspace, home, state, agentDir, dshState].map((path) => mkdir(path, { recursive: true })));
-    const fixture = agentPinned ? await createPatchedHostFixture(root) : undefined;
+    const originalHost = join(packageRoot, "node_modules", "openclaw");
+    const fixture = agentPinned ? await createPatchedHostFixture(root)
+      : { host: originalHost, plugin: await createPluginFixture(root, originalHost) };
+    const networkGuard = await createNetworkGuard(root);
     await writeFile(join(workspace, "fixture.txt"), "DASHBOARD-HOST-READ\n");
-    responses = await startResponsesServer(responder);
+    responses = await startResponsesServer(async (request) => {
+      try { await responder(request); }
+      catch (error) { failFixture(error); throw error; }
+    });
     const port = await reserveLoopbackPort();
     const configPath = join(root, "openclaw.json");
     const logPath = join(root, "openclaw.log");
     await writeFile(configPath, JSON.stringify({
       gateway: { mode: "local", bind: "loopback", auth: { mode: "token" } },
+      discovery: { mdns: { mode: "off" } },
+      update: { checkOnStart: false, auto: { enabled: false } },
+      browser: { enabled: false },
       agents: {
         defaults: {
           model: { primary: MODEL_REF },
           sandbox: { mode: "off" },
         },
         entries: {
-          experiment: {
+          [AGENT_ID]: {
             workspace, agentDir,
             ...(agentPinned ? { runtime: { type: "embedded", harness: "dsh-native" } }
               : { models: { [MODEL_REF]: { agentRuntime: { id: "dsh-native" } } } }),
@@ -161,7 +237,7 @@ export async function startDashboardGateway(responder, { agentPinned = false } =
         slots: { memory: "none" },
         enabled: true,
         allow: ["dsh-native"],
-        load: { paths: [fixture?.plugin ?? pluginRoot] },
+        load: { paths: [fixture.plugin] },
         entries: {
           "github-copilot": { enabled: false },
           "dsh-native": {
@@ -174,12 +250,14 @@ export async function startDashboardGateway(responder, { agentPinned = false } =
           },
         },
       },
-      logging: { level: "debug", consoleLevel: "debug", file: logPath },
+      logging: { level: "debug", consoleLevel: "debug", file: logPath,
+        ...(redactTranscriptIdentity ? { redactPatterns: ["^github-copilot$", "^gpt-6-astra$"] } : {}) },
       diagnostics: { enabled: false },
     }));
     child = spawn(process.execPath, [
       "--import", pathToFileURL(join(packageRoot, "tests", "fixtures", "loopback-only.mjs")).href,
-      join(fixture?.host ?? join(packageRoot, "node_modules", "openclaw"), "openclaw.mjs"),
+      "--import", pathToFileURL(networkGuard).href,
+      join(fixture.host, "openclaw.mjs"),
       "gateway", "run", "--allow-unconfigured",
       "--bind", "loopback", "--port", String(port), "--auth", "token", "--token", TOKEN,
     ], {
@@ -192,6 +270,14 @@ export async function startDashboardGateway(responder, { agentPinned = false } =
         OPENCLAW_LOG_LEVEL: "debug",
         HOME: home,
         USERPROFILE: home,
+        APPDATA: join(home, "AppData", "Roaming"),
+        LOCALAPPDATA: join(home, "AppData", "Local"),
+        XDG_CONFIG_HOME: join(home, ".config"),
+        XDG_CACHE_HOME: join(home, ".cache"),
+        XDG_DATA_HOME: join(home, ".local", "share"),
+        TEMP: root,
+        TMP: root,
+        TMPDIR: root,
         DO_NOT_TRACK: "1",
         FORCE_COLOR: "0",
         NODE_DISABLE_COMPILE_CACHE: "1",
@@ -199,14 +285,17 @@ export async function startDashboardGateway(responder, { agentPinned = false } =
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
     });
-    closed = new Promise((resolve, reject) => {
-      child.once("error", reject);
-      child.once("close", resolve);
+    closed = new Promise((resolve) => {
+      child.once("error", (error) => { failFixture(error); resolve(); });
+      child.once("close", (code, signal) => {
+        failFixture(new Error(`Dashboard gateway exited: code=${code}, signal=${signal}`));
+        resolve();
+      });
     });
     child.stdout.on("data", (data) => { stdout += data; });
     child.stderr.on("data", (data) => { stderr += data; });
     try {
-      await waitForPort(port);
+      await waitForPort(port, assertHealthy);
     } catch (error) {
       const log = await readFile(logPath, "utf8").catch(() => "(no OpenClaw log)");
       throw new Error(`Gateway failed to open its port.\n${stdout}\n${stderr}\n${log.slice(-12000)}`, { cause: error });
@@ -214,7 +303,7 @@ export async function startDashboardGateway(responder, { agentPinned = false } =
     const { publicKey, privateKey } = generateKeyPairSync("ed25519");
     const publicKeyRaw = Buffer.from(publicKey.export({ format: "jwk" }).x, "base64url");
     let readyResolve;
-    const ready = new Promise((resolve) => { readyResolve = resolve; });
+    const ready = new Promise((resolve, reject) => { readyResolve = resolve; readyReject = reject; });
     chat = new GatewayClient({
     deviceIdentity: {
       deviceId: createHash("sha256").update(publicKeyRaw).digest("hex"),
@@ -240,6 +329,9 @@ export async function startDashboardGateway(responder, { agentPinned = false } =
     maxProtocol: 4,
     onHelloOk() { readyResolve(); },
     onEvent(frame) { events.push(frame); },
+    onConnectError(error) { failFixture(error); },
+    onClose(code, reason) { failFixture(new Error(`Dashboard client closed: ${code} ${reason}`)); },
+    onGap(info) { failFixture(new Error(`Dashboard client lost event frames: ${JSON.stringify(info)}`)); },
     });
     try {
       chat.start();
@@ -257,35 +349,72 @@ export async function startDashboardGateway(responder, { agentPinned = false } =
       port,
       token: TOKEN,
       modelRef: MODEL_REF,
+      agentId: AGENT_ID,
       responses,
       chat,
+      events,
+      eventsForRun,
+      assertTurnHealthy,
       stdout: () => stdout,
       stderr: () => stderr,
-      async waitForAssistant(sessionKey, text) {
-        try { return await waitForAssistantText(chat, events, sessionKey, new RegExp(text)); }
+      async waitForFinal(sessionKey, runId, timeoutMs = 120000) {
+        assert.ok(sessionKey && runId, "waitForFinal requires an exact sessionKey and runId");
+        try {
+          return await waitFor(() => {
+            assertTurnHealthy(sessionKey, runId);
+            return eventsForRun(sessionKey, runId).find((frame) =>
+              frame.event === "chat" && frame.payload.state === "final");
+          }, timeoutMs);
+        }
         catch (error) {
-          const log = await readFile(logPath, "utf8");
-          throw new Error(`${error.message}\n${stdout.slice(-12000)}\n${stderr.slice(-12000)}\n${log.slice(-18000)}`, { cause: error });
+          const log = await readFile(logPath, "utf8").catch(() => "(no OpenClaw log)");
+          throw new Error(`Waiting for Dashboard final ${sessionKey}/${runId}: ${error.message}\n` +
+            `${JSON.stringify(eventsForRun(sessionKey, runId))}\n${stdout.slice(-6000)}\n${stderr.slice(-6000)}\n${log.slice(-12000)}`,
+          { cause: error });
         }
       },
-      async readDshBindings() {
-        const bindings = [];
-        for (const directory of await readdir(dshState, { withFileTypes: true })) {
-          if (!directory.isDirectory()) continue;
-          const path = join(dshState, directory.name, "binding.json");
-          try { bindings.push({ path, value: JSON.parse(await readFile(path, "utf8")) }); }
-          catch (error) { if (error.code !== "ENOENT") throw error; }
-        }
-        return bindings;
+      async waitForDurableSettle(sessionKey, runId, timeoutMs = 120000) {
+        assert.ok(sessionKey && runId, "waitForDurableSettle requires an exact sessionKey and runId");
+        let stableSince;
+        let previousSnapshot;
+        return waitFor(async () => {
+          assertTurnHealthy(sessionKey, runId);
+          const bindings = await readDshBindings();
+          const binding = bindings.find((entry) => entry.value.lastRunId === runId);
+          if (binding?.value.status === "blocked") throw new Error(`Native binding blocked for ${runId}`);
+          const history = await chat.request("chat.history",
+            { sessionKey, agentId: AGENT_ID, limit: 20 }, { timeoutMs: 15000 });
+          assertTurnHealthy(sessionKey, runId);
+          const assistant = history.messages?.find((message) => message.role === "assistant" &&
+            (message.idempotencyKey ?? message.__openclaw?.idempotencyKey) === `dsh-native:${runId}:assistant`);
+          if (binding?.value.status !== "ready" || !assistant || history.inFlightRun) {
+            stableSince = undefined;
+            return false;
+          }
+          // Streaming/final can precede both the native commit and host reply-dispatch cleanup.
+          const snapshot = JSON.stringify([
+            binding.value, history.messages, history.sessionInfo?.modelProvider, history.sessionInfo?.model,
+            history.sessionInfo?.activeModelProvider, history.sessionInfo?.activeModel,
+            eventsForRun(sessionKey, runId).length,
+          ]);
+          if (snapshot !== previousSnapshot || stableSince === undefined) {
+            previousSnapshot = snapshot;
+            stableSince = Date.now();
+          }
+          return Date.now() - stableSince >= 500 ? { binding, bindings, history, assistant } : false;
+        }, timeoutMs);
       },
+      readDshBindings,
       close: stopPartial,
       async assertHealthyLogs() {
         const log = await readFile(logPath, "utf8");
         assert.match(log, /dsh-native/i);
+        assert.doesNotMatch(`${stdout}\n${stderr}\n${log}`, /Offline integration forbids/);
         return log;
       },
       coreTools: CORE_TOOLS,
       agentPinned,
+      redactTranscriptIdentity,
     };
   } catch (error) {
     await stopPartial();

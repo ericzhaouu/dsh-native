@@ -1,4 +1,4 @@
-DSH NATIVE FOR OPENCLAW -- EXPERIMENTAL 0.3.0
+DSH NATIVE FOR OPENCLAW -- EXPERIMENTAL 0.3.1
 
 Source: https://github.com/ericzhaouu/dsh-native
 Author: https://github.com/ericzhaouu
@@ -7,6 +7,21 @@ Plugin / harness ID: dsh-native
 Example Agent: dsh-experiment
 License: MIT; Copyright (c) 2026 ericzhaouu.
 The Chinese README.md contains the complete guide.
+
+VERSION 0.3.1
+
+Current-attempt attribution uses the validated executing provider/model instead
+of redacted transcript identity. Canonical content and redaction remain intact.
+The public assistant event publishes one approved final snapshot after persistence,
+cleanup and the awaited agent_end hook barrier, so Dashboard receives real text.
+Existing partial callbacks remain; this does not promise per-token Dashboard text.
+Ownership is retained through publication; cancelled, reset, disposed and failed
+attempts do not publish a successful final. SDK best-effort hook error policy remains.
+Real Gateway tests inspect delivered agent/chat events, not only chat.history,
+including redacted metadata, tools, continuation and stock-host compatibility.
+The 0.3.0 host-patch specification is unchanged. Independent isolated completions
+such as automatic title generation remain unsupported. Install in a maintenance
+window and start /new; old history/notices are not rewritten or deleted.
 
 WHAT THIS IS
 
@@ -49,7 +64,7 @@ PowerShell examples follow; C:\PATH\TO values are placeholders.
   node --version
   npm.cmd ci
 
-Confirm package.json version 0.3.0. OpenClaw is an optional peer to avoid
+Confirm package.json version 0.3.1. OpenClaw is an optional peer to avoid
 bundling a second production host. Development still needs the genuine SDK.
 If it is absent, obtain and verify the exact official 2026.9.2 artifact from
 the OpenClaw release workflow, then install it locally:
@@ -63,7 +78,7 @@ the OpenClaw release workflow, then install it locally:
 If the configured registry lacks that SDK, use the verified official artifact,
 not speculative npm versions, a newer preview or hand-written replacement SDK
 types. The check is read-only; it should report unpatched for the stock pinned
-artifact. npm pack runs prepack/build and creates openclaw-dsh-native-0.3.0.tgz.
+artifact. npm pack runs prepack/build and creates openclaw-dsh-native-0.3.1.tgz.
 Use npm.cmd if PowerShell blocks npm.ps1; do not change execution policy.
 
 MAINTENANCE BEFORE INSTALL / PATCH / CONFIGURATION
@@ -80,7 +95,7 @@ Use the correct installation/profile and keep its supervisor from respawning it.
 
   openclaw gateway stop --force
   openclaw gateway status --no-probe
-  openclaw plugins install "C:\PATH\TO\openclaw-dsh-native-0.3.0.tgz" --force --accept-capabilities
+  openclaw plugins install "C:\PATH\TO\openclaw-dsh-native-0.3.1.tgz" --force --accept-capabilities
 
 The operator must verify shutdown; service status alone is not proof that all
 old processes/tools have exited. For gateway stop, --force confirms a
@@ -95,7 +110,7 @@ a host version or rewriting shared host dependencies. A prepared-directory
 installation is an alternative, still with Gateway stopped:
 
   New-Item -ItemType Directory -Path .\artifacts\prepared-dsh-native
-  tar -xf .\openclaw-dsh-native-0.3.0.tgz -C .\artifacts\prepared-dsh-native
+  tar -xf .\openclaw-dsh-native-0.3.1.tgz -C .\artifacts\prepared-dsh-native
   Push-Location .\artifacts\prepared-dsh-native\package
   npm.cmd ci --omit=dev
   Pop-Location
@@ -338,7 +353,7 @@ read host-patch\USAGE.txt; --recover-stale-lock is NOT a native-session unlock.
 For upgrades, retain a known-good plugin archive/config, stop before reinstall,
 recheck the exact host artifact and use /new. Host updates can replace patched
 files; maintenance/rebasing is required. Do not apply this patch to new builds
-or replace individual live JS files. 0.3.0 includes the prior streaming fix.
+or replace individual live JS files. 0.3.1 includes the prior streaming fix.
 
 DEVELOPMENT / TEST LIMITS
 

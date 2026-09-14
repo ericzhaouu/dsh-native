@@ -1,6 +1,6 @@
 # DSH Native for OpenClaw
 
-**实验性版本 0.3.0**：把官方 DeepSeek Harness（DSH）的模型／工具循环接入 OpenClaw 的原生 `AgentHarnessV2`，并保留 OpenClaw 对模型、认证、工具授权与会话入口的控制。
+**实验性版本 0.3.1**：把官方 DeepSeek Harness（DSH）的模型／工具循环接入 OpenClaw 的原生 `AgentHarnessV2`，并保留 OpenClaw 对模型、认证、工具授权与会话入口的控制。
 
 - 源码仓库：[ericzhaouu/dsh-native](https://github.com/ericzhaouu/dsh-native)
 - 作者：[ericzhaouu](https://github.com/ericzhaouu)
@@ -16,6 +16,7 @@
 
 ## 目录
 
+- [0.3.1 修复](#031-修复)
 - [运行基线与兼容范围](#运行基线与兼容范围)
 - [它是什么：native、ACP 与 provider](#它是什么nativeacp-与-provider)
 - [从源码构建](#从源码构建)
@@ -32,6 +33,15 @@
 - [仓库结构](#仓库结构)
 - [排错](#排错)
 - [致谢与许可证](#致谢与许可证)
+
+## 0.3.1 修复
+
+- **模型状态归属**：转录可能将 provider／model 脱敏。当前尝试的模型身份改为来自已校验的实际执行路由，不再把 `***` 当作模型提供商，避免成功任务被误报为 Model Fallback。转录内容、脱敏和计费信息保持不变。
+- **Dashboard 最终正文**：通过公开 SDK 发布标准 `assistant` 事件，让客户端收到含正文的 `chat.final`，而不只是结束标记。新增的 Dashboard 正文事件是持久化及收尾完成后的最终快照，不承诺逐 token 展示；现有宿主 partial callbacks 保留。
+- **取消与收尾**：等待公开的 `agent_end` 完成接口，并保持尝试所有权直到发布结束。取消、重置、停用、过期或失败的尝试不能继续宣布成功正文。SDK 对 hook 错误的 best-effort 策略不变。
+- **回归验收**：真实隔离 Gateway 测试直接检查客户端 `assistant`／`chat.delta`／`chat.final` 内容、重复消息和错误回退，同时检查脱敏历史、工具及第二轮续聊。仅检查历史里有答案，不再视为送达证明。
+
+此版本不新增独立的 `isolated completion` 能力；自动标题生成等辅助模型调用仍不在支持范围内。Agent 级宿主补丁规格与 0.3.0 相同；已有补丁先执行 `--check`，不要为了升级插件手动重写宿主文件。升级仍需维护窗口和新会话，不会自动部署或清除旧告警／历史。
 
 ## 运行基线与兼容范围
 
@@ -95,7 +105,7 @@ node --version
 npm.cmd ci
 ```
 
-确认所用源码的 `package.json` 版本为 `0.3.0`。本项目把 OpenClaw 声明为 **optional peer**，避免在生产插件内部自动安装第二份宿主；开发／类型检查／真实 SDK 测试仍需要匹配的 SDK。
+确认所用源码的 `package.json` 版本为 `0.3.1`。本项目把 OpenClaw 声明为 **optional peer**，避免在生产插件内部自动安装第二份宿主；开发／类型检查／真实 SDK 测试仍需要匹配的 SDK。
 
 若开发目录尚未提供精确 SDK，先从 [OpenClaw 官方仓库](https://github.com/openclaw/openclaw)的发行流程取得并验证上述 **2026.9.2 官方制品**，然后本地安装：
 
@@ -109,7 +119,7 @@ npm.cmd pack
 
 `--check` 只检查，不会应用补丁。未修改的匹配制品应报告 `unpatched`。如果所用 registry 没有这个版本，应使用已核验的精确官方制品，**不要猜测可用的 npm 版本、改用最新预览版或伪造 SDK 类型**。无法取得匹配制品时，应停止需要该 SDK 的构建／集成验证。
 
-`npm pack` 的 `prepack` 会再次执行构建，生成本地 `openclaw-dsh-native-0.3.0.tgz`。不要把开发目录中的 OpenClaw SDK、账号或会话状态随插件复制出去。
+`npm pack` 的 `prepack` 会再次执行构建，生成本地 `openclaw-dsh-native-0.3.1.tgz`。不要把开发目录中的 OpenClaw SDK、账号或会话状态随插件复制出去。
 
 ## 维护窗口安装与 Agent 级启用
 
@@ -133,7 +143,7 @@ openclaw gateway status --no-probe
 仍保持 Gateway 停止：
 
 ```powershell
-openclaw plugins install "C:\PATH\TO\openclaw-dsh-native-0.3.0.tgz" --force --accept-capabilities
+openclaw plugins install "C:\PATH\TO\openclaw-dsh-native-0.3.1.tgz" --force --accept-capabilities
 ```
 
 `--force` 用于确认本地来源／覆盖安装；`--accept-capabilities` 是官方安装器对声明能力的接受选项，**仅用于已审阅并信任的代码**，不是规避安全策略。先阅读安装器说明和能力提示，不要无条件接受陌生代码。归档安装会处理运行依赖；已有 provider 及认证应留在 OpenClaw，不填入插件设置。
@@ -142,7 +152,7 @@ openclaw plugins install "C:\PATH\TO\openclaw-dsh-native-0.3.0.tgz" --force --ac
 
 ```powershell
 New-Item -ItemType Directory -Path .\artifacts\prepared-dsh-native
-tar -xf .\openclaw-dsh-native-0.3.0.tgz -C .\artifacts\prepared-dsh-native
+tar -xf .\openclaw-dsh-native-0.3.1.tgz -C .\artifacts\prepared-dsh-native
 Push-Location .\artifacts\prepared-dsh-native\package
 npm.cmd ci --omit=dev
 Pop-Location
@@ -400,7 +410,7 @@ node .\host-patch\apply.mjs --root $HostRoot --check
 
 备份当前可回退的插件制品和配置，在停机窗口构建／安装新包。OpenClaw 升级可能替换补丁文件：先规划恢复／迁移，重新核对目标制品，不把旧补丁强加给新版本。发生 `partial` 时保持停止并按补丁文档恢复，不能带半套补丁启动。
 
-0.1 的旧绑定缺少后续版本的模型／账号指纹；保留但不静默迁移。无论升级、切 runtime、换模型还是换账号，都使用 `/new`，不要直接重放旧任务。0.3.0 包含此前 reasoning 尾部空白的流式修正，不需要也不建议对运行中的安装做零散 JS 替换。
+0.1 的旧绑定缺少后续版本的模型／账号指纹；保留但不静默迁移。无论升级、切 runtime、换模型还是换账号，都使用 `/new`，不要直接重放旧任务。0.3.1 包含此前 reasoning 尾部空白的流式修正，不需要也不建议对运行中的安装做零散 JS 替换。
 
 ## 安全与公开发布
 

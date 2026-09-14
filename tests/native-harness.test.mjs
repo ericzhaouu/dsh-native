@@ -118,10 +118,11 @@ function fixture(t, overrides = {}) {
     getModelProviderRequestTransport: () => undefined,
     setActiveEmbeddedRun: f.spy("register", (_sessionId, handle) => { f.handle = handle; }),
     clearActiveEmbeddedRun: f.spy("clear"),
+    emitAgentEvent: f.spy("emitAgentEvent"),
     runAgentHarnessLlmInputHook: f.spy("inputHook"),
     runAgentHarnessLlmOutputHook: f.spy("outputHook"),
     runAgentHarnessBeforeAgentFinalizeHook: f.spy("finalizeHook", async () => ({ action: "continue" })),
-    runAgentHarnessAgentEndHook: f.spy("endHook"),
+    awaitAgentHarnessAgentEndHook: f.spy("endHook", async () => {}),
   };
   f.host = {
     systemPrompt: "Host-owned system prompt",
@@ -355,6 +356,176 @@ test("returns the V2 result with OpenClaw identity, canonical assistant usage an
   assert.equal(f.p.hostCapabilities.reportOutputTokens.mock.callCount(), 0);
 });
 
+test("redacted mirror metadata never replaces the executed candidate's attribution", async (t) => {
+  const f = fixture(t, { modelId: "selected-alias-that-did-not-run" });
+  const persist = f.transcript.persistAssistant;
+  f.transcript.persistAssistant = async (message) => persist({
+    ...message, provider: "***", model: "***",
+    content: [{ type: "text", text: "Host-approved redacted answer" }],
+  });
+  const result = await f.harness.runAttempt(f.p);
+  assert.equal(result.terminal.kind, "ok");
+  assert.equal(result.lastAssistant.provider, "***");
+  assert.equal(result.lastAssistant.model, "***");
+  assert.equal(result.messagesSnapshot.at(-1), result.lastAssistant);
+  assert.notEqual(result.currentAttemptAssistant, result.lastAssistant);
+  for (const message of [result.currentAttemptAssistant, result.currentAttemptCompletedAssistant]) {
+    assert.equal(message.provider, f.p.provider);
+    assert.equal(message.model, f.input.modelId);
+    assert.deepEqual(message.content, result.lastAssistant.content);
+    assert.deepEqual(message.usage, result.lastAssistant.usage);
+    assert.equal(message.idempotencyKey, result.lastAssistant.idempotencyKey);
+  }
+  assert.equal(result.runtimeModelSelection, undefined, "Host-selected routes do not claim native model ownership");
+  assert.equal(f.sdk.emitAgentEvent.mock.calls[0].arguments[0].data.text, "Host-approved redacted answer");
+});
+
+test("late failures retain executed attribution and redacted persistence without a final event", async (t) => {
+  const f = fixture(t);
+  const persist = f.transcript.persistAssistant;
+  f.transcript.persistAssistant = async (message) => persist({ ...message, provider: "***", model: "***" });
+  f.errors.hostDispose = new Error("drain failed");
+  const result = await f.harness.runAttempt(f.p);
+  assert.equal(result.terminal.kind, "failed");
+  assert.equal(result.lastAssistant.provider, "***");
+  assert.equal(result.currentAttemptAssistant.provider, f.p.provider);
+  assert.equal(result.currentAttemptAssistant.model, f.input.modelId);
+  assert.equal(result.assistantTranscriptOwned, true);
+  assert.equal(f.sdk.emitAgentEvent.mock.callCount(), 0);
+  noCompletedAssistant(result);
+});
+
+test("publishes exactly one approved final assistant event after persistence and successful cleanup", async (t) => {
+  const f = fixture(t);
+  f.run = async (input) => {
+    await input.onEvent({ type: "text", text: "Uncommitted partial" });
+    await input.onEvent({ type: "reasoning", text: "Private reasoning" });
+    assert.equal(f.sdk.emitAgentEvent.mock.callCount(), 0);
+    return f.output;
+  };
+  const persist = f.transcript.persistAssistant;
+  f.transcript.persistAssistant = async (message) => persist({
+    ...message, content: [{ type: "text", text: "Short approved final" }],
+  });
+  const result = await f.harness.runAttempt(f.p);
+  assert.equal(result.terminal.kind, "ok");
+  assert.equal(f.sdk.emitAgentEvent.mock.callCount(), 1);
+  assert.deepEqual(f.sdk.emitAgentEvent.mock.calls[0].arguments[0], {
+    runId: f.p.runId, sessionId: f.p.sessionId, sessionKey: f.p.sessionKey,
+    agentId: f.p.agentId, lifecycleGeneration: f.p.lifecycleGeneration, stream: "assistant",
+    data: { text: "Short approved final", delta: "", phase: "final_answer",
+      itemId: `dsh-native:${f.p.runId}:assistant` },
+  });
+  before(f, "persistAssistant", "emitAgentEvent");
+  before(f, "endHook", "emitAgentEvent");
+  assert.equal(f.p.onPartialReply.mock.callCount(), 1, "Final snapshot must not be duplicated through partial callbacks");
+});
+
+test("suppressed live chunks still produce the approved final snapshot", async (t) => {
+  const f = fixture(t, { suppressLiveStreamOutput: true });
+  f.run = async (input) => {
+    await input.onEvent({ type: "text", text: "Uncommitted partial" });
+    return f.output;
+  };
+  assert.equal((await f.harness.runAttempt(f.p)).terminal.kind, "ok");
+  assert.equal(f.p.onPartialReply.mock.callCount(), 0);
+  assert.equal(f.sdk.emitAgentEvent.mock.callCount(), 1);
+  assert.equal(f.sdk.emitAgentEvent.mock.calls[0].arguments[0].data.text, f.output.text);
+});
+
+test("silent, hidden and commentary messages never publish a visible final", async (t) => {
+  for (const mode of ["silent", "hidden", "commentary"]) {
+    await t.test(mode, async (t) => {
+      const f = fixture(t, { silentExpected: mode === "silent" });
+      const persist = f.transcript.persistAssistant;
+      f.transcript.persistAssistant = async (message) => persist({
+        ...message, ...(mode === "hidden" ? { display: false } : {}),
+        ...(mode === "commentary" ? { phase: "commentary" } : {}),
+      });
+      f.run = async (input) => {
+        if (mode === "silent") {
+          await input.onEvent({ type: "text", text: "Silent text" });
+          await input.onEvent({ type: "reasoning", text: "Silent reasoning" });
+        }
+        return f.output;
+      };
+      assert.equal((await f.harness.runAttempt(f.p)).terminal.kind, "ok");
+      assert.equal(f.sdk.emitAgentEvent.mock.callCount(), 0);
+      assert.equal(f.p.onPartialReply.mock.callCount(), 0);
+      assert.equal(f.p.onReasoningStream.mock.callCount(), 0);
+    });
+  }
+});
+
+test("final event callback failure or cancellation cannot publish a completed reply", async (t) => {
+  for (const kind of ["callback", "cancel", "authority", "emitter"]) {
+    await t.test(kind, async (t) => {
+      const controller = new AbortController();
+      const f = fixture(t, { abortSignal: controller.signal });
+      const reason = new Error(`final ${kind} failed`);
+      f.p.onAgentEvent = async (event) => {
+        assert.equal(event.stream, "assistant");
+        if (kind === "callback") throw reason;
+        if (kind === "cancel") controller.abort(reason);
+        if (kind === "authority") f.p.hostCapabilities.assertActive = () => { throw reason; };
+      };
+      if (kind === "emitter") f.errors.emitAgentEvent = reason;
+      const result = await f.harness.runAttempt(f.p);
+      assert.equal(result.terminal.kind, kind === "cancel" ? "aborted" : "failed");
+      assert.equal(f.sdk.emitAgentEvent.mock.callCount(), kind === "emitter" ? 1 : 0);
+      assert.equal(result.assistantTranscriptOwned, true);
+      assert.equal(result.replayMetadata.replaySafe, false);
+      noCompletedAssistant(result);
+    });
+  }
+});
+
+test("reset and disposal retain ownership while final publication is awaiting a callback", async (t) => {
+  for (const action of ["reset", "dispose"]) {
+    await t.test(action, async (t) => {
+      const f = fixture(t);
+      const reached = deferred();
+      const finish = deferred();
+      f.p.onAgentEvent = async () => { reached.resolve(); await finish.promise; };
+      const pending = f.harness.runAttempt(f.p);
+      await reached.promise;
+      const competing = await f.harness.runAttempt({ ...f.p, runId: "replacement-run" });
+      assert.equal(competing.terminal.kind, "failed");
+      assert.match(competing.terminal.error.message, /another DSH native attempt/u);
+      let drained = false;
+      const cleanup = action === "dispose"
+        ? f.harness.dispose().then(() => { drained = true; })
+        : f.harness.reset({ sessionId: f.p.sessionId, reason: "reset" });
+      await tick();
+      assert.equal(f.input.signal.aborted, true);
+      if (action === "dispose") assert.equal(drained, false, "Disposal must wait for pending publication");
+      finish.resolve();
+      const result = await pending;
+      await cleanup;
+      assert.equal(result.terminal.kind, "aborted");
+      assert.equal(f.sdk.emitAgentEvent.mock.callCount(), 0);
+      noCompletedAssistant(result);
+    });
+  }
+});
+
+test("awaits the public end-hook barrier before final publication", async (t) => {
+  const f = fixture(t);
+  const reached = deferred();
+  const finish = deferred();
+  f.sdk.awaitAgentHarnessAgentEndHook = f.spy("endHook", async () => {
+    reached.resolve();
+    await finish.promise;
+  });
+  const pending = f.harness.runAttempt(f.p);
+  await reached.promise;
+  assert.equal(f.sdk.emitAgentEvent.mock.callCount(), 0);
+  assert.equal(f.p.onAgentEvent.mock.callCount(), 0);
+  finish.resolve();
+  assert.equal((await pending).terminal.kind, "ok");
+  assert.equal(f.sdk.emitAgentEvent.mock.callCount(), 1);
+});
+
 test("accepts the host's default idle permissionChange object and legacy context engine", async (t) => {
   const f = fixture(t, { contextEngine: { info: { id: "legacy", ownsCompaction: false, hostRequirements: {} } } });
   assert.equal((await f.harness.runAttempt(f.p)).terminal.kind, "ok");
@@ -486,6 +657,7 @@ test("late cleanup or agent-end failure must not advertise a completed assistant
       assert.equal(result.terminal.kind, "failed");
       assert.equal(result.terminal.error, primary);
       assert.equal(result.assistantTranscriptOwned, true);
+      assert.equal(f.sdk.emitAgentEvent.mock.callCount(), 0);
       noCompletedAssistant(result);
     });
   }
@@ -572,6 +744,7 @@ test("a suppressed native mirror is failed but owned, preventing host fallback p
   assert.equal(result.currentAttemptAssistant, undefined);
   assert.equal(result.messagesSnapshot.some((message) => message.role === "assistant"), false);
   assert.equal(result.replayMetadata.replaySafe, false);
+  assert.equal(f.sdk.emitAgentEvent.mock.callCount(), 0);
   noCompletedAssistant(result);
 });
 
@@ -600,7 +773,7 @@ test("input/output/finalize/end hooks receive canonical host context and truthfu
   assert.equal(finalize.event.messages.at(-1), output.event.lastAssistant);
   assert.equal(finalize.event.lastAssistantMessage, f.output.text);
   assert.equal(finalize.event.stopHookActive, false);
-  const end = f.sdk.runAgentHarnessAgentEndHook.mock.calls[0].arguments[0];
+  const end = f.sdk.awaitAgentHarnessAgentEndHook.mock.calls[0].arguments[0];
   assert.equal(end.ctx, input.ctx);
   assert.equal(end.event.messages, result.messagesSnapshot);
   assert.equal(end.event.success, true);
@@ -623,7 +796,7 @@ test("revision requests fail closed without rerunning the provider or persisting
   assert.equal(f.transcript.persistAssistant.mock.callCount(), 0);
   noMirrorOwnership(result);
   noCompletedAssistant(result);
-  const end = f.sdk.runAgentHarnessAgentEndHook.mock.calls[0].arguments[0].event;
+  const end = f.sdk.awaitAgentHarnessAgentEndHook.mock.calls[0].arguments[0].event;
   assert.equal(end.success, false);
   assert.match(end.error, /revision/u);
 });
@@ -640,7 +813,7 @@ test("input/output/finalization hook failures stay failures and never complete a
       assert.equal(f.transcript.persistAssistant.mock.callCount(), 0);
       noMirrorOwnership(result);
       noCompletedAssistant(result);
-      assert.equal(f.sdk.runAgentHarnessAgentEndHook.mock.calls[0].arguments[0].event.success, false);
+      assert.equal(f.sdk.awaitAgentHarnessAgentEndHook.mock.calls[0].arguments[0].event.success, false);
     });
   }
 });

@@ -106,6 +106,8 @@ test("OpenClaw 2026.9.2 public SDK release smoke", { concurrency: false }, async
         "resolveBootstrapContextForRun",
         "resolveAgentHarnessBeforePromptBuildResult",
         "runAgentHarnessBeforeMessageWriteHook",
+        "emitAgentEvent",
+        "awaitAgentHarnessAgentEndHook",
       ]) assert.equal(typeof sdk[name], "function", name);
       // Transcript reads can open SQLite; test the public surface without opening a store.
       for (const name of [

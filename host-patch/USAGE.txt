@@ -1,5 +1,5 @@
 OPENCLAW AGENT HARNESS PIN -- OPTIONAL EXPERIMENTAL HOST PATCH
-DSH Native 0.3.0
+DSH Native 0.3.1 (unchanged patch specification from 0.3.0)
 
 Project: https://github.com/ericzhaouu/dsh-native
 Author: https://github.com/ericzhaouu
@@ -44,7 +44,7 @@ Do not change global defaults, credentials or policies merely to select DSH.
 If the Agent has no model override, it inherits the normal default.
 
 The pin takes precedence over model/provider runtime selection, including
-fallback candidates. That DOES NOT add provider support. DSH Native 0.3.0
+fallback candidates. That DOES NOT add provider support. DSH Native 0.3.1
 supports only deepseek / openai-completions and github-copilot GPT /
 openai-responses. Unsupported pins fail with a typed error, not a substitute
 model or an escape to the built-in runtime.
@@ -99,7 +99,7 @@ MAINTENANCE: STOP BEFORE INSTALL / PATCH / CONFIGURATION
    Gateway after plugin/runtime changes. Do not write live config first.
 4. Install the reviewed plugin while Gateway remains stopped:
 
-     openclaw plugins install "C:\PATH\TO\openclaw-dsh-native-0.3.0.tgz" --force --accept-capabilities
+     openclaw plugins install "C:\PATH\TO\openclaw-dsh-native-0.3.1.tgz" --force --accept-capabilities
 
    --force confirms the local source/overwrite; official --accept-capabilities
    accepts declared capabilities of reviewed code, not a policy bypass.

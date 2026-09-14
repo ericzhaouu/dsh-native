@@ -6,7 +6,6 @@ import { patchHost } from "../../host-patch/apply.mjs";
 export const projectRoot = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
 
 export async function createPatchedHostFixture(root) {
-  const pluginSource = process.env.DSH_NATIVE_PACKAGED_ROOT ?? projectRoot;
   const source = join(projectRoot, "node_modules", "openclaw");
   const host = join(root, "openclaw");
   await mkdir(host);
@@ -15,6 +14,11 @@ export async function createPatchedHostFixture(root) {
   }
   await symlink(join(projectRoot, "node_modules"), join(host, "node_modules"), "junction");
   await patchHost(host, { action: "apply", offlineConfirmed: true });
+  return { host, plugin: await createPluginFixture(root, host) };
+}
+
+export async function createPluginFixture(root, host) {
+  const pluginSource = process.env.DSH_NATIVE_PACKAGED_ROOT ?? projectRoot;
   const plugin = join(root, "plugin");
   await mkdir(plugin);
   for (const name of ["package.json", "openclaw.plugin.json", "dist"]) {
@@ -26,5 +30,5 @@ export async function createPatchedHostFixture(root) {
     await mkdir(dirname(target), { recursive: true });
     await symlink(name === "openclaw" ? host : join(projectRoot, "node_modules", ...name.split("/")), target, "junction");
   }
-  return { host, plugin };
+  return plugin;
 }
