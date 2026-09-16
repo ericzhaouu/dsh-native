@@ -22,7 +22,7 @@ const prompt = () => createUserMessage({ content: [{ type: "text", text: "Hello"
 const assistant = (content) => createAssistantMessage({ content, source: { provider: "test", model: "test" } });
 const channel = (events, type) => events.filter((event) => event.type === type).map((event) => event.text).join("");
 
-async function harness(t, generate = async function* () { yield text("Done"); yield finish(); }, setup) {
+async function harness(t, generate = async function* () { yield text("Done"); yield finish(); }, setup, trackerOptions) {
   const ctx = new Context();
   t.after(() => ctx.fiber.dispose());
   await ctx.plugin(Spine, {
@@ -46,7 +46,7 @@ async function harness(t, generate = async function* () { yield text("Done"); yi
     sessionId: SessionId(`worker-turn-${++nextId}`),
     agentOptions: { provider: "test", model: "test" },
     setup(agentCtx) {
-      tracker = new TurnTracker(agentCtx, (event) => events.push(event));
+      tracker = new TurnTracker(agentCtx, (event) => events.push(event), trackerOptions);
       setup?.(agentCtx);
     },
   });
@@ -442,4 +442,84 @@ test("requires scoped idle context, validates identity, detaches idempotently, a
   await h.ctx.sessions.flush(h.agent.session);
   assert.throws(() => tracker.result(h.agent.id, false, 0), (error) => error === thrown);
   assert.deepEqual(h.events, []);
+});
+
+test("internal steps hide every text/reasoning projection but retain canonical history and usage", async (t) => {
+  const classified = [];
+  const h = await harness(t, async function* (_options, call) {
+    if (call === 1) {
+      yield text("internal ");
+      yield { type: "block-end", index: 0, block: { type: "text", text: "internal JSON" } };
+      yield reasoning("private reasoning");
+      yield {
+        type: "block-end", index: 2,
+        block: { type: "tool-call", id: "prepare", name: "control", arguments: "{}" },
+      };
+      yield usage(7, 4, 3, 2);
+      yield finish("tool-calls");
+    } else {
+      yield text("Visible answer");
+      yield reasoning("Visible reasoning");
+      yield usage(2, 3, 4, 1);
+      yield finish();
+    }
+  }, (ctx) => ctx.tools.register({
+    name: "control", description: "Internal", parameters: { type: "object" },
+    output: { schema: { type: "string" }, render: (_args, value) => [{ type: "text", text: value }] },
+    async execute() { return "internal result"; },
+  }), { isInternalStep(turn, step) { classified.push([turn, step]); return step === 1; } });
+  h.agent.followup(prompt());
+  const result = await h.settle();
+  assert.equal(result.text, "Visible answer");
+  assert.equal(result.reasoning, "Visible reasoning");
+  assert.equal(channel(h.events, "text"), result.text);
+  assert.equal(channel(h.events, "reasoning"), result.reasoning);
+  assert.deepEqual(result.usage, { input: 9, output: 7, cacheRead: 7, cacheWrite: 3 });
+  assert.deepEqual(classified, [[1, 1], [1, 2]]);
+  const messages = h.agent.session.events.filter((event) => event.type === "assistant/message");
+  assert.ok(messages[0].data.message.content.some((block) => block.text === "internal JSON"));
+  assert.ok(messages[0].data.message.content.some((block) => block.text === "private reasoning"));
+});
+
+test("internal-only output is never a visible final response, including max-tokens", async (t) => {
+  for (const kind of ["stop", "max-tokens"]) {
+    const h = await harness(t, async function* () { yield text("internal"); yield finish(kind); },
+      undefined, { isInternalStep: () => true });
+    h.agent.followup(prompt());
+    await assert.rejects(h.settle(), /no committed final assistant output/);
+    assert.equal(channel(h.events, "text"), "");
+  }
+});
+
+test("hiding a step never bypasses stream provenance, canonical blocks, finish, or retry validation", async (t) => {
+  for (const fault of ["sources", "rewrite", "block", "finish", "retry"]) {
+    const h = await harness(t, undefined, undefined, { isInternalStep: () => true });
+    const m = manual(h);
+    m.chunk(text("raw"));
+    if (fault === "block") m.chunk({ type: "block-end", index: 0, block: { type: "text", text: "changed" } });
+    if (fault !== "finish") m.chunk(fault === "retry" ? failure() : finish());
+    m.commit([{ type: "text", text: fault === "rewrite" ? "changed" : "raw" }], {},
+      fault === "sources" ? [] : undefined);
+    m.end();
+    assert.throws(() => h.tracker.assertHealthy(), /different stream attempt|differs|terminal finish|abandoned streamed output/);
+    await assert.rejects(h.settle(), /different stream attempt|differs|terminal finish|abandoned streamed output/);
+    assert.equal(channel(h.events, "text"), "");
+    assert.equal(channel(h.events, "reasoning"), "");
+  }
+});
+
+test("internal classification is frozen at step/start and an interrupted internal prefix stays hidden", async (t) => {
+  let internal = true;
+  const h = await harness(t, undefined, undefined, { isInternalStep: () => internal });
+  const m = manual(h);
+  internal = false;
+  m.chunk(text("internal partial"));
+  m.chunk(reasoning("internal thinking"));
+  m.commit([{ type: "text", text: "internal partial" }], { interrupted: true });
+  m.end({ kind: "aborted", reason: { kind: "user" } });
+  const result = await h.settle(true);
+  assert.equal(result.stopReason, "aborted");
+  assert.equal(result.text, "");
+  assert.equal(result.reasoning, undefined);
+  assert.deepEqual(result.usage, zero);
 });

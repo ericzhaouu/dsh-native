@@ -7,6 +7,7 @@ import type {
   ModelProvider,
   ReasoningEfforts,
 } from "./protocol.js";
+import type { PreparationPolicy, PreparationResolution, TaskPreparationConfig } from "./preparation.js";
 
 export interface DshConfig {
   stateDir: string;
@@ -15,6 +16,7 @@ export interface DshConfig {
   streamIdleTimeoutMs: number;
   allowedBaseUrls: string[];
   allowedCopilotBaseUrls?: string[];
+  taskPreparation?: TaskPreparationConfig;
 }
 
 export interface DshAttempt {
@@ -39,6 +41,8 @@ export interface DshAttempt {
   assertActive(): void;
   onEvent(event: BridgeEvent): void | Promise<void>;
   executeTool(call: BridgeToolCall, signal: AbortSignal): Promise<BridgeToolResult>;
+  taskPreparation?: { policy: PreparationPolicy; userText: string };
+  onPreparationDecision?(resolution: PreparationResolution): void | Promise<void>;
 }
 
 export interface DshRuntime {

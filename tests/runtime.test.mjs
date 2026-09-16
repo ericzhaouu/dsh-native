@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { createHash, randomUUID } from "node:crypto";
+import { mkdir, readdir, readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import { parseDshConfig } from "../dist/config.js";
 import { createDshRuntime } from "../dist/runtime.js";
 import { startModelServer } from "./fixtures/model-server.mjs";
@@ -10,7 +11,8 @@ import { startModelServer } from "./fixtures/model-server.mjs";
 const SENTINEL = "not-a-real-key-dsh-native-test";
 
 async function fixture(responder, body) {
-  const root = await mkdtemp(join(tmpdir(), "dsh-native-test-"));
+  const root = join(fileURLToPath(new URL(".", import.meta.url)), `.runtime-${randomUUID()}`);
+  await mkdir(root);
   const model = await startModelServer(responder);
   const runtime = createDshRuntime(parseDshConfig({
     stateDir: root, allowedBaseUrls: [model.baseUrl],
@@ -64,6 +66,7 @@ test("real DSH boots with only host tools, streams, and resumes in a new child",
     assert.equal(first.text, "Fixture complete.");
     assert.equal(first.stopReason, "stop");
     assert.equal(first.toolCalls, 1);
+    assert.equal(Object.hasOwn(first, "preparation"), false);
     assert.equal(calls, 1);
     assert.ok(first.usage.output > 0);
     assert.ok(events.some((event) => event.type === "text"));
@@ -78,6 +81,9 @@ test("real DSH boots with only host tools, streams, and resumes in a new child",
     assert.equal(second.sessionId, first.sessionId);
     assert.equal(calls, 1);
     assert.ok(model.requests.at(-1).body.messages.some((message) => message.content === "fixture-content"));
+    const binding = JSON.parse(await readFile(join(root,
+      createHash("sha256").update(input.sessionId).digest("hex"), "binding.json"), "utf8"));
+    assert.equal(Object.hasOwn(binding, "taskPreparation"), false);
     await assert.rejects(runtime.run({ ...input, runId: "run-2" }), /already submitted/);
     await assert.rejects(runtime.run({ ...input, runId: "run-1" }), /already submitted/);
     async function scan(directory) {

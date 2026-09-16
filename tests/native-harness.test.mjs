@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 import test from "node:test";
 import { createNativeHarness } from "../dist/native/harness.js";
 import { createNativeToolHost } from "../dist/native/host.js";
+import { parseTaskPreparationConfig, resolvePreparationDecision } from "../dist/preparation.js";
 
 /** @typedef {import("openclaw/plugin-sdk/agent-harness").AgentHarnessV2} AgentHarnessV2 */
 /** @typedef {Parameters<AgentHarnessV2["runAttempt"]>[0]} Attempt */
@@ -116,6 +117,7 @@ function fixture(t, overrides = {}) {
   });
   f.sdk = {
     getModelProviderRequestTransport: () => undefined,
+    resolveSessionAgentIds: f.spy("resolveAgent", () => ({ sessionAgentId: "main" })),
     setActiveEmbeddedRun: f.spy("register", (_sessionId, handle) => { f.handle = handle; }),
     clearActiveEmbeddedRun: f.spy("clear"),
     emitAgentEvent: f.spy("emitAgentEvent"),
@@ -307,6 +309,68 @@ test("construction is deferred and support is strictly opt-in", async (t) => {
   }
   assert.equal(f.harness.supports({ ...support, requestedRuntime: "dsh-native" }).supported, true);
   assert.deepEqual(f.events, []);
+});
+
+test("adaptive preparation is selected only for an exact configured Agent", async (t) => {
+  for (const enabled of [false, true]) {
+    await t.test(enabled ? "enabled" : "unlisted", async (t) => {
+      const f = fixture(t, { transcriptPrompt: "Create a local file.", prompt: "Host-wrapped user request" });
+      const taskPreparation = parseTaskPreparationConfig({ agentIds: enabled ? ["main"] : ["another-agent"] });
+      f.harness = createNativeHarness({ ...config, taskPreparation }, f.runtime, f.dependencies);
+      f.run = async (input) => {
+        if (!enabled) {
+          assert.equal(input.taskPreparation, undefined);
+          assert.equal(input.onPreparationDecision, undefined);
+          assert.equal(f.dependencies.prepareHost.mock.calls[0].arguments[4], undefined);
+          return f.output;
+        }
+        assert.equal(input.prompt, f.p.prompt, "Preparation must not overwrite the normal task prompt");
+        assert.equal(input.taskPreparation.userText, f.p.transcriptPrompt, "Evidence must use the original admitted input");
+        const preparation = f.dependencies.prepareHost.mock.calls[0].arguments[4];
+        assert.deepEqual(preparation.policy, input.taskPreparation.policy);
+        assert.throws(() => preparation.gate.assertAllowed("read"), /not authorized/);
+        const resolved = resolvePreparationDecision({
+          version: 1, ...input.taskPreparation,
+        }, {
+          version: 1, revision: 0, mode: "execute", task: "new",
+          goal: "Create a local file", deliverables: ["report.txt"], constraints: ["Workspace only"],
+          assumptions: [], unresolved: [], question: "", enhancedPrompt: "Create report.txt in the workspace.",
+          evidence: { source: "current", quote: "Create a local file." },
+        }, f.p.runId, ["read"]);
+        await input.onPreparationDecision(resolved);
+        assert.doesNotThrow(() => preparation.gate.assertAllowed("read"));
+        assert.throws(() => preparation.gate.assertAllowed("write"), /not authorized/);
+        return { ...f.output, preparation: resolved };
+      };
+      assert.equal((await f.harness.runAttempt(f.p)).terminal.kind, "ok");
+      assert.equal(f.transcript.persistUser.mock.callCount(), 1);
+      assert.equal(f.transcript.persistAssistant.mock.callCount(), 1);
+    });
+  }
+});
+
+test("adaptive preparation does not accept synthetic internal input as user execution authority", async (t) => {
+  const f = fixture(t, { inputProvenance: { kind: "internal_system", sourceTool: "fixture" } });
+  f.harness = createNativeHarness({
+    ...config, taskPreparation: parseTaskPreparationConfig({ agentIds: ["main"] }),
+  }, f.runtime, f.dependencies);
+  const result = await f.harness.runAttempt(f.p);
+  assert.equal(result.terminal.kind, "failed");
+  assert.match(result.terminal.error.message, /ordinary foreground user turn/);
+  assert.equal(f.runtime.run.mock.callCount(), 0);
+});
+
+test("missing explicit Agent identity is resolved before selecting the preparation gate", async (t) => {
+  const f = fixture(t, { agentId: undefined });
+  f.harness = createNativeHarness({
+    ...config, taskPreparation: parseTaskPreparationConfig({ agentIds: ["main"] }),
+  }, f.runtime, f.dependencies);
+  const result = await f.harness.runAttempt(f.p);
+  assert.equal(result.terminal.kind, "ok");
+  assert.equal(f.sdk.resolveSessionAgentIds.mock.callCount(), 1);
+  assert.equal(f.dependencies.prepareHost.mock.calls[0].arguments[0].agentId, "main");
+  assert.ok(f.dependencies.prepareHost.mock.calls[0].arguments[4].gate);
+  assert.ok(f.input.taskPreparation);
 });
 
 test("returns the V2 result with OpenClaw identity, canonical assistant usage and unpriced billing", async (t) => {

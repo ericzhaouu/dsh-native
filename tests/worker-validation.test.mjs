@@ -266,7 +266,7 @@ test("parseRun accepts distinct safe tool names and does not retain names betwee
 
 test("parseRun rejects unsafe, reserved, duplicate, and overlong tool names", () => {
   for (const name of [
-    ...nonStrings, "", " ", "run_code", "a".repeat(65), "a/b", "a\\b", "a.b", "a:b",
+    ...nonStrings, "", " ", "run_code", "dsh_prepare_task", "a".repeat(65), "a/b", "a\\b", "a.b", "a:b",
     "has space", "a\0b", "世界", ...lineTerminators.map((value) => `run_code${value}`),
   ]) {
     assert.throws(() => parseRun(run({ tools: [tool({ name })] })), TypeError, inspect(name));
@@ -277,6 +277,33 @@ test("parseRun rejects unsafe, reserved, duplicate, and overlong tool names", ()
   for (const description of [...nonStrings, "before\0after"]) {
     assert.throws(() => parseRun(run({ tools: [tool({ description })] })), TypeError, inspect(description));
   }
+});
+
+const preparation = () => ({
+  version: 1,
+  policy: { version: 1, executionTools: ["read", "exec"], skillAllowlist: [], maxClarificationTurns: 2, maxToolCalls: 3 },
+  userText: "Read the requested file.",
+});
+
+test("parseRun strictly parses opt-in task preparation and detaches its policy", () => {
+  const input = run({ taskPreparation: preparation() });
+  const parsed = parseRun(input);
+  assert.deepEqual(parsed, input);
+  parsed.taskPreparation.policy.executionTools.push("write");
+  assert.deepEqual(input.taskPreparation.policy.executionTools, ["read", "exec"]);
+  assert.equal(Object.hasOwn(parseRun(run()), "taskPreparation"), false);
+  assert.equal(Object.hasOwn(parseRun(run({ taskPreparation: undefined })), "taskPreparation"), false);
+  for (const value of [
+    null, false, {}, { ...preparation(), version: 2 }, { ...preparation(), extra: true },
+    { ...preparation(), policy: { ...preparation().policy, maxToolCalls: 0 } },
+    { ...preparation(), policy: { ...preparation().policy, executionTools: ["dsh_prepare_task"] } },
+    { ...preparation(), previous: {} }, { ...preparation(), userText: 1 },
+  ]) {
+    assert.throws(() => parseRun(run({ taskPreparation: value })), /preparation/i);
+  }
+  assert.throws(() => parseRun(run({
+    taskPreparation: preparation(), tools: [tool({ name: "dsh_prepare_task" })],
+  })), /reserved/);
 });
 
 test("parseRun requires a JSON object schema with explicit object type", () => {

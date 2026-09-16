@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createConnection, createServer } from "node:net";
+import { get } from "node:http";
 import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { createHash, generateKeyPairSync, randomUUID } from "node:crypto";
@@ -91,6 +92,37 @@ async function waitForPort(port, assertHealthy, timeoutMs = 180000) {
   }, timeoutMs, 250);
 }
 
+async function waitForReadiness(port, assertHealthy) {
+  await waitFor(() => {
+    assertHealthy();
+    return new Promise((resolve, reject) => {
+      const request = get(`http://127.0.0.1:${port}/readyz`, { timeout: 1500 }, (response) => {
+        if (response.statusCode !== 200) {
+          response.resume();
+          resolve(false);
+          return;
+        }
+        let body = "";
+        response.setEncoding("utf8");
+        response.on("data", (chunk) => {
+          body += chunk;
+          if (body.length > 8192) request.destroy(new Error("Oversized Gateway readiness response"));
+        });
+        response.once("error", reject);
+        response.once("end", () => {
+          try { resolve(JSON.parse(body).ready === true); }
+          catch (error) { reject(error); }
+        });
+      });
+      request.once("timeout", () => { resolve(false); request.destroy(); });
+      request.once("error", (error) => {
+        if (["ECONNREFUSED", "ECONNRESET", "ETIMEDOUT"].includes(error.code)) resolve(false);
+        else reject(error);
+      });
+    });
+  }, 180000, 250);
+}
+
 function envSubset() {
   return Object.fromEntries(Object.entries(process.env).filter(([key]) =>
     ["systemroot", "windir", "comspec", "pathext", "path", "temp", "tmp", "tmpdir", "lang"].includes(key.toLowerCase())));
@@ -115,7 +147,7 @@ async function withTimeout(promise, ms, message) {
   } finally { clearTimeout(timer); }
 }
 
-export async function startDashboardGateway(responder, { agentPinned = true, redactTranscriptIdentity = false } = {}) {
+export async function startDashboardGateway(responder, { agentPinned = true, redactTranscriptIdentity = false, taskPreparation } = {}) {
   assert.equal(OPENCLAW_VERSION, "2026.9.2", "Dashboard fixture must use the inspected genuine SDK");
   const root = join(packageRoot, "artifacts", `dashboard-gateway-${randomUUID()}`);
   const workspace = join(root, "workspace");
@@ -246,6 +278,7 @@ export async function startDashboardGateway(responder, { agentPinned = true, red
               stateDir: dshState,
               startupTimeoutMs: 120000,
               allowedCopilotBaseUrls: [responses.baseUrl],
+              ...(taskPreparation === undefined ? {} : { taskPreparation }),
             },
           },
         },
@@ -296,6 +329,7 @@ export async function startDashboardGateway(responder, { agentPinned = true, red
     child.stderr.on("data", (data) => { stderr += data; });
     try {
       await waitForPort(port, assertHealthy);
+      await waitForReadiness(port, assertHealthy);
     } catch (error) {
       const log = await readFile(logPath, "utf8").catch(() => "(no OpenClaw log)");
       throw new Error(`Gateway failed to open its port.\n${stdout}\n${stderr}\n${log.slice(-12000)}`, { cause: error });

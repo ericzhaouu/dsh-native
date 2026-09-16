@@ -1,3 +1,5 @@
+import type { PreparationRequest, PreparationResolution } from "./preparation.js";
+
 export const BRIDGE_VERSION = 1;
 export const RUNTIME_ID = "dsh-native";
 export const DSH_VERSION = "0.1.2-alpha.2";
@@ -25,6 +27,7 @@ export interface BridgeRun {
   reasoningEffort?: string;
   maxTokens?: number;
   tools: BridgeTool[];
+  taskPreparation?: PreparationRequest;
 }
 
 export interface BridgeUsage {
@@ -41,6 +44,7 @@ export interface BridgeResult {
   stopReason: "stop" | "length" | "aborted";
   sessionId: string;
   toolCalls: number;
+  preparation?: PreparationResolution;
 }
 
 export interface BridgeToolCall {

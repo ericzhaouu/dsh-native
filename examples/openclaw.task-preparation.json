@@ -1,0 +1,28 @@
+{
+  "plugins": {
+    "entries": {
+      "dsh-native": {
+        "enabled": true,
+        "config": {
+          "taskPreparation": {
+            "agentIds": ["dsh-experiment"],
+            "executionTools": ["read", "write", "edit", "apply_patch", "exec", "process"],
+            "skillAllowlist": [],
+            "maxClarificationTurns": 3,
+            "maxToolCalls": 24
+          }
+        }
+      }
+    }
+  },
+  "agents": {
+    "entries": {
+      "dsh-experiment": {
+        "runtime": {
+          "type": "embedded",
+          "harness": "dsh-native"
+        }
+      }
+    }
+  }
+}

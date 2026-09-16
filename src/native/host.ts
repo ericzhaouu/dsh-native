@@ -3,6 +3,8 @@ import { isAbsolute, relative, resolve } from "node:path";
 import type { AgentHarnessV2, AnyAgentTool } from "openclaw/plugin-sdk/agent-harness";
 import { resolveAgentConfig } from "openclaw/plugin-sdk/agent-scope-runtime";
 import type { BridgeTool, BridgeToolCall, BridgeToolResult, JsonObject } from "../protocol.js";
+import { renderPreparationInstructions, type PreparationPolicy } from "../preparation.js";
+import { filterPreparationSkills, type PreparationGate } from "./preparation.js";
 
 type Attempt = Parameters<AgentHarnessV2["runAttempt"]>[0];
 type Runtime = typeof import("openclaw/plugin-sdk/agent-harness-runtime");
@@ -144,6 +146,7 @@ export interface NativeToolHostOptions {
   observeToolTerminal?: Attempt["observeToolTerminal"];
   onAgentToolResult?: Attempt["onAgentToolResult"];
   cleanups?: Array<(reason: string) => Promise<void>>;
+  preparationGate?: PreparationGate;
 }
 
 /** Installs the final dispatch gate before the host adds its before-tool policy wrapper. */
@@ -206,6 +209,7 @@ export function createNativeToolHost(options: NativeToolHostOptions): Omit<Nativ
       check(executionSignal);
       if (executionAllow && !executionAllow.has(tool.name)) throw new Error(`Execution denied for ${tool.name}`);
       validate(tool.name, args);
+      options.preparationGate?.start(tool.name);
       invocation.args = args as Record<string, unknown>;
       invocation.started = true;
       startedCount++;
@@ -291,6 +295,7 @@ export function createNativeToolHost(options: NativeToolHostOptions): Omit<Nativ
         }
         if (!byName.has(call.name)) throw new Error(`Unknown or unavailable host tool: ${call.name}`);
         if (executionAllow && !executionAllow.has(call.name)) throw new Error(`Execution denied for ${call.name}`);
+        options.preparationGate?.assertAllowed(call.name);
         validate(call.name, call.arguments);
       } catch (error) {
         return Promise.reject(error);
@@ -324,7 +329,8 @@ export function createNativeToolHost(options: NativeToolHostOptions): Omit<Nativ
 }
 
 export async function prepareNativeHost(p: Parameters<AgentHarnessV2["runAttempt"]>[0], signal: AbortSignal,
-  assertActive: () => void, history: Awaited<ReturnType<AgentHarnessV2["runAttempt"]>>["messagesSnapshot"] = []): Promise<NativeHost> {
+  assertActive: () => void, history: Awaited<ReturnType<AgentHarnessV2["runAttempt"]>>["messagesSnapshot"] = [],
+  preparation?: { policy: PreparationPolicy; gate: PreparationGate }): Promise<NativeHost> {
   assertNativeHostSupported(p);
   const controller = new AbortController();
   const lifetime = AbortSignal.any([signal, controller.signal, ...(p.abortSignal ? [p.abortSignal] : [])]);
@@ -403,6 +409,10 @@ export async function prepareNativeHost(p: Parameters<AgentHarnessV2["runAttempt
         tools = tools.filter((tool) => !denied.has(tool));
       }
       if (p.forceRestartSafeTools) tools = tools.filter((tool) => sdk.isAgentToolReplaySafe(tool));
+      if (preparation) {
+        const allowed = new Set(preparation.policy.executionTools);
+        tools = tools.filter((tool) => allowed.has(tool.name));
+      }
     }
     check();
     const bootstrapWorkspaceDir = p.bootstrapWorkspaceDir ?? p.workspaceDir;
@@ -427,15 +437,19 @@ export async function prepareNativeHost(p: Parameters<AgentHarnessV2["runAttempt
       toolAuthority: { fingerprint: p.toolAuthorityFingerprint, activeToolNames: () => tools.map((tool) => tool.name), assertActive: check },
       developerInstructions: { build: ({ toolsAllow }) => {
         tools = sdk.applyEmbeddedAttemptToolsAllow(tools, toolsAllow);
-        return renderNativeSystemPrompt({
+        const prompt = renderNativeSystemPrompt({
         workspaceDir: foreground.workspaceDir, cwd, bootstrapWorkspaceDir, contextFiles,
         toolNames: tools.map((tool) => tool.name),
         credentialSafety: sdk.buildCredentialSafetyPrompt(),
         replyGuidance: sdk.buildHarnessVisibleReplyGuidance({
           sourceReplyDeliveryMode: foreground.sourceReplyDeliveryMode, messageToolAvailable: false,
         }),
-        skillsPrompt: foreground.skillsSnapshot?.prompt, extraSystemPrompt: foreground.extraSystemPrompt,
+        skillsPrompt: preparation
+          ? filterPreparationSkills(foreground.skillsSnapshot?.prompt, preparation.policy.skillAllowlist)
+          : foreground.skillsSnapshot?.prompt,
+        extraSystemPrompt: foreground.extraSystemPrompt,
         });
+        return preparation ? `${prompt}\n\n${renderPreparationInstructions(preparation.policy)}` : prompt;
       } },
     });
     check();
@@ -447,6 +461,7 @@ export async function prepareNativeHost(p: Parameters<AgentHarnessV2["runAttempt
       channelId: p.chatId ?? p.currentChannelId, toolExecutionAllow: p.toolExecutionAllow,
       initialReplayState: p.initialReplayState, observeToolTerminal: p.observeToolTerminal,
       onAgentToolResult: p.onAgentToolResult, cleanups,
+      preparationGate: preparation?.gate,
     });
     const preparedHost = host;
     return {

@@ -1,4 +1,4 @@
-DSH NATIVE FOR OPENCLAW -- EXPERIMENTAL 0.3.1
+DSH NATIVE FOR OPENCLAW -- EXPERIMENTAL 0.4.0
 
 Source: https://github.com/ericzhaouu/dsh-native
 Author: https://github.com/ericzhaouu
@@ -8,7 +8,38 @@ Example Agent: dsh-experiment
 License: MIT; Copyright (c) 2026 ericzhaouu.
 The Chinese README.md contains the complete guide.
 
-VERSION 0.3.1
+ADAPTIVE TASK PREPARATION (0.4.0, DEFAULT OFF)
+
+Optional taskPreparation configuration applies only to exact agentIds.
+Chat/clarify/draft modes have no host tools; execute gets the intersection of
+executionTools and current host permissions. No model decision grants new authority.
+One first-step dsh_prepare_task control call is validated by the parent before
+any host tool can become available. Decision and execution cannot be batched in
+the same model response. Preparation text/reasoning stays out of visible replies,
+but its usage and native decision record remain part of the private session.
+
+Defaults: agentIds=[], skillAllowlist=[], maxClarificationTurns=3 (1..5),
+maxToolCalls=24 (1..100 per attempt). executionTools defaults to the existing core
+coding tool family and can only narrow what the host provides. Every enabled turn
+normally adds a model decision step; this is not zero-cost intent classification.
+See examples\openclaw.task-preparation.json and the complete Chinese README.
+
+The original user message is retained. Compact task state is versioned and
+committed with the existing private binding after successful native settlement.
+Each turn recomputes its gate. Changing policy or toggling preparation on an
+existing session requires /new; corrupt/uncertain state never falls back to
+unrestricted execution. Reaching the clarification limit produces an unresolved
+draft, not mandatory execution. Only explicit skillAllowlist entries are advertised.
+Listing a skill is not a guarantee its dependencies or tools are supported.
+
+Natural-language intent classification can be wrong. Opt-in permits automatic
+handling of sufficiently clear requests within the configured ceiling; it is not
+a semantic authorization proof or an exec/network sandbox. Keep host approval
+rules. Remove exec/process from the ceiling when arbitrary programs are unwanted.
+No new search/browser/MCP/delegation or privilege-escalation support is added.
+Do not use another tool to bypass unavailable capabilities.
+
+RETAINED 0.3.1 FIXES
 
 Current-attempt attribution uses the validated executing provider/model instead
 of redacted transcript identity. Canonical content and redaction remain intact.
@@ -64,7 +95,7 @@ PowerShell examples follow; C:\PATH\TO values are placeholders.
   node --version
   npm.cmd ci
 
-Confirm package.json version 0.3.1. OpenClaw is an optional peer to avoid
+Confirm package.json version 0.4.0. OpenClaw is an optional peer to avoid
 bundling a second production host. Development still needs the genuine SDK.
 If it is absent, obtain and verify the exact official 2026.9.2 artifact from
 the OpenClaw release workflow, then install it locally:
@@ -78,7 +109,7 @@ the OpenClaw release workflow, then install it locally:
 If the configured registry lacks that SDK, use the verified official artifact,
 not speculative npm versions, a newer preview or hand-written replacement SDK
 types. The check is read-only; it should report unpatched for the stock pinned
-artifact. npm pack runs prepack/build and creates openclaw-dsh-native-0.3.1.tgz.
+artifact. npm pack runs prepack/build and creates openclaw-dsh-native-0.4.0.tgz.
 Use npm.cmd if PowerShell blocks npm.ps1; do not change execution policy.
 
 MAINTENANCE BEFORE INSTALL / PATCH / CONFIGURATION
@@ -95,7 +126,7 @@ Use the correct installation/profile and keep its supervisor from respawning it.
 
   openclaw gateway stop --force
   openclaw gateway status --no-probe
-  openclaw plugins install "C:\PATH\TO\openclaw-dsh-native-0.3.1.tgz" --force --accept-capabilities
+  openclaw plugins install "C:\PATH\TO\openclaw-dsh-native-0.4.0.tgz" --force --accept-capabilities
 
 The operator must verify shutdown; service status alone is not proof that all
 old processes/tools have exited. For gateway stop, --force confirms a
@@ -110,7 +141,7 @@ a host version or rewriting shared host dependencies. A prepared-directory
 installation is an alternative, still with Gateway stopped:
 
   New-Item -ItemType Directory -Path .\artifacts\prepared-dsh-native
-  tar -xf .\openclaw-dsh-native-0.3.1.tgz -C .\artifacts\prepared-dsh-native
+  tar -xf .\openclaw-dsh-native-0.4.0.tgz -C .\artifacts\prepared-dsh-native
   Push-Location .\artifacts\prepared-dsh-native\package
   npm.cmd ci --omit=dev
   Pop-Location
@@ -353,7 +384,7 @@ read host-patch\USAGE.txt; --recover-stale-lock is NOT a native-session unlock.
 For upgrades, retain a known-good plugin archive/config, stop before reinstall,
 recheck the exact host artifact and use /new. Host updates can replace patched
 files; maintenance/rebasing is required. Do not apply this patch to new builds
-or replace individual live JS files. 0.3.1 includes the prior streaming fix.
+or replace individual live JS files. 0.4.0 retains the prior streaming/delivery fixes.
 
 DEVELOPMENT / TEST LIMITS
 

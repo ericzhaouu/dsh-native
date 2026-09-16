@@ -2,17 +2,21 @@ import type { Context } from "@deepseek-ai/cordis";
 import type {} from "@deepseek-ai/cordis-plugin-loader";
 import { assembleContextFor, type Agent, type AgentHandle, type AgentOptions } from "@deepseek-ai/dsh-agent";
 import { createUserMessage, HarnessError, ReasoningEffortId, type GenerateOptions, type ToolSchema } from "@deepseek-ai/dsh-llm";
-import { SessionId } from "@deepseek-ai/dsh-session";
+import { SessionId, type SessionEvent } from "@deepseek-ai/dsh-session";
 import type {} from "@deepseek-ai/dsh-session-persistence";
 import { renderContextSnapshot, renderPrompt } from "@deepseek-ai/dsh-system-prompt";
-import type { ToolDefinition, ToolRunContext } from "@deepseek-ai/dsh-tools";
+import type { ToolDefinition, ToolExecution, ToolExecutionResult, ToolRunContext } from "@deepseek-ai/dsh-tools";
 import { Ajv } from "ajv";
 import { realpath, stat } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { normalize } from "node:path";
 import type { Readable, Writable } from "node:stream";
 import { isDeepStrictEqual } from "node:util";
-import { BRIDGE_VERSION, DSH_VERSION, type BridgeEvent, type BridgeResult, type BridgeRun } from "../protocol.js";
+import { BRIDGE_VERSION, DSH_VERSION, type BridgeEvent, type BridgeResult, type BridgeRun, type BridgeTool } from "../protocol.js";
+import {
+  createPreparationTool, parsePreparationDecision, parsePreparationResolution, PREPARATION_TOOL_NAME,
+  type PreparationDecision, type PreparationResolution,
+} from "../preparation.js";
 import { JsonRpcPeer } from "../rpc.js";
 import { TurnTracker } from "./turn.js";
 import { assertCopilotReplaySafe, sanitizeCopilotStream } from "./copilot-replay.js";
@@ -50,6 +54,25 @@ function auditSchemas(actual: readonly ToolSchema[], expected: readonly ToolSche
   }
 }
 
+interface ExpectedCall {
+  readonly block: Readonly<{ id: string; name: string; arguments: string }>;
+  seq?: number;
+  token?: ToolExecution["token"];
+  invoked?: boolean;
+  result?: Readonly<ToolExecutionResult>;
+  committed?: boolean;
+}
+
+interface PreparationStep {
+  readonly turn: number;
+  readonly step: number;
+  readonly internal: boolean;
+  readonly tools: readonly ToolSchema[];
+  signal?: AbortSignal;
+  calls?: readonly ExpectedCall[];
+  ended: boolean;
+}
+
 /** Owns a single request and Agent handle; never changes the process workspace. */
 export class BridgeWorker {
   readonly peer: JsonRpcPeer;
@@ -69,8 +92,15 @@ export class BridgeWorker {
   private toolCalls = 0;
   private readonly callIds = new Set<string>();
   private readonly definitions = new Map<string, ToolDefinition>();
+  private readonly hostDefinitions = new Map<string, ToolDefinition>();
+  private readonly registrations = new Map<string, () => void>();
   private readonly writes = new Set<Promise<void>>();
   private request?: BridgeRun;
+  private preparationTool?: BridgeTool;
+  private controlStep?: PreparationStep;
+  private activeStep?: PreparationStep;
+  private preparation?: PreparationResolution;
+  private preparationReady = false;
 
   constructor(
     private readonly ctx: Context,
@@ -153,12 +183,42 @@ export class BridgeWorker {
     this.auditGlobal();
     const agent = this.agent;
     if (!agent) throw new Error("No owned DSH agent");
-    auditSchemas(agent.ctx.tools.schemas(agent), [...this.definitions.values()]);
+    auditSchemas(agent.ctx.tools.schemas(agent), this.activeSchemas());
     for (const [name, definition] of this.definitions) {
       if (agent.ctx.tools.get(name, agent) !== definition) {
         throw new Error(`DSH tool callback was replaced: ${name}`);
       }
     }
+  }
+
+  private activeSchemas(): ToolSchema[] {
+    return [...this.definitions.keys()].map((name) => {
+      const schema = name === PREPARATION_TOOL_NAME
+        ? this.preparationTool : this.request?.tools.find((tool) => tool.name === name);
+      if (!schema) throw new Error(`Unapproved DSH tool definition: ${name}`);
+      return schema;
+    });
+  }
+
+  private registerTool(definition: ToolDefinition): void {
+    const agent = this.agent;
+    if (!agent || this.definitions.has(definition.name)) throw new Error("Invalid DSH tool registration");
+    // DSH emits tools/change synchronously after mutation. Stage the exact new
+    // inventory first; every notification remains audited, including transitions.
+    this.definitions.set(definition.name, definition);
+    this.registrations.set(definition.name, agent.ctx.tools.register(definition));
+    this.auditTools();
+    this.assertHealthy();
+  }
+
+  private unregisterTool(name: string): void {
+    const dispose = this.registrations.get(name);
+    if (!dispose) throw new Error(`Missing owned DSH tool registration: ${name}`);
+    this.definitions.delete(name);
+    this.registrations.delete(name);
+    dispose();
+    this.auditTools();
+    this.assertHealthy();
   }
 
   private auditRequest(options: GenerateOptions): void {
@@ -171,7 +231,18 @@ export class BridgeWorker {
       throw new Error("Unowned, auxiliary, or rerouted DSH model request");
     }
     if ((options.system ?? "") !== run.systemPrompt) throw new Error("DSH changed the host system prompt");
-    auditSchemas(options.tools ?? [], run.tools);
+    if (run.taskPreparation) {
+      const step = this.activeStep;
+      if (!step || step.ended || step.calls || !step.signal || options.signal !== step.signal ||
+        this.agent?.status !== "running" || this.cancelled || step.signal.aborted ||
+        (step.internal ? this.preparationReady : !this.preparationReady)) {
+        throw new Error("Unowned or out-of-phase DSH preparation model request");
+      }
+      auditSchemas(options.tools ?? [], step.tools);
+      auditSchemas(options.tools ?? [], this.activeSchemas());
+    } else {
+      auditSchemas(options.tools ?? [], run.tools);
+    }
   }
 
   private emit = (event: BridgeEvent): void => {
@@ -243,14 +314,25 @@ export class BridgeWorker {
     agentCtx.systemPrompt.section({
       name: "openclaw:complete", order: 0, complete: true, text: "{{openclaw_system_prompt}}",
     });
-    agentCtx.on("agent/request", async (_event, next) => {
+    agentCtx.on("agent/request", async (event, next) => {
       await next();
+      if (run.taskPreparation) {
+        const step = this.activeStep;
+        if (event.agent !== agent || !step || step.ended || step.turn !== event.turn || step.step !== event.step) {
+          const error = new Error("Unowned DSH preparation request step");
+          this.fail(error);
+          throw error;
+        }
+        step.signal = event.signal;
+      }
       // Resume otherwise inherits an earlier explicit reasoning effort. Missing
       // fields in this run must instead use the current adapter/profile defaults.
+      const maxTokens = run.taskPreparation && this.activeStep?.internal
+        ? Math.min(run.maxTokens ?? 8192, 8192) : run.maxTokens;
       return {
         provider: providerRoute(run.provider), model: run.modelId,
         ...(run.reasoningEffort === undefined ? {} : { reasoningEffort: ReasoningEffortId(run.reasoningEffort) }),
-        ...(run.maxTokens === undefined ? {} : { maxTokens: run.maxTokens }),
+        ...(maxTokens === undefined ? {} : { maxTokens }),
       };
     });
     const ajv = new Ajv({ strict: false, allErrors: true, validateFormats: false, ownProperties: true, addUsedSchema: false });
@@ -274,8 +356,29 @@ export class BridgeWorker {
         finalizeContent: (_execution, result) => result.isError && result.error.info?.code === "HOST_TOOL_ERROR"
           ? [{ type: "text", text: result.error.message }] : undefined,
       });
-      this.definitions.set(host.name, definition);
-      agentCtx.tools.register(definition);
+      this.hostDefinitions.set(host.name, definition);
+      if (!run.taskPreparation) this.registerTool(definition);
+    }
+    if (run.taskPreparation) {
+      this.preparationTool = createPreparationTool(run.taskPreparation);
+      this.registerTool(Object.freeze<ToolDefinition>({
+        ...this.preparationTool,
+        parameters: structuredClone(this.preparationTool.parameters),
+        output: {
+          schema: { type: "object" },
+          render: (_args, value) => {
+            const resolution = parsePreparationResolution(value);
+            if (!isDeepStrictEqual(resolution, this.preparation)) throw new Error("Preparation output was replaced");
+            // A normal tool-result data block, never a system prompt or deferred instruction.
+            return [{ type: "text", text: JSON.stringify(resolution) }];
+          },
+        },
+        execute: (args, execution) => this.prepareTask(args, execution),
+      }));
+      agentCtx.on("session/event", (session, event) => {
+        if (session !== agent.session) return;
+        try { this.observePreparation(event); } catch (error) { this.fail(error); }
+      });
     }
     agentCtx.tools.guard((execution) => {
       try {
@@ -284,24 +387,35 @@ export class BridgeWorker {
         if (execution.agent !== agent || execution.parent || !this.definitions.has(execution.name)) {
           throw new Error(`Unapproved DSH tool execution: ${execution.name}`);
         }
+        if (run.taskPreparation) {
+          const call = this.expectedExecution(execution);
+          if (call.token) throw new Error("Duplicate DSH preparation execution");
+          if (execution.signal !== this.activeStep?.signal) throw new Error("Unowned DSH tool cancellation identity");
+          call.token = execution.token;
+        }
       } catch (error) {
         this.fail(error);
         return errorOf(error).message;
       }
       return undefined;
     });
-    agentCtx.on("tools/result", (execution) => {
-      if (execution.agent !== agent || execution.parent || !this.definitions.has(execution.name)) {
-        this.fail(new Error(`Unapproved DSH tool execution: ${execution.name}`));
-      }
+    agentCtx.on("tools/result", (execution, result) => {
+      try {
+        if (execution.agent !== agent || execution.parent || !this.definitions.has(execution.name)) {
+          throw new Error(`Unapproved DSH tool execution: ${execution.name}`);
+        }
+        if (run.taskPreparation) this.observeToolResult(execution, result);
+      } catch (error) { this.fail(error); }
       return undefined;
     });
-    this.tracker = new TurnTracker(agentCtx, this.emit);
+    this.tracker = new TurnTracker(agentCtx, this.emit, run.taskPreparation ? {
+      isInternalStep: (turn, step) => this.controlStep?.turn === turn && this.controlStep.step === step,
+    } : {});
     const assembly = await agentCtx.systemPrompt.assemble(assembleContextFor(agent));
     if (renderPrompt(assembly) !== run.systemPrompt || renderContextSnapshot(assembly)) {
       throw new Error("DSH prompt assembly differs from the complete host prompt");
     }
-    auditSchemas(assembly.tools, run.tools);
+    auditSchemas(assembly.tools, this.activeSchemas());
     return { commit: () => {
       this.assertHealthy();
       this.auditTools();
@@ -310,16 +424,213 @@ export class BridgeWorker {
     } };
   }
 
+  private observePreparation(event: SessionEvent): void {
+    if (event.type === "step/start") {
+      if (this.activeStep && !this.activeStep.ended) throw new Error("Overlapping DSH preparation steps");
+      if (this.controlStep && !this.preparationReady) throw new Error("Preparation control step did not commit");
+      const step: PreparationStep = {
+        turn: event.data.turn, step: event.data.step, internal: !this.controlStep,
+        tools: Object.freeze(structuredClone(this.activeSchemas())), ended: false,
+      };
+      this.controlStep ??= step;
+      this.activeStep = step;
+      return;
+    }
+    if (event.type !== "assistant/message" && event.type !== "tool/call" &&
+      event.type !== "tool/result" && event.type !== "step/end") return;
+    const step = this.activeStep;
+    if (!step || step.ended || event.data.turn !== step.turn || event.data.step !== step.step) {
+      throw new Error("DSH preparation event outside its live step");
+    }
+    switch (event.type) {
+      case "assistant/message": {
+        if (step.calls) throw new Error("Duplicate DSH preparation assistant message");
+        if (event.data.interrupted) return;
+        const blocks = event.data.message.content.filter((block) => block.type === "tool-call");
+        if (step.internal && (blocks.length !== 1 || blocks[0]?.name !== PREPARATION_TOOL_NAME)) {
+          throw new Error("Preparation requires exactly one control call and no host siblings");
+        }
+        const ids = new Set<string>();
+        for (const block of blocks) {
+          if (!block.id || ids.has(block.id) || this.callIds.has(block.id) ||
+            !step.tools.some((tool) => tool.name === block.name)) {
+            throw new Error("Unapproved, duplicate, or unadvertised DSH preparation tool call");
+          }
+          ids.add(block.id);
+        }
+        step.calls = Object.freeze(blocks.map((block) => ({ block: Object.freeze({ ...block }) })));
+        for (const id of ids) this.callIds.add(id);
+        return;
+      }
+      case "tool/call": {
+        const call = step.calls?.find((call) => call.block.id === event.data.callId);
+        if (!call || call.seq !== undefined || call.block.name !== event.data.name ||
+          call.block.arguments !== event.data.arguments) throw new Error("Unowned DSH preparation tool/call");
+        call.seq = event.seq;
+        return;
+      }
+      case "tool/result": {
+        const block = event.data.message.content[0];
+        const call = step.calls?.find((call) => call.block.id === block.toolCallId);
+        if (!call || call.committed || call.seq === undefined ||
+          !isDeepStrictEqual(event.sourceEventSeqs, [call.seq])) throw new Error("Unowned DSH preparation tool/result");
+        if (call.result) {
+          if (Boolean(block.isError) !== call.result.isError || !isDeepStrictEqual(block.content, call.result.content)) {
+            throw new Error("DSH preparation tool result changed before commit");
+          }
+        } else if (!this.cancelled && !step.signal?.aborted) {
+          throw new Error("DSH preparation tool result has no owned execution");
+        }
+        call.committed = true;
+        return;
+      }
+      case "step/end": {
+        step.ended = true;
+        if (this.cancelled || step.signal?.aborted) return;
+        this.assertHealthy();
+        this.tracker?.assertHealthy();
+        if (!step.calls || step.calls.some((call) => !call.committed)) {
+          throw new Error("DSH preparation step has uncommitted calls");
+        }
+        if (step.internal) {
+          const call = step.calls[0];
+          if (!this.preparation || !call?.invoked || !call.result || call.result.isError || !call.committed) {
+            throw new Error("Preparation control did not commit a successful result");
+          }
+          // The loop assembles its next request AFTER step/end. Never append a
+          // session event here, and never register tools while the batch is live.
+          this.unregisterTool(PREPARATION_TOOL_NAME);
+          for (const name of this.preparation.allowedTools) {
+            if (this.cancelled || step.signal?.aborted) return;
+            const definition = this.hostDefinitions.get(name);
+            if (!definition) throw new Error("Preparation selected an unknown host tool");
+            this.registerTool(definition);
+          }
+          this.preparationReady = true;
+        }
+        return;
+      }
+    }
+  }
+
+  private expectedExecution(execution: ToolExecution): ExpectedCall {
+    this.assertHealthy();
+    this.tracker?.assertHealthy();
+    this.auditTools();
+    const step = this.activeStep;
+    const call = step?.calls?.find((call) => call.block.id === execution.callId);
+    if (!this.armed || !step || step.ended || !call || call.seq === undefined || call.committed ||
+      execution.agent !== this.agent || execution.parent !== undefined || execution.rootCallId !== execution.callId ||
+      this.ctx.agents.currentInitiator() !== this.agent || execution.name !== call.block.name ||
+      !step.tools.some((tool) => tool.name === execution.name)) {
+      throw new Error("Invalid or unowned DSH preparation execution identity");
+    }
+    // Validate against the committed call, not a mutable wrapper's arguments.
+    if (!isDeepStrictEqual(execution.arguments, JSON.parse(call.block.arguments || "{}"))) {
+      throw new Error("DSH preparation execution arguments changed");
+    }
+    if (step.internal ? this.preparationReady || execution.name !== PREPARATION_TOOL_NAME
+      : !this.preparationReady || this.preparation?.decision.mode !== "execute" ||
+        !this.preparation.allowedTools.includes(execution.name)) {
+      throw new Error("DSH tool execution exceeds preparation authority");
+    }
+    return call;
+  }
+
+  private beginPreparedCall(execution: ToolExecution): ExpectedCall {
+    const call = this.expectedExecution(execution);
+    if (this.cancelled || execution.signal.aborted || call.token !== execution.token || call.invoked) {
+      throw new Error("Cancelled, duplicate, or unguarded DSH preparation callback");
+    }
+    call.invoked = true;
+    return call;
+  }
+
+  private observeToolResult(execution: ToolExecution, result: Readonly<ToolExecutionResult>): void {
+    const call = this.expectedExecution(execution);
+    if (call.result || (call.token !== undefined && call.token !== execution.token) ||
+      (!result.isError && (!call.invoked || call.token !== execution.token))) {
+      throw new Error("Duplicate or unowned DSH preparation execution result");
+    }
+    if (execution.name === PREPARATION_TOOL_NAME) {
+      if (result.isError) {
+        if (!this.cancelled && !execution.signal.aborted) throw new Error("Preparation control tool failed");
+      } else if (!this.preparation || !isDeepStrictEqual(result.value, this.preparation) ||
+        !isDeepStrictEqual(result.content, [{ type: "text", text: JSON.stringify(this.preparation) }]) ||
+        result.concludesTurn || result.additionalContexts?.length) {
+        throw new Error("Preparation control result was replaced or injected instructions");
+      }
+    }
+    call.result = result;
+  }
+
+  private async prepareTask(value: unknown, execution: ToolRunContext): Promise<unknown> {
+    try {
+      const call = this.beginPreparedCall(execution);
+      const request = this.request?.taskPreparation;
+      if (!request || this.preparation || this.activeStep !== this.controlStep) {
+        throw new Error("Unexpected or repeated preparation control");
+      }
+      const decision = parsePreparationDecision(value);
+      if (decision.revision !== (request.previous?.revision ?? 0)) throw new Error("Stale preparation decision revision");
+      // Await the parent even during cancellation; it owns the gate and settlement.
+      const resolution = parsePreparationResolution(await this.peer.request("prepare", { decision }));
+      this.validateResolution(decision, resolution);
+      if (this.activeStep !== this.controlStep || this.activeStep?.ended || call.token !== execution.token) {
+        throw new Error("Preparation settled outside its control execution");
+      }
+      this.preparation = resolution;
+      return resolution;
+    } catch (error) {
+      this.fail(error);
+      throw error;
+    }
+  }
+
+  private validateResolution(decision: PreparationDecision, resolution: PreparationResolution): void {
+    const request = this.request?.taskPreparation;
+    if (!request) throw new Error("Unexpected preparation resolution");
+    const effective = resolution.decision;
+    const previous = request.previous;
+    const evidenceText = effective.evidence.source === "current" ? request.userText : previous?.requestText;
+    const turns = effective.task === "new" ? 0 : previous?.clarificationTurns ?? 0;
+    if (effective.revision !== decision.revision || effective.task !== decision.task ||
+      !isDeepStrictEqual(effective.evidence, decision.evidence) ||
+      (effective.mode === "execute" && decision.mode !== "execute") ||
+      (effective.task === "continue" && !previous?.goal.trim()) ||
+      (effective.evidence.source === "previous" && !previous) ||
+      (effective.evidence.quote && !evidenceText?.includes(effective.evidence.quote)) ||
+      (previous && resolution.state.sourceRunId === previous.sourceRunId) ||
+      resolution.state.requestText !== (effective.task === "new" ? request.userText : previous?.requestText ?? "") ||
+      resolution.state.clarificationTurns !== turns + (effective.mode === "clarify" ? 1 : 0) ||
+      (effective.mode === "clarify" && resolution.state.clarificationTurns > request.policy.maxClarificationTurns) ||
+      resolution.allowedTools.some((name) => !this.hostDefinitions.has(name) || !request.policy.executionTools.includes(name)) ||
+      (effective.mode !== "execute" && resolution.allowedTools.length > 0)) {
+      throw new Error("Preparation resolution exceeds request bounds or tool ceiling");
+    }
+  }
+
   private async callTool(name: string, args: ReturnType<typeof jsonObject>, execution: ToolRunContext): Promise<string> {
     this.assertHealthy();
     this.auditTools();
-    if (execution.agent !== this.agent || execution.name !== name || execution.parent ||
+    if (this.request?.taskPreparation) {
+      try {
+        if (execution.name !== name) throw new Error("DSH preparation callback name mismatch");
+        this.beginPreparedCall(execution);
+        if (this.toolCalls >= this.request.taskPreparation.policy.maxToolCalls) {
+          throw new Error("Preparation host tool-call budget exhausted");
+        }
+      } catch (error) {
+        this.fail(error);
+        throw error;
+      }
+    } else if (execution.agent !== this.agent || execution.name !== name || execution.parent ||
       typeof execution.callId !== "string" || !execution.callId || this.callIds.has(execution.callId)) {
       const error = new Error("Invalid, duplicate, or unowned DSH callback identity");
       this.fail(error);
       throw error;
     }
-    this.callIds.add(execution.callId);
+    if (!this.request?.taskPreparation) this.callIds.add(execution.callId);
     this.toolCalls++;
     const pending = this.peer.request("tool", { callId: execution.callId, name, arguments: args });
     const cancel = () => this.emit({ type: "tool-cancel", callId: execution.callId });
@@ -382,7 +693,12 @@ export class BridgeWorker {
     await this.flush();
     await Promise.all(this.writes);
     this.assertHealthy();
-    return this.tracker.result(run.sessionId, this.cancelled, this.toolCalls);
+    const result = this.tracker.result(run.sessionId, this.cancelled, this.toolCalls);
+    if (run.taskPreparation && result.stopReason !== "aborted" && !this.preparationReady) {
+      throw new Error("Preparation control was not successfully committed");
+    }
+    return run.taskPreparation && this.preparationReady && this.preparation
+      ? { ...result, preparation: structuredClone(this.preparation) } : result;
   }
 
   private async flush(): Promise<void> {

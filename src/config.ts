@@ -3,9 +3,11 @@ import { isAbsolute, join } from "node:path";
 import { isRecord } from "./protocol.js";
 import type { DshConfig } from "./runtime-types.js";
 import { COPILOT_ENDPOINTS } from "./copilot-policy.js";
+import { parseTaskPreparationConfig } from "./preparation.js";
 
 const KEYS = new Set([
   "stateDir", "startupTimeoutMs", "shutdownTimeoutMs", "streamIdleTimeoutMs", "allowedBaseUrls", "allowedCopilotBaseUrls",
+  "taskPreparation",
 ]);
 
 export function normalizeBaseUrl(value: string): string {
@@ -45,6 +47,7 @@ export function parseDshConfig(value: unknown): DshConfig {
     streamIdleTimeoutMs: timeout(input.streamIdleTimeoutMs, 120_000, "streamIdleTimeoutMs"),
     allowedBaseUrls: urls.map((url: string) => normalizeBaseUrl(url)),
     allowedCopilotBaseUrls: copilotUrls.map((url: string) => normalizeBaseUrl(url)),
+    ...(input.taskPreparation === undefined ? {} : { taskPreparation: parseTaskPreparationConfig(input.taskPreparation) }),
   };
 }
 

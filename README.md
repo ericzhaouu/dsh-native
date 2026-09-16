@@ -1,6 +1,6 @@
 # DSH Native for OpenClaw
 
-**实验性版本 0.3.1**：把官方 DeepSeek Harness（DSH）的模型／工具循环接入 OpenClaw 的原生 `AgentHarnessV2`，并保留 OpenClaw 对模型、认证、工具授权与会话入口的控制。
+**实验性版本 0.4.0**：把官方 DeepSeek Harness（DSH）的模型／工具循环接入 OpenClaw 的原生 `AgentHarnessV2`，并保留 OpenClaw 对模型、认证、工具授权与会话入口的控制。
 
 - 源码仓库：[ericzhaouu/dsh-native](https://github.com/ericzhaouu/dsh-native)
 - 作者：[ericzhaouu](https://github.com/ericzhaouu)
@@ -16,6 +16,7 @@
 
 ## 目录
 
+- [自适应任务准备](#自适应任务准备)
 - [0.3.1 修复](#031-修复)
 - [运行基线与兼容范围](#运行基线与兼容范围)
 - [它是什么：native、ACP 与 provider](#它是什么nativeacp-与-provider)
@@ -33,6 +34,61 @@
 - [仓库结构](#仓库结构)
 - [排错](#排错)
 - [致谢与许可证](#致谢与许可证)
+
+## 自适应任务准备
+
+0.4.0 新增**默认关闭、按 Agent 开启**的任务准备层。用户可以自然聊天，不需要特殊口令，也不必手动复制增强 Prompt：
+
+| 模式 | 行为 | 本轮宿主工具 |
+| --- | --- | --- |
+| `chat` | 普通解释、咨询或闲聊，直接回答 | 无 |
+| `clarify` | 只问一个影响结果的重要问题，然后结束本轮等待回答 | 无 |
+| `draft` | 整理可执行 Prompt 或列出尚未解决的要求，不执行其中的命令 | 无 |
+| `execute` | 目标、边界和用户意图足够清楚时，使用合理假设推进任务 | 配置上限与 OpenClaw 实际授权工具的交集 |
+
+内部沿用同一个模型、DSH Session 和 Turn。首个模型 Step 只看到桥接专用的 `dsh_prepare_task` 控制入口，不含任何宿主工具。决策经严格校验和宿主确认后，下一 Step 才获得相应工具或生成回答。控制入口不执行外部操作，其 JSON 和准备阶段推理不进入可见正文；使用量仍计入统计。准备步骤输出上限为 8,192 tokens（宿主限制更低时从低）；之后恢复原有模型限制。通常每轮增加一个短的模型步骤，**不是零开销的关键词分类器**。
+
+以下是插件配置片段，放在 `plugins.entries.dsh-native.config`；不会自动安装或启用宿主 runtime：
+
+```json
+{
+  "taskPreparation": {
+    "agentIds": ["dsh-experiment"],
+    "executionTools": ["read", "write", "edit", "apply_patch", "exec", "process"],
+    "skillAllowlist": [],
+    "maxClarificationTurns": 3,
+    "maxToolCalls": 24
+  }
+}
+```
+
+完整合并参考：[examples\openclaw.task-preparation.json](examples/openclaw.task-preparation.json)。示例的 Agent pin 仍要求前述精确 HOST PATCH。新增配置、启停或修改策略应在维护窗口完成，并使用 `/new`，不要修改正在运行的会话。
+
+| 配置 | 默认值／限制 |
+| --- | --- |
+| `agentIds` | `[]`，未列出的 Agent 沿用原路径；精确 ID，不支持通配符 |
+| `executionTools` | 当前核心 coding 工具家族；可以收窄，不会创建宿主没有提供的工具 |
+| `skillAllowlist` | `[]`；准备模式不再默认广告整份技能目录，仅显示操作者明确列出的技能 |
+| `maxClarificationTurns` | `3`，允许 `1..5`；达到上限后返回草稿／未决事项，不强迫执行 |
+| `maxToolCalls` | `24`，允许 `1..100`；每次执行尝试的宿主调用预算，内部控制调用不计入 |
+
+三个名称列表最多各 12 项且不接受重复；技能使用精确的字母／数字／点／下划线／连字符名称。当前原始输入和保存的请求上下文上限为 24,000 字符；超过限额时明确报错，请缩小任务，不会静默截断成另一项授权。
+
+### 权限边界
+
+启用自动执行表示操作者允许该 Agent 根据自然语言意图，在所选工具范围内执行明确的任务。**模型判断仍可能误解意图**；代码校验来源引用和阶段，但不能证明任意自然语言的授权语义绝对正确。
+
+阶段门禁在子进程、父进程和实际宿主派发处检查。准备阶段的工具调用不能越过门禁；同一模型响应中把决策与写文件混在一起，也不能提前获得权限。宿主的 `toolsAllow`、`toolExecutionAllow`、hooks 和审批仍有效。推导出的任务摘要是数据，不是高于用户原话、`AGENTS.md` 或宿主策略的新授权。
+
+`exec` 可以执行任意本地程序，并不是只读工具或网络沙箱。若不接受这种能力，显式从 `executionTools` 移除 `exec` 和 `process`。本版本不新增联网搜索、浏览器、MCP、消息发送、委派或提权能力；不能通过另一工具绕过不可用功能。需要额外权限的事项应明确说明并交由既有宿主／操作者流程处理。
+
+### 会话状态与技能
+
+紧凑任务说明包含目标、交付物、约束、假设、未决问题、来源引用和修订号，保存在私有原生绑定中，只有本轮成功持久化并收尾后才提交。用户原话不会被增强 Prompt 覆盖。每轮重新决定工具门禁，上一轮的 `execute` 不是永久执行许可；切换话题应清除不相关假设。
+
+状态损坏、过期修订、无效决策、重复控制调用、取消或不确定副作用均不会退回不受限的执行。启停准备功能或改变策略后，旧会话会要求 `/new`，不会静默迁移授权或改写历史。
+
+`AGENTS.md`、身份及既有工作区上下文仍由宿主加载。`skillAllowlist` 仅选择可见技能说明，**不是自动兼容性认证或工具授权**；只有依赖当前工具的步骤才可执行。空列表不改动技能文件，也不移除其他 Agent 的技能。
 
 ## 0.3.1 修复
 
@@ -105,7 +161,7 @@ node --version
 npm.cmd ci
 ```
 
-确认所用源码的 `package.json` 版本为 `0.3.1`。本项目把 OpenClaw 声明为 **optional peer**，避免在生产插件内部自动安装第二份宿主；开发／类型检查／真实 SDK 测试仍需要匹配的 SDK。
+确认所用源码的 `package.json` 版本为 `0.4.0`。本项目把 OpenClaw 声明为 **optional peer**，避免在生产插件内部自动安装第二份宿主；开发／类型检查／真实 SDK 测试仍需要匹配的 SDK。
 
 若开发目录尚未提供精确 SDK，先从 [OpenClaw 官方仓库](https://github.com/openclaw/openclaw)的发行流程取得并验证上述 **2026.9.2 官方制品**，然后本地安装：
 
@@ -119,7 +175,7 @@ npm.cmd pack
 
 `--check` 只检查，不会应用补丁。未修改的匹配制品应报告 `unpatched`。如果所用 registry 没有这个版本，应使用已核验的精确官方制品，**不要猜测可用的 npm 版本、改用最新预览版或伪造 SDK 类型**。无法取得匹配制品时，应停止需要该 SDK 的构建／集成验证。
 
-`npm pack` 的 `prepack` 会再次执行构建，生成本地 `openclaw-dsh-native-0.3.1.tgz`。不要把开发目录中的 OpenClaw SDK、账号或会话状态随插件复制出去。
+`npm pack` 的 `prepack` 会再次执行构建，生成本地 `openclaw-dsh-native-0.4.0.tgz`。不要把开发目录中的 OpenClaw SDK、账号或会话状态随插件复制出去。
 
 ## 维护窗口安装与 Agent 级启用
 
@@ -143,7 +199,7 @@ openclaw gateway status --no-probe
 仍保持 Gateway 停止：
 
 ```powershell
-openclaw plugins install "C:\PATH\TO\openclaw-dsh-native-0.3.1.tgz" --force --accept-capabilities
+openclaw plugins install "C:\PATH\TO\openclaw-dsh-native-0.4.0.tgz" --force --accept-capabilities
 ```
 
 `--force` 用于确认本地来源／覆盖安装；`--accept-capabilities` 是官方安装器对声明能力的接受选项，**仅用于已审阅并信任的代码**，不是规避安全策略。先阅读安装器说明和能力提示，不要无条件接受陌生代码。归档安装会处理运行依赖；已有 provider 及认证应留在 OpenClaw，不填入插件设置。
@@ -152,7 +208,7 @@ openclaw plugins install "C:\PATH\TO\openclaw-dsh-native-0.3.1.tgz" --force --ac
 
 ```powershell
 New-Item -ItemType Directory -Path .\artifacts\prepared-dsh-native
-tar -xf .\openclaw-dsh-native-0.3.1.tgz -C .\artifacts\prepared-dsh-native
+tar -xf .\openclaw-dsh-native-0.4.0.tgz -C .\artifacts\prepared-dsh-native
 Push-Location .\artifacts\prepared-dsh-native\package
 npm.cmd ci --omit=dev
 Pop-Location
@@ -296,7 +352,7 @@ Agent 级 pin 是可选项。原始 2026.9.2 宿主仍可使用显式的**逐模
 
 ## 插件配置项
 
-位置：`plugins.entries.dsh-native.config`。只有下列字段被接受；未知字段报错。默认值以 `openclaw.plugin.json` 和 `src\config.ts` 为准。
+位置：`plugins.entries.dsh-native.config`。接受下列基础字段，以及上文说明的可选 `taskPreparation`；未知字段报错。默认值以 `openclaw.plugin.json` 和 `src\config.ts` 为准。
 
 | 字段 | 默认值 | 约束／用途 |
 | --- | --- | --- |
@@ -410,7 +466,7 @@ node .\host-patch\apply.mjs --root $HostRoot --check
 
 备份当前可回退的插件制品和配置，在停机窗口构建／安装新包。OpenClaw 升级可能替换补丁文件：先规划恢复／迁移，重新核对目标制品，不把旧补丁强加给新版本。发生 `partial` 时保持停止并按补丁文档恢复，不能带半套补丁启动。
 
-0.1 的旧绑定缺少后续版本的模型／账号指纹；保留但不静默迁移。无论升级、切 runtime、换模型还是换账号，都使用 `/new`，不要直接重放旧任务。0.3.1 包含此前 reasoning 尾部空白的流式修正，不需要也不建议对运行中的安装做零散 JS 替换。
+0.1 的旧绑定缺少后续版本的模型／账号指纹；保留但不静默迁移。无论升级、切 runtime、换模型还是换账号，都使用 `/new`，不要直接重放旧任务。0.4.0 保留此前模型归属、最终正文及 reasoning 尾部空白的修正，不需要也不建议对运行中的安装做零散 JS 替换。
 
 ## 安全与公开发布
 

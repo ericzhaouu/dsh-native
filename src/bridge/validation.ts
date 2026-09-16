@@ -2,6 +2,7 @@ import { isAbsolute } from "node:path";
 import {
   isRecord, type BridgeRun, type BridgeTool, type BridgeToolResult, type Json, type JsonObject, type ModelProvider,
 } from "../protocol.js";
+import { parsePreparationRequest, PREPARATION_TOOL_NAME } from "../preparation.js";
 
 const deepSeekEfforts = ["off", "low", "high", "max"] as const;
 const copilotEfforts = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
@@ -71,7 +72,7 @@ export function parseRun(value: unknown): BridgeRun {
   const run = record(value, "run");
   keys(run, [
     "provider", "sessionId", "resume", "workspaceDir", "systemPrompt", "prompt", "modelId",
-    "reasoningEffort", "maxTokens", "tools",
+    "reasoningEffort", "maxTokens", "tools", "taskPreparation",
   ], "run");
   const selectedProvider = run.provider === undefined ? "deepseek" : provider(run.provider, "provider");
   const sessionId = string(run.sessionId, "sessionId", true);
@@ -95,7 +96,7 @@ export function parseRun(value: unknown): BridgeRun {
     const tool = record(value, "tool");
     keys(tool, ["name", "description", "parameters"], "tool");
     const name = string(tool.name, "tool.name", true);
-    if (!/^[A-Za-z0-9_-]{1,64}$/.test(name) || name === "run_code" || names.has(name)) {
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(name) || name === "run_code" || name === PREPARATION_TOOL_NAME || names.has(name)) {
       throw new TypeError(`Invalid, duplicate, or reserved host tool name: ${name}`);
     }
     names.add(name);
@@ -103,6 +104,7 @@ export function parseRun(value: unknown): BridgeRun {
     if (parameters.type !== "object") throw new TypeError(`tool ${name} parameters must have type object`);
     return { name, description: string(tool.description, "tool.description"), parameters };
   });
+  const taskPreparation = run.taskPreparation === undefined ? undefined : parsePreparationRequest(run.taskPreparation);
   return {
     ...(run.provider === undefined ? {} : { provider: selectedProvider }),
     sessionId, resume: run.resume, workspaceDir, modelId, tools,
@@ -110,5 +112,6 @@ export function parseRun(value: unknown): BridgeRun {
     prompt: string(run.prompt, "prompt", true),
     ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
     ...(maxTokens === undefined ? {} : { maxTokens }),
+    ...(taskPreparation === undefined ? {} : { taskPreparation }),
   };
 }

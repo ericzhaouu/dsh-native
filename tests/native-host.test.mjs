@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { join } from "node:path";
 import { registerHooks } from "node:module";
-import { assertNativeHostSupported, createNativeToolHost, prepareNativeHost, projectNativeToolResult, renderNativeSystemPrompt } from "../src/native/host.ts";
+import { assertNativeHostSupported, createNativeToolHost, prepareNativeHost, projectNativeToolResult, renderNativeSystemPrompt } from "../dist/native/host.js";
 
 const schema = { type: "object", properties: { path: { type: "string" } }, required: ["path"], additionalProperties: false };
 const signal = () => new AbortController().signal;
@@ -76,6 +76,28 @@ test("keeps adjusted hook arguments and reports actual dispatch to the host", as
   assert.equal(terminal[0].executionStarted, true);
   assert.deepEqual(host.getToolCounts(), { startedCount: 1, completedCount: 1, activeCount: 0 });
   assert.deepEqual(host.getReplayState(), { hadPotentialSideEffects: false, replaySafe: true });
+});
+
+test("preparation closes dispatch before hooks and checks again after host hook rewrites", async () => {
+  let allowed = false;
+  let starts = 0;
+  let executions = 0;
+  const gate = {
+    assertAllowed() { if (!allowed) throw new Error("preparation is closed"); },
+    start() { this.assertAllowed(); starts++; },
+  };
+  const f = fixture([tool("write", async () => { executions++; return { content: [] }; })], {
+    rewrite: (args) => { allowed = false; return args; },
+    options: { preparationGate: gate },
+  });
+  await assert.rejects(f.host.executeTool(call("write", "closed"), signal()), /preparation is closed/);
+  allowed = true;
+  const result = await f.host.executeTool(call("write", "revoked"), signal());
+  assert.equal(result.isError, true);
+  assert.equal(starts, 0);
+  assert.equal(executions, 0);
+  assert.equal(f.host.getToolCounts().startedCount, 0);
+  await f.host.dispose();
 });
 
 test("policy-blocked mutations never count as started or side effects", async () => {
@@ -390,6 +412,19 @@ test("prepareNativeHost composes public SDK seams without granting tools during 
   }, signal(), () => {});
   assert.deepEqual(denied.tools, []);
   await denied.dispose();
+
+  const gated = await prepareNativeHost({
+    ...base, skillsSnapshot: { prompt: "<skill><name>unavailable-web</name><location>web/SKILL.md</location></skill>" },
+  }, signal(), () => {}, [], {
+    policy: { version: 1, executionTools: ["read"], skillAllowlist: [], maxClarificationTurns: 3, maxToolCalls: 24 },
+    gate: { assertAllowed() { throw new Error("preparation closed"); }, start() { throw new Error("preparation closed"); } },
+  });
+  assert.deepEqual(gated.tools.map((tool) => tool.name), ["read"]);
+  assert.doesNotMatch(gated.systemPrompt, /unavailable-web|web\/SKILL.md/);
+  assert.match(gated.systemPrompt, /dsh_prepare_task/);
+  assert.match(gated.systemPrompt, /Bootstrap rules/);
+  await assert.rejects(gated.executeTool(call("read", "before-preparation"), signal()), /preparation closed/);
+  await gated.dispose();
 
   for (const policy of [{ sandbox: { mode: "all" } }, { tools: { exec: { host: "node" } } }]) {
     await assert.rejects(prepareNativeHost({

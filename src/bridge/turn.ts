@@ -19,10 +19,15 @@ interface Attempt {
 }
 
 interface Step {
+  internal: boolean;
   attempt?: Attempt;
   message?: MessageEvent;
   failure?: Error;
   ended: boolean;
+}
+
+export interface TurnTrackerOptions {
+  isInternalStep?: (turn: number, step: number) => boolean;
 }
 
 interface Turn {
@@ -58,6 +63,7 @@ function output(message: MessageEvent): { text: string; reasoning: string } {
 export class TurnTracker {
   private readonly agent: Agent;
   private readonly emit: (event: BridgeEvent) => void;
+  private readonly options: TurnTrackerOptions;
   private readonly listeners: (() => void)[];
   private readonly turns: Turn[] = [];
   private readonly usage: BridgeUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
@@ -68,12 +74,13 @@ export class TurnTracker {
   private committedText = "";
   private committedReasoning = "";
 
-  constructor(ctx: Context, emit: (event: BridgeEvent) => void) {
+  constructor(ctx: Context, emit: (event: BridgeEvent) => void, options: TurnTrackerOptions = {}) {
     const agent = ctx.agent;
     if (!agent) throw new Error("TurnTracker requires an agent-scoped Context");
     if (agent.status !== "idle") throw new Error("Attach TurnTracker before followup/send");
     this.agent = agent;
     this.emit = emit;
+    this.options = options;
     this.lastSeq = agent.session.events.length - 1;
     this.listeners = [
       ctx.on("session/event", (session, event) => {
@@ -91,6 +98,11 @@ export class TurnTracker {
   /** Detach only this tracker; does not cancel or dispose its agent. Idempotent. */
   dispose(): void {
     for (const off of this.listeners.splice(0)) off();
+  }
+
+  /** Allow a safety gate to reject invalid raw output before dispatching tools. */
+  assertHealthy(): void {
+    if (this.error) throw this.error;
   }
 
   private fail(message: string): void {
@@ -147,7 +159,13 @@ export class TurnTracker {
           this.fail("DSH opened an overlapping or repeated step");
           return;
         }
-        turn.steps.set(event.data.step, { ended: false });
+        try {
+          turn.steps.set(event.data.step, {
+            ended: false, internal: this.options.isInternalStep?.(event.data.turn, event.data.step) ?? false,
+          });
+        } catch (error) {
+          this.error ??= failure(error);
+        }
         return;
       }
       case "assistant/chunk": {
@@ -220,7 +238,7 @@ export class TurnTracker {
         }
         attempt.blocks.set(chunk.index, { type, text: (block?.text ?? "") + chunk.text });
         attempt[type] += chunk.text;
-        this.delta(type, chunk.text);
+        if (!step.internal) this.delta(type, chunk.text);
         return;
       }
       case "block-end": {
@@ -240,7 +258,7 @@ export class TurnTracker {
           }
           const suffix = block.text.slice(prefix.length);
           attempt[block.type] += suffix;
-          this.delta(block.type, suffix);
+          if (!step.internal) this.delta(block.type, suffix);
         }
         return;
       }
@@ -291,10 +309,12 @@ export class TurnTracker {
       this.fail("DSH committed assistant output differs from emitted deltas");
       return;
     }
-    this.delta("text", final.text.slice(attempt.text.length));
-    this.delta("reasoning", final.reasoning.slice(attempt.reasoning.length));
-    this.committedText += final.text;
-    this.committedReasoning += final.reasoning;
+    if (!step.internal) {
+      this.delta("text", final.text.slice(attempt.text.length));
+      this.delta("reasoning", final.reasoning.slice(attempt.reasoning.length));
+      this.committedText += final.text;
+      this.committedReasoning += final.reasoning;
+    }
     step.failure = undefined;
     const usage = event.data.usage;
     // DSH inputTokens is already uncached; cache counters are disjoint.
@@ -350,7 +370,7 @@ export class TurnTracker {
         }
         length ||= step.attempt?.finish?.kind === "max-tokens";
       }
-      const last = turn.lastMessage && output(turn.lastMessage);
+      const last = turn.lastMessage && !turn.steps.get(turn.lastMessage.data.step)?.internal && output(turn.lastMessage);
       if (!last || (!last.text.trim() && !last.reasoning.trim())) {
         throw new Error("DSH turn has no committed final assistant output");
       }

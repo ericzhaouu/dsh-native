@@ -6,6 +6,8 @@ import { prepareNativeHost, type NativeHost } from "./host.js";
 import { nativeSupports, resolveNativeRoute } from "./route.js";
 import { prepareNativeTranscript } from "./transcript.js";
 import { prepareNativeContinuity } from "./continuity.js";
+import { resolvePreparationPolicy } from "../preparation.js";
+import { createPreparationGate } from "./preparation.js";
 
 type Attempt = Parameters<AgentHarnessV2["runAttempt"]>[0];
 type Result = Awaited<ReturnType<AgentHarnessV2["runAttempt"]>>;
@@ -13,7 +15,7 @@ type Terminal = Extract<Result, { terminal: unknown }>["terminal"];
 type Assistant = NonNullable<Result["lastAssistant"]>;
 type Sdk = typeof import("openclaw/plugin-sdk/agent-harness-runtime");
 type LifecycleSdk = Pick<Sdk, "setActiveEmbeddedRun" | "clearActiveEmbeddedRun" |
-  "getModelProviderRequestTransport" | "emitAgentEvent" |
+  "getModelProviderRequestTransport" | "emitAgentEvent" | "resolveSessionAgentIds" |
   "runAgentHarnessLlmInputHook" | "runAgentHarnessLlmOutputHook" |
   "awaitAgentHarnessAgentEndHook" | "runAgentHarnessBeforeAgentFinalizeHook">;
 
@@ -91,7 +93,13 @@ export function createNativeAssistant(p: Attempt, output: BridgeResult, now = Da
     },
     stopReason: output.stopReason,
     timestamp: now,
-    ...{ dshNative: { billing: "unpriced" } },
+    ...{ dshNative: { billing: "unpriced",
+      ...(output.preparation ? { preparation: {
+        mode: output.preparation.decision.mode,
+        revision: output.preparation.state.revision,
+        clarificationTurns: output.preparation.state.clarificationTurns,
+      } } : {}),
+    } },
   };
 }
 
@@ -261,8 +269,17 @@ export function createNativeHarness(
         p.onAttemptTimeoutArmed?.();
         sdk = await dependencies.loadSdk();
         assertActive();
+        if (config.taskPreparation && !p.agentId) {
+          const { sessionAgentId } = sdk.resolveSessionAgentIds({ config: p.config, sessionKey: p.sessionKey });
+          p = { ...p, agentId: sessionAgentId };
+        }
         const route = resolveNativeRoute(p, config, sdk.getModelProviderRequestTransport);
         executedModel = { provider: p.provider, model: route.modelId };
+        const preparationPolicy = resolvePreparationPolicy(config.taskPreparation, p.agentId ?? "");
+        if (preparationPolicy && p.inputProvenance && p.inputProvenance.kind !== "external_user") {
+          failure("adaptive task preparation requires an ordinary foreground user turn");
+        }
+        const preparationGate = preparationPolicy ? createPreparationGate(preparationPolicy) : undefined;
         hookContext = {
           runId: p.runId, agentId: p.agentId, sessionId: p.sessionId, sessionKey: p.sessionKey,
           workspaceDir: p.workspaceDir, modelProviderId: p.provider, modelId: p.model.id,
@@ -280,7 +297,8 @@ export function createNativeHarness(
         assertActive();
         assertContinuity = dependencies.prepareContinuity?.(config, p, transcript.messages);
         assertContinuity?.();
-        host = await dependencies.prepareHost(p, signal, assertActive, transcript.messages);
+        host = await dependencies.prepareHost(p, signal, assertActive, transcript.messages,
+          preparationPolicy && preparationGate ? { policy: preparationPolicy, gate: preparationGate } : undefined);
         assertActive();
         await transcript.persistUser();
         assertActive();
@@ -306,6 +324,13 @@ export function createNativeHarness(
           tools: host.tools, signal,
           assertActive: () => { assertActive(); assertContinuity?.(); },
           onEvent,
+          ...(preparationPolicy && preparationGate ? {
+            taskPreparation: { policy: preparationPolicy, userText: p.transcriptPrompt ?? p.prompt },
+            onPreparationDecision: (resolution) => {
+              assertActive();
+              preparationGate.resolve(resolution);
+            },
+          } satisfies Pick<Parameters<DshRuntime["run"]>[0], "taskPreparation" | "onPreparationDecision"> : {}),
           executeTool: async (call, toolSignal) => {
             assertActive();
             await p.onToolStreamBoundary?.();
