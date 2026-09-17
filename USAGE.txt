@@ -1,4 +1,4 @@
-DSH NATIVE FOR OPENCLAW -- EXPERIMENTAL 0.5.1
+DSH NATIVE FOR OPENCLAW -- EXPERIMENTAL 0.5.2
 
 Source: https://github.com/ericzhaouu/dsh-native
 Author: https://github.com/ericzhaouu
@@ -7,6 +7,27 @@ Plugin / harness ID: dsh-native
 Example Agent: dsh-experiment
 License: MIT; Copyright (c) 2026 ericzhaouu.
 The Chinese README.md contains the complete guide.
+
+PER-AGENT SKILL VISIBILITY OVERRIDE (0.5.2)
+
+taskPreparation.skillAllowlistByAgent is optional. Keys must be exact IDs that
+also appear in taskPreparation.agentIds. Each value uses the same exact Skill
+name validation as skillAllowlist, max 12, no wildcards or duplicates. A listed
+Agent's array REPLACES shared skillAllowlist; [] explicitly advertises none.
+Omitted Agents inherit the shared list. This only changes visible Skill
+instructions for preparation; it does not install tools, change auth, connect
+MCP or alter the child protocol.
+
+  {
+    "taskPreparation": {
+      "agentIds": ["dsh-experiment", "dsh-other"],
+      "skillAllowlist": [],
+      "skillAllowlistByAgent": {
+        "dsh-experiment": ["content-distill"],
+        "dsh-other": []
+      }
+    }
+  }
 
 SAME-SESSION RESET REPAIR (0.5.1)
 
@@ -68,7 +89,9 @@ Each turn recomputes its gate. Changing policy or toggling preparation on an
 existing session requires /new; corrupt/uncertain state never falls back to
 unrestricted execution. Reaching the clarification limit produces an unresolved
 draft, not mandatory execution. Only explicit skillAllowlist entries are advertised.
-Listing a skill is not a guarantee its dependencies or tools are supported.
+skillAllowlistByAgent can replace that shared list for one enabled Agent without
+changing another. Listing a skill is not a guarantee its dependencies or tools
+are supported.
 
 Natural-language intent classification can be wrong. Opt-in permits automatic
 handling of sufficiently clear requests within the configured ceiling; it is not
@@ -133,7 +156,7 @@ PowerShell examples follow; C:\PATH\TO values are placeholders.
   node --version
   npm.cmd ci
 
-Confirm package.json version 0.5.1. OpenClaw is an optional peer to avoid
+Confirm package.json version 0.5.2. OpenClaw is an optional peer to avoid
 bundling a second production host. Development still needs the genuine SDK.
 If it is absent, obtain and verify the exact official 2026.9.2 artifact from
 the OpenClaw release workflow, then install it locally:
@@ -147,7 +170,7 @@ the OpenClaw release workflow, then install it locally:
 If the configured registry lacks that SDK, use the verified official artifact,
 not speculative npm versions, a newer preview or hand-written replacement SDK
 types. The check is read-only; it should report unpatched for the stock pinned
-artifact. npm pack runs prepack/build and creates openclaw-dsh-native-0.5.1.tgz.
+artifact. npm pack runs prepack/build and creates openclaw-dsh-native-0.5.2.tgz.
 Use npm.cmd if PowerShell blocks npm.ps1; do not change execution policy.
 
 MAINTENANCE BEFORE INSTALL / PATCH / CONFIGURATION
@@ -164,7 +187,7 @@ Use the correct installation/profile and keep its supervisor from respawning it.
 
   openclaw gateway stop --force
   openclaw gateway status --no-probe
-  openclaw plugins install "C:\PATH\TO\openclaw-dsh-native-0.5.1.tgz" --force --accept-capabilities
+  openclaw plugins install "C:\PATH\TO\openclaw-dsh-native-0.5.2.tgz" --force --accept-capabilities
 
 The operator must verify shutdown; service status alone is not proof that all
 old processes/tools have exited. For gateway stop, --force confirms a
@@ -179,7 +202,7 @@ a host version or rewriting shared host dependencies. A prepared-directory
 installation is an alternative, still with Gateway stopped:
 
   New-Item -ItemType Directory -Path .\artifacts\prepared-dsh-native
-  tar -xf .\openclaw-dsh-native-0.5.1.tgz -C .\artifacts\prepared-dsh-native
+  tar -xf .\openclaw-dsh-native-0.5.2.tgz -C .\artifacts\prepared-dsh-native
   Push-Location .\artifacts\prepared-dsh-native\package
   npm.cmd ci --omit=dev
   Pop-Location

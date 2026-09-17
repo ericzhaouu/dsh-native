@@ -6,8 +6,12 @@
         "config": {
           "toolAllowlist": ["read", "write", "edit", "apply_patch", "exec", "process"],
           "taskPreparation": {
-            "agentIds": ["dsh-experiment"],
+            "agentIds": ["dsh-experiment", "dsh-other"],
             "skillAllowlist": [],
+            "skillAllowlistByAgent": {
+              "dsh-experiment": ["content-distill"],
+              "dsh-other": []
+            },
             "maxClarificationTurns": 3,
             "maxToolCalls": 24
           }
@@ -18,6 +22,12 @@
   "agents": {
     "entries": {
       "dsh-experiment": {
+        "runtime": {
+          "type": "embedded",
+          "harness": "dsh-native"
+        }
+      },
+      "dsh-other": {
         "runtime": {
           "type": "embedded",
           "harness": "dsh-native"

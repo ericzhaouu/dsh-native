@@ -1,6 +1,6 @@
 # DSH Native for OpenClaw
 
-**实验性版本 0.5.1**：把官方 DeepSeek Harness（DSH）的模型／工具循环接入 OpenClaw 的原生 `AgentHarnessV2`，并保留 OpenClaw 对模型、认证、工具授权与会话入口的控制。
+**实验性版本 0.5.2**：把官方 DeepSeek Harness（DSH）的模型／工具循环接入 OpenClaw 的原生 `AgentHarnessV2`，并保留 OpenClaw 对模型、认证、工具授权与会话入口的控制。
 
 - 源码仓库：[ericzhaouu/dsh-native](https://github.com/ericzhaouu/dsh-native)
 - 作者：[ericzhaouu](https://github.com/ericzhaouu)
@@ -16,6 +16,7 @@
 
 ## 目录
 
+- [0.5.2 Agent 级 SKILL 可见性覆盖](#052-agent-级-skill-可见性覆盖)
 - [0.5.1 会话重置修复](#051-会话重置修复)
 - [继承宿主工具与收窄清单](#继承宿主工具与收窄清单)
 - [自适应任务准备](#自适应任务准备)
@@ -36,6 +37,23 @@
 - [仓库结构](#仓库结构)
 - [排错](#排错)
 - [致谢与许可证](#致谢与许可证)
+
+## 0.5.2 Agent 级 SKILL 可见性覆盖
+
+0.5.2 增加 `taskPreparation.skillAllowlistByAgent`。键必须同时出现在 `taskPreparation.agentIds` 中；值使用与 `skillAllowlist` 相同的精确 Skill 名称校验，最多 12 项，不支持通配符。列出的 Agent 使用该数组**替换**共享 `skillAllowlist`；`[]` 明确表示不广告任何 Skill；未列出的 Agent 继续继承共享列表。此覆盖只影响准备阶段可见的 Skill 说明，不改变宿主工具、认证、MCP 连接或子进程协议。
+
+```json
+{
+  "taskPreparation": {
+    "agentIds": ["dsh-experiment", "dsh-other"],
+    "skillAllowlist": [],
+    "skillAllowlistByAgent": {
+      "dsh-experiment": ["content-distill"],
+      "dsh-other": []
+    }
+  }
+}
+```
 
 ## 0.5.1 会话重置修复
 
@@ -61,8 +79,12 @@ OpenClaw 的聊天 `/new` 可以保留原 `sessionId`，通过宿主转录中的
 {
   "toolAllowlist": ["read", "web_search", "web_fetch"],
   "taskPreparation": {
-    "agentIds": ["dsh-experiment"],
+    "agentIds": ["dsh-experiment", "dsh-other"],
     "skillAllowlist": [],
+    "skillAllowlistByAgent": {
+      "dsh-experiment": ["content-distill"],
+      "dsh-other": []
+    },
     "maxClarificationTurns": 3,
     "maxToolCalls": 24
   }
@@ -83,7 +105,7 @@ OpenClaw 的聊天 `/new` 可以保留原 `sessionId`，通过宿主转录中的
 
 ### SKILL、MCP 与特殊工具
 
-SKILL 是方法说明，不是可执行工具。`skillAllowlist` 控制哪些技能说明可见；实际步骤仍必须使用本轮工具集合。单独把技能加入名单不会添加搜索、飞书或 MCP 工具。
+SKILL 是方法说明，不是可执行工具。`skillAllowlist` 控制共享可见技能说明；`skillAllowlistByAgent` 可按已启用 Agent 精确替换它。实际步骤仍必须使用本轮工具集合。单独把技能加入名单不会添加搜索、飞书或 MCP 工具。
 
 MCP 连接和认证应由 OpenClaw 管理。本版只接纳宿主能安全提供的兼容工具实例；不会自行读取 MCP 配置并建立新连接，也不会把缓存的 advertised catalog 当成当前请求者已连接的证明。需要单独物化请求者连接、特殊审批续接或其他未支持上下文的工具，应明确报告不兼容，而不是宣称所有 MCP／插件都已完整接通。
 
@@ -108,8 +130,12 @@ MCP 连接和认证应由 OpenClaw 管理。本版只接纳宿主能安全提供
 {
   "toolAllowlist": ["read", "write", "edit", "apply_patch", "exec", "process"],
   "taskPreparation": {
-    "agentIds": ["dsh-experiment"],
+    "agentIds": ["dsh-experiment", "dsh-other"],
     "skillAllowlist": [],
+    "skillAllowlistByAgent": {
+      "dsh-experiment": ["content-distill"],
+      "dsh-other": []
+    },
     "maxClarificationTurns": 3,
     "maxToolCalls": 24
   }
@@ -123,6 +149,7 @@ MCP 连接和认证应由 OpenClaw 管理。本版只接纳宿主能安全提供
 | `agentIds` | `[]`，未列出的 Agent 沿用原路径；精确 ID，不支持通配符 |
 | `executionTools` | 旧版兼容字段；优先使用顶层 `toolAllowlist`，省略时从顶层派生，否则默认为 coding 工具家族 |
 | `skillAllowlist` | `[]`；准备模式不再默认广告整份技能目录，仅显示操作者明确列出的技能 |
+| `skillAllowlistByAgent` | 可选对象；键必须是 `agentIds` 中的精确 Agent ID，值替换该 Agent 的共享 Skill 列表；`[]` 明确为空，省略则继承 |
 | `maxClarificationTurns` | `3`，允许 `1..5`；达到上限后返回草稿／未决事项，不强迫执行 |
 | `maxToolCalls` | `24`，允许 `1..100`；每次执行尝试的宿主调用预算，内部控制调用不计入 |
 
@@ -215,7 +242,7 @@ node --version
 npm.cmd ci
 ```
 
-确认所用源码的 `package.json` 版本为 `0.5.1`。本项目把 OpenClaw 声明为 **optional peer**，避免在生产插件内部自动安装第二份宿主；开发／类型检查／真实 SDK 测试仍需要匹配的 SDK。
+确认所用源码的 `package.json` 版本为 `0.5.2`。本项目把 OpenClaw 声明为 **optional peer**，避免在生产插件内部自动安装第二份宿主；开发／类型检查／真实 SDK 测试仍需要匹配的 SDK。
 
 若开发目录尚未提供精确 SDK，先从 [OpenClaw 官方仓库](https://github.com/openclaw/openclaw)的发行流程取得并验证上述 **2026.9.2 官方制品**，然后本地安装：
 
@@ -229,7 +256,7 @@ npm.cmd pack
 
 `--check` 只检查，不会应用补丁。未修改的匹配制品应报告 `unpatched`。如果所用 registry 没有这个版本，应使用已核验的精确官方制品，**不要猜测可用的 npm 版本、改用最新预览版或伪造 SDK 类型**。无法取得匹配制品时，应停止需要该 SDK 的构建／集成验证。
 
-`npm pack` 的 `prepack` 会再次执行构建，生成本地 `openclaw-dsh-native-0.5.1.tgz`。不要把开发目录中的 OpenClaw SDK、账号或会话状态随插件复制出去。
+`npm pack` 的 `prepack` 会再次执行构建，生成本地 `openclaw-dsh-native-0.5.2.tgz`。不要把开发目录中的 OpenClaw SDK、账号或会话状态随插件复制出去。
 
 ## 维护窗口安装与 Agent 级启用
 
@@ -253,7 +280,7 @@ openclaw gateway status --no-probe
 仍保持 Gateway 停止：
 
 ```powershell
-openclaw plugins install "C:\PATH\TO\openclaw-dsh-native-0.5.1.tgz" --force --accept-capabilities
+openclaw plugins install "C:\PATH\TO\openclaw-dsh-native-0.5.2.tgz" --force --accept-capabilities
 ```
 
 `--force` 用于确认本地来源／覆盖安装；`--accept-capabilities` 是官方安装器对声明能力的接受选项，**仅用于已审阅并信任的代码**，不是规避安全策略。先阅读安装器说明和能力提示，不要无条件接受陌生代码。归档安装会处理运行依赖；已有 provider 及认证应留在 OpenClaw，不填入插件设置。
@@ -262,7 +289,7 @@ openclaw plugins install "C:\PATH\TO\openclaw-dsh-native-0.5.1.tgz" --force --ac
 
 ```powershell
 New-Item -ItemType Directory -Path .\artifacts\prepared-dsh-native
-tar -xf .\openclaw-dsh-native-0.5.1.tgz -C .\artifacts\prepared-dsh-native
+tar -xf .\openclaw-dsh-native-0.5.2.tgz -C .\artifacts\prepared-dsh-native
 Push-Location .\artifacts\prepared-dsh-native\package
 npm.cmd ci --omit=dev
 Pop-Location

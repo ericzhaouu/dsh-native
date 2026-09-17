@@ -121,6 +121,87 @@ test("only explicitly listed, exact lowercase agent IDs enable preparation", () 
   assert.deepEqual(config.executionTools, ["read", "exec"]);
 });
 
+test("per-agent skill allowlist overrides are exact, replacing only the selected agent", () => {
+  const config = parseTaskPreparationConfig({
+    agentIds: ["dsh-experiment", "dsh-other"],
+    executionTools: ["read"],
+    skillAllowlist: ["shared-skill"],
+    skillAllowlistByAgent: {
+      "dsh-experiment": ["content-distill"],
+      "dsh-other": [],
+    },
+  });
+  assert.deepEqual(config.skillAllowlistByAgent, {
+    "dsh-experiment": ["content-distill"],
+    "dsh-other": [],
+  });
+  assert.deepEqual(resolvePreparationPolicy(config, "dsh-experiment"), policy({
+    executionTools: ["read"], skillAllowlist: ["content-distill"],
+  }));
+  assert.deepEqual(resolvePreparationPolicy(config, "dsh-other"), policy({
+    executionTools: ["read"], skillAllowlist: [],
+  }));
+  assert.deepEqual(resolvePreparationPolicy(parseTaskPreparationConfig({
+    agentIds: ["dsh-experiment", "dsh-other"],
+    skillAllowlist: ["shared-skill"],
+    skillAllowlistByAgent: { "dsh-experiment": ["content-distill"] },
+  }), "dsh-other").skillAllowlist, ["shared-skill"]);
+  assert.equal(resolvePreparationPolicy(config, "inactive"), undefined);
+});
+
+test("per-agent skill allowlists reject inactive keys and malformed values without getters", () => {
+  assert.throws(() => parseTaskPreparationConfig({
+    agentIds: ["dsh-experiment"],
+    skillAllowlistByAgent: { "dsh-other": ["content-distill"] },
+  }), /unknown field/);
+  assert.throws(() => parseTaskPreparationConfig({
+    agentIds: ["dsh-experiment"],
+    skillAllowlistByAgent: { "dsh-experiment": ["content-distill", "content-distill"] },
+  }), /duplicates/);
+  assert.throws(() => parseTaskPreparationConfig({
+    agentIds: ["dsh-experiment"],
+    skillAllowlistByAgent: { "dsh-experiment": ["*"] },
+  }), /invalid/);
+  assert.throws(() => parseTaskPreparationConfig({
+    agentIds: ["dsh-experiment"],
+    skillAllowlistByAgent: { "dsh-experiment": Array.from({ length: 13 }, (_, i) => `s${i}`) },
+  }));
+  assert.throws(() => parseTaskPreparationConfig({
+    agentIds: ["dsh-experiment"],
+    skillAllowlistByAgent: new Map([["dsh-experiment", ["content-distill"]]]),
+  }), /plain JSON object/);
+  assert.throws(() => parseTaskPreparationConfig(JSON.parse(
+    '{"agentIds":["dsh-experiment"],"skillAllowlistByAgent":{"__proto__":["content-distill"]}}',
+  )), /unknown field/);
+  const accessor = Object.defineProperty({}, "dsh-experiment", {
+    enumerable: true, get() { assert.fail("per-Agent allowlist getters must not run"); },
+  });
+  assert.throws(() => parseTaskPreparationConfig({
+    agentIds: ["dsh-experiment"],
+    skillAllowlistByAgent: accessor,
+  }), /JSON data/);
+});
+
+test("per-agent skill policies are defensive copies and leave other fingerprints unchanged", () => {
+  const shared = parseTaskPreparationConfig({
+    agentIds: ["dsh-experiment", "dsh-other"],
+    skillAllowlist: ["shared-skill"],
+  });
+  const overridden = parseTaskPreparationConfig({
+    agentIds: ["dsh-experiment", "dsh-other"],
+    skillAllowlist: ["shared-skill"],
+    skillAllowlistByAgent: { "dsh-experiment": ["content-distill"] },
+  });
+  const before = JSON.stringify(resolvePreparationPolicy(shared, "dsh-other"));
+  const after = JSON.stringify(resolvePreparationPolicy(overridden, "dsh-other"));
+  assert.equal(after, before);
+  const policyForExperiment = resolvePreparationPolicy(overridden, "dsh-experiment");
+  policyForExperiment.skillAllowlist.push("mutated");
+  policyForExperiment.executionTools.pop();
+  assert.deepEqual(overridden.skillAllowlistByAgent["dsh-experiment"], ["content-distill"]);
+  assert.deepEqual(overridden.executionTools, codingTools);
+});
+
 test("agent identifiers reject wildcard, duplicate, ambiguous and overlong names", () => {
   for (const name of ["*", "a*", "A", "0a", "a.b", "a/b", "a\\b", "a b", "a\n", "a\0", "", `a${"a".repeat(64)}`]) {
     assert.throws(() => parseTaskPreparationConfig({ agentIds: [name] }), name);

@@ -16,6 +16,7 @@ export type TaskPreparationConfig = {
   agentIds: string[];
   executionTools: string[];
   skillAllowlist: string[];
+  skillAllowlistByAgent?: Record<string, string[]>;
   maxClarificationTurns: number;
   maxToolCalls: number;
 };
@@ -85,7 +86,7 @@ const LIMIT = {
   toolCalls: 100,
 } as const;
 const CONFIG_KEYS = [
-  "agentIds", "executionTools", "skillAllowlist", "maxClarificationTurns", "maxToolCalls",
+  "agentIds", "executionTools", "skillAllowlist", "skillAllowlistByAgent", "maxClarificationTurns", "maxToolCalls",
 ] as const;
 const POLICY_KEYS = [
   "version", "executionTools", "skillAllowlist", "maxClarificationTurns", "maxToolCalls",
@@ -210,15 +211,29 @@ function skills(value: unknown, path: string): string[] {
   return names(value, path, LIMIT.skillName, (name) => /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(name));
 }
 
+function skillAllowlistByAgent(value: unknown, agentIds: readonly string[]): Record<string, string[]> {
+  const input = record(value, "config.skillAllowlistByAgent", agentIds, []);
+  const result: Record<string, string[]> = {};
+  for (const agentId of Object.keys(input)) {
+    result[agentId] = skills(input[agentId], `config.skillAllowlistByAgent.${agentId}`);
+  }
+  return result;
+}
+
 export function parseTaskPreparationConfig(value: unknown): TaskPreparationConfig {
   const input = record(value, "config", CONFIG_KEYS, []);
   const setting = (key: typeof CONFIG_KEYS[number], fallback: unknown): unknown =>
     Object.hasOwn(input, key) ? input[key] : fallback;
+  const agentIds = names(setting("agentIds", []), "config.agentIds", 64,
+    (name) => /^[a-z][a-z0-9_-]{0,63}$/.test(name));
+  const perAgentSkills = Object.hasOwn(input, "skillAllowlistByAgent")
+    ? skillAllowlistByAgent(input.skillAllowlistByAgent, agentIds)
+    : undefined;
   return {
-    agentIds: names(setting("agentIds", []), "config.agentIds", 64,
-      (name) => /^[a-z][a-z0-9_-]{0,63}$/.test(name)),
+    agentIds,
     executionTools: tools(setting("executionTools", [...CODING_TOOLS]), "config.executionTools"),
     skillAllowlist: skills(setting("skillAllowlist", []), "config.skillAllowlist"),
+    ...(perAgentSkills ? { skillAllowlistByAgent: perAgentSkills } : {}),
     maxClarificationTurns: integer(setting("maxClarificationTurns", 3),
       "config.maxClarificationTurns", 1, LIMIT.clarificationTurns),
     maxToolCalls: integer(setting("maxToolCalls", 24), "config.maxToolCalls", 1, LIMIT.toolCalls),
@@ -234,8 +249,9 @@ export function resolvePreparationPolicy(
   if (!parsed.agentIds.includes(agentId)) return undefined;
   return {
     version: 1,
-    executionTools: parsed.executionTools,
-    skillAllowlist: parsed.skillAllowlist,
+    executionTools: [...parsed.executionTools],
+    skillAllowlist: [...(Object.hasOwn(parsed.skillAllowlistByAgent ?? {}, agentId)
+      ? parsed.skillAllowlistByAgent![agentId]! : parsed.skillAllowlist)],
     maxClarificationTurns: parsed.maxClarificationTurns,
     maxToolCalls: parsed.maxToolCalls,
   };

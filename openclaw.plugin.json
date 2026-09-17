@@ -40,6 +40,16 @@
             "type": "array", "uniqueItems": true, "maxItems": 12, "default": [],
             "items": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$" }
           },
+          "skillAllowlistByAgent": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "array", "uniqueItems": true, "maxItems": 12,
+              "items": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$" }
+            },
+            "maxProperties": 12,
+            "propertyNames": { "pattern": "^[a-z][a-z0-9_-]{0,63}$" },
+            "description": "Optional exact per-Agent Skill allowlist override. Keys must also be listed in taskPreparation.agentIds; runtime validation enforces that match. A listed Agent's array replaces skillAllowlist; omitted Agents inherit it."
+          },
           "maxClarificationTurns": { "type": "integer", "minimum": 1, "maximum": 5, "default": 3 },
           "maxToolCalls": { "type": "integer", "minimum": 1, "maximum": 100, "default": 24 }
         }
