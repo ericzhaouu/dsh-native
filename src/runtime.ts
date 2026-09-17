@@ -225,7 +225,10 @@ async function runChild(config: DshConfig, input: DshAttempt): Promise<BridgeRes
   if (provider === "deepseek" && (input.headers !== undefined || input.reasoningEfforts !== undefined)) {
     throw new Error("Copilot request settings cannot be applied to a DeepSeek session.");
   }
-  if (!input.apiKey || !input.sessionId || !input.runId) throw new Error("Missing prepared DSH authentication or identity.");
+  if (!input.apiKey || !input.sessionId || !input.runId ||
+      input.nativeStateId !== undefined && (!input.nativeStateId || input.nativeStateId.trim() !== input.nativeStateId)) {
+    throw new Error("Missing prepared DSH authentication or identity.");
+  }
   if (new Set(input.tools.map((tool) => tool.name)).size !== input.tools.length) {
     throw new Error("Duplicate host tool names.");
   }
@@ -256,7 +259,7 @@ async function runChild(config: DshConfig, input: DshAttempt): Promise<BridgeRes
     credential: createHash("sha256").update(input.apiKey).digest("hex"),
     headers: Object.entries(headers ?? {}).sort(([a], [b]) => a.localeCompare(b)),
   })).digest("hex");
-  const key = createHash("sha256").update(input.sessionId).digest("hex");
+  const key = createHash("sha256").update(input.nativeStateId ?? input.sessionId).digest("hex");
   const directory = join(config.stateDir, key);
   const home = join(directory, "home");
   await mkdir(home, { recursive: true, mode: 0o700 });

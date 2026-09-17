@@ -1,6 +1,6 @@
 # DSH Native for OpenClaw
 
-**实验性版本 0.5.0**：把官方 DeepSeek Harness（DSH）的模型／工具循环接入 OpenClaw 的原生 `AgentHarnessV2`，并保留 OpenClaw 对模型、认证、工具授权与会话入口的控制。
+**实验性版本 0.5.1**：把官方 DeepSeek Harness（DSH）的模型／工具循环接入 OpenClaw 的原生 `AgentHarnessV2`，并保留 OpenClaw 对模型、认证、工具授权与会话入口的控制。
 
 - 源码仓库：[ericzhaouu/dsh-native](https://github.com/ericzhaouu/dsh-native)
 - 作者：[ericzhaouu](https://github.com/ericzhaouu)
@@ -16,6 +16,7 @@
 
 ## 目录
 
+- [0.5.1 会话重置修复](#051-会话重置修复)
 - [继承宿主工具与收窄清单](#继承宿主工具与收窄清单)
 - [自适应任务准备](#自适应任务准备)
 - [0.3.1 修复](#031-修复)
@@ -35,6 +36,14 @@
 - [仓库结构](#仓库结构)
 - [排错](#排错)
 - [致谢与许可证](#致谢与许可证)
+
+## 0.5.1 会话重置修复
+
+OpenClaw 的聊天 `/new` 可以保留原 `sessionId`，通过宿主转录中的重置事件清空模型上下文，而不是删除可见历史。此前仅测试新会话 ID 会漏掉这个渠道入口差异：重置后的首次请求可能仍因旧的非 DSH 历史而被拒绝，再次 `/new` 也不能解决。
+
+0.5.1 按宿主当前分支的明确清空边界隔离上下文和原生状态，不再假设 `/new` 一定换 ID。原始历史及旧 DSH 状态保留；宿主用户入库回执、会话身份、写入栅栏与边界之后的 DSH 归属校验不放宽。消息正文中写着 `/new` 或“新会话”不是重置凭证。
+
+仅兼容能够确认的清空边界。保留旧上下文的重置、不支持的分支变化或执行中的边界冲突仍明确失败，不能用删除历史、改绑定或导入其他运行时消息绕过。此修复不扩展搜索、飞书业务工具或主动消息投递权限。
 
 ## 继承宿主工具与收窄清单
 
@@ -206,7 +215,7 @@ node --version
 npm.cmd ci
 ```
 
-确认所用源码的 `package.json` 版本为 `0.5.0`。本项目把 OpenClaw 声明为 **optional peer**，避免在生产插件内部自动安装第二份宿主；开发／类型检查／真实 SDK 测试仍需要匹配的 SDK。
+确认所用源码的 `package.json` 版本为 `0.5.1`。本项目把 OpenClaw 声明为 **optional peer**，避免在生产插件内部自动安装第二份宿主；开发／类型检查／真实 SDK 测试仍需要匹配的 SDK。
 
 若开发目录尚未提供精确 SDK，先从 [OpenClaw 官方仓库](https://github.com/openclaw/openclaw)的发行流程取得并验证上述 **2026.9.2 官方制品**，然后本地安装：
 
@@ -220,7 +229,7 @@ npm.cmd pack
 
 `--check` 只检查，不会应用补丁。未修改的匹配制品应报告 `unpatched`。如果所用 registry 没有这个版本，应使用已核验的精确官方制品，**不要猜测可用的 npm 版本、改用最新预览版或伪造 SDK 类型**。无法取得匹配制品时，应停止需要该 SDK 的构建／集成验证。
 
-`npm pack` 的 `prepack` 会再次执行构建，生成本地 `openclaw-dsh-native-0.5.0.tgz`。不要把开发目录中的 OpenClaw SDK、账号或会话状态随插件复制出去。
+`npm pack` 的 `prepack` 会再次执行构建，生成本地 `openclaw-dsh-native-0.5.1.tgz`。不要把开发目录中的 OpenClaw SDK、账号或会话状态随插件复制出去。
 
 ## 维护窗口安装与 Agent 级启用
 
@@ -244,7 +253,7 @@ openclaw gateway status --no-probe
 仍保持 Gateway 停止：
 
 ```powershell
-openclaw plugins install "C:\PATH\TO\openclaw-dsh-native-0.5.0.tgz" --force --accept-capabilities
+openclaw plugins install "C:\PATH\TO\openclaw-dsh-native-0.5.1.tgz" --force --accept-capabilities
 ```
 
 `--force` 用于确认本地来源／覆盖安装；`--accept-capabilities` 是官方安装器对声明能力的接受选项，**仅用于已审阅并信任的代码**，不是规避安全策略。先阅读安装器说明和能力提示，不要无条件接受陌生代码。归档安装会处理运行依赖；已有 provider 及认证应留在 OpenClaw，不填入插件设置。
@@ -253,7 +262,7 @@ openclaw plugins install "C:\PATH\TO\openclaw-dsh-native-0.5.0.tgz" --force --ac
 
 ```powershell
 New-Item -ItemType Directory -Path .\artifacts\prepared-dsh-native
-tar -xf .\openclaw-dsh-native-0.5.0.tgz -C .\artifacts\prepared-dsh-native
+tar -xf .\openclaw-dsh-native-0.5.1.tgz -C .\artifacts\prepared-dsh-native
 Push-Location .\artifacts\prepared-dsh-native\package
 npm.cmd ci --omit=dev
 Pop-Location
@@ -512,7 +521,7 @@ node .\host-patch\apply.mjs --root $HostRoot --check
 
 备份当前可回退的插件制品和配置，在停机窗口构建／安装新包。OpenClaw 升级可能替换补丁文件：先规划恢复／迁移，重新核对目标制品，不把旧补丁强加给新版本。发生 `partial` 时保持停止并按补丁文档恢复，不能带半套补丁启动。
 
-0.1 的旧绑定缺少后续版本的模型／账号指纹；保留但不静默迁移。无论升级、切 runtime、换模型还是换账号，都使用 `/new`，不要直接重放旧任务。0.5.0 保留此前模型归属、最终正文及 reasoning 尾部空白的修正，不需要也不建议对运行中的安装做零散 JS 替换。
+0.1 的旧绑定缺少后续版本的模型／账号指纹；保留但不静默迁移。无论升级、切 runtime、换模型还是换账号，都使用 `/new`，不要直接重放旧任务。0.5.1 保留此前模型归属、最终正文及 reasoning 尾部空白的修正，不需要也不建议对运行中的安装做零散 JS 替换。
 
 ## 安全与公开发布
 

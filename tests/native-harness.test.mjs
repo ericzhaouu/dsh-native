@@ -140,6 +140,7 @@ function fixture(t, overrides = {}) {
       { role: "user", content: "Earlier request", timestamp: 1 },
       { role: "user", content: f.p.prompt, timestamp: 2 },
     ],
+    contextMessages: undefined,
     persistUser: f.spy("persistUser", async () => {}),
     markSentToProvider: f.spy("sentToProvider"),
     persistAssistant: f.spy("persistAssistant", async (assistant) => {
@@ -149,6 +150,7 @@ function fixture(t, overrides = {}) {
       return { owned: true, idempotencyKey, message };
     }),
   };
+  f.transcript.contextMessages = f.transcript.messages;
   f.runtime = {
     run: f.spy("runtimeRun", async (input) => {
       f.input = input;
@@ -868,6 +870,41 @@ test("input/output/finalize/end hooks receive canonical host context and truthfu
   before(f, "outputHook", "finalizeHook");
   before(f, "finalizeHook", "persistAssistant");
   before(f, "persistAssistant", "endHook");
+});
+
+test("reset-filtered context goes to model hooks while result preserves full visible snapshot", async (t) => {
+  const f = fixture(t);
+  const old = { role: "assistant", content: [{ type: "text", text: "old visible" }], idempotencyKey: "foreign:assistant" };
+  f.transcript.messages = [
+    { role: "user", content: "old", timestamp: 1 },
+    old,
+    { role: "user", content: f.p.prompt, timestamp: 2 },
+  ];
+  f.transcript.contextMessages = [f.transcript.messages.at(-1)];
+  f.dependencies.prepareTranscript = f.spy("prepareTranscript", async () => f.transcript);
+  f.dependencies.prepareHost = f.spy("prepareHost", async (_p, _signal, _assertActive, messages) => {
+    assert.deepEqual(messages, f.transcript.contextMessages);
+    return f.host;
+  });
+  const result = await f.harness.runAttempt(f.p);
+  const input = f.sdk.runAgentHarnessLlmInputHook.mock.calls[0].arguments[0];
+  assert.deepEqual(input.event.historyMessages, []);
+  const finalize = f.sdk.runAgentHarnessBeforeAgentFinalizeHook.mock.calls[0].arguments[0];
+  assert.equal(finalize.event.messages[0], f.transcript.contextMessages[0]);
+  const end = f.sdk.awaitAgentHarnessAgentEndHook.mock.calls[0].arguments[0];
+  assert.equal(end.event.messages, f.transcript.contextMessages);
+  assert.equal(end.event.messages.some((message) => message === old), false);
+  assert.deepEqual(result.messagesSnapshot.slice(0, 2), f.transcript.messages.slice(0, 2));
+});
+
+test("native reset epoch is forwarded only to runtime state, not canonical host session identity", async (t) => {
+  const f = fixture(t);
+  f.transcript.nativeStateId = "openclaw-session\0reset\0reset-1";
+  f.transcript.assistantKeyPrefix = "dsh-native:reset:reset-1:";
+  const result = await f.harness.runAttempt(f.p);
+  assert.equal(result.sessionIdUsed, f.p.sessionId);
+  assert.equal(f.input.sessionId, f.p.sessionId);
+  assert.equal(f.input.nativeStateId, f.transcript.nativeStateId);
 });
 
 test("revision requests fail closed without rerunning the provider or persisting a final assistant", async (t) => {

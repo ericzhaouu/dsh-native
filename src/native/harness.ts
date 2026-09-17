@@ -295,9 +295,11 @@ export function createNativeHarness(
         assertActive();
         transcript = await dependencies.prepareTranscript(p, assertActive);
         assertActive();
-        assertContinuity = dependencies.prepareContinuity?.(config, p, transcript.messages);
+        assertContinuity = dependencies.prepareContinuity?.(
+          config, p, transcript.contextMessages, transcript.nativeStateId, transcript.assistantKeyPrefix,
+        );
         assertContinuity?.();
-        host = await dependencies.prepareHost(p, signal, assertActive, transcript.messages,
+        host = await dependencies.prepareHost(p, signal, assertActive, transcript.contextMessages,
           preparationPolicy && preparationGate ? { policy: preparationPolicy, gate: preparationGate } : undefined,
           config.toolAllowlist);
         assertActive();
@@ -309,7 +311,7 @@ export function createNativeHarness(
           event: {
             runId: p.runId, sessionId: p.sessionId, provider: p.provider, model: route.modelId,
             systemPrompt: host.systemPrompt, prompt: host.prompt,
-            historyMessages: transcript.messages.slice(0, -1), imagesCount: 0, tools: host.tools,
+            historyMessages: transcript.contextMessages.slice(0, -1), imagesCount: 0, tools: host.tools,
           },
         });
         assertActive();
@@ -321,6 +323,7 @@ export function createNativeHarness(
         assertActive();
         const output = await runtime.run({
           ...route, sessionId: p.sessionId, runId: p.runId,
+          nativeStateId: transcript.nativeStateId,
           workspaceDir: p.cwd ?? p.workspaceDir, prompt: host.prompt, systemPrompt: host.systemPrompt,
           tools: host.tools, signal,
           assertActive: () => { assertActive(); assertContinuity?.(); },
@@ -370,7 +373,7 @@ export function createNativeHarness(
             runId: p.runId, sessionId: p.sessionId, sessionKey: p.sessionKey,
             provider: p.provider, model: route.modelId, cwd: p.cwd ?? p.workspaceDir,
             stopHookActive: false, lastAssistantMessage: output.text,
-            messages: [...transcript.messages, assistant],
+            messages: [...transcript.contextMessages, assistant],
           },
         });
         assertActive();
@@ -428,7 +431,7 @@ export function createNativeHarness(
         try {
           await sdk.awaitAgentHarnessAgentEndHook({
             ctx: hookContext, event: {
-              runId: p.runId, messages: result.messagesSnapshot, success: terminal.kind === "ok",
+              runId: p.runId, messages: transcript?.contextMessages ?? [], success: terminal.kind === "ok",
               durationMs: Date.now() - startedAt,
               ...(terminal.kind === "failed" ? { error: describe(terminal.error) } :
                 terminal.kind === "ok" ? {} : { error: terminal.kind }),
@@ -503,7 +506,7 @@ export function createNativeHarness(
           await run.done;
         }
       }
-      // Old native state remains quarantined; a new OpenClaw sessionId creates fresh history.
+      // Old state is retained; a new host identity or clear-reset epoch starts fresh native history.
     },
     dispose() {
       disposal ??= (async () => {

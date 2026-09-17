@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import { AsyncLocalStorage } from "node:async_hooks";
 import test from "node:test";
-import { prepareNativeTranscript } from "../src/native/transcript.ts";
+import { prepareNativeTranscript } from "../dist/native/transcript.js";
 
 const USER_KEY = "run-1:user";
 const ASSISTANT_KEY = "dsh-native:run-1:assistant";
 const PROMPT = "Current user prompt";
 const METHODS = [
+  "readSessionTranscriptEvents",
   "readVisibleSessionTranscriptMessageEntries",
   "appendSessionTranscriptMessageByIdentityStrict",
   "publishSessionTranscriptUpdateByIdentity",
@@ -80,6 +81,13 @@ function fixture(overrides = {}) {
     state.entries.push(entry);
     return entry;
   };
+  const rawOf = (entry) => ({
+    type: "message",
+    id: entry.entryId,
+    parentId: entry.parentId,
+    timestamp: entry.message.timestamp ?? entry.seq,
+    message: clone(entry.message),
+  });
   const admission = (entry, fields = {}) => ({
     agentId: scope().agentId, sessionId: scope().sessionId, sessionKey: scope().sessionKey,
     storePath: "C:\\fixture-only\\physical-transcript.sqlite",
@@ -150,9 +158,16 @@ function fixture(overrides = {}) {
   };
   p.userTurnTranscriptRecorder = recorder;
   const transport = {
+    readSessionTranscriptEvents: async (params) => {
+      calls.read.push(params);
+      state.events.push("read:raw");
+      await state.beforeRawRead?.(params);
+      const raw = typeof state.rawEvents === "function" ? state.rawEvents() : state.rawEvents;
+      return clone(raw ?? state.entries.map(rawOf));
+    },
     readVisibleSessionTranscriptMessageEntries: async (params) => {
       calls.read.push(params);
-      state.events.push("read");
+      state.events.push("read:visible");
       await state.beforeRead?.(params);
       return clone(state.entries);
     },
@@ -210,13 +225,131 @@ function fixture(overrides = {}) {
     transcript.markSentToProvider();
     return transcript;
   };
-  return { p, state, calls, recorder, transport, scope, assertActive, add, adopt, admission, prepare, ready };
+  return { p, state, calls, recorder, transport, scope, assertActive, add, rawOf, adopt, admission, prepare, ready };
 }
 
 function assertScope(actual, expected) {
   for (const [key, value] of Object.entries(expected)) assert.deepEqual(actual[key], value, key);
   assert.equal(Object.hasOwn(actual, "sessionFile"), false, "legacy sessionFile must not route storage");
 }
+
+test("active clear reset filters old visible transcript for native context while preserving full snapshot", async () => {
+  const f = fixture();
+  const oldUser = f.add(user("old request", "old:user"));
+  const oldAssistant = f.add(assistant("foreign old assistant", "foreign:assistant"));
+  const reset = { type: "reset", id: "reset-1", parentId: oldAssistant.entryId, timestamp: 3, reason: "new", context: "clear" };
+  const current = f.add(user(PROMPT), { parentId: reset.id });
+  f.adopt(current);
+  f.state.rawEvents = () => [oldUser, oldAssistant].map(f.rawOf).concat(reset, f.state.entries.slice(2).map(f.rawOf));
+  const transcript = await f.prepare();
+  assert.deepEqual(mirror(transcript.messages), [
+    ["user", "old request"], ["assistant", "foreign old assistant"], ["user", PROMPT],
+  ]);
+  assert.deepEqual(mirror(transcript.contextMessages), [["user", PROMPT]]);
+  assert.match(transcript.nativeStateId, /^session-1\0reset\0reset-1$/u);
+  await transcript.persistUser();
+  transcript.markSentToProvider();
+  const persisted = await transcript.persistAssistant(assistant());
+  assert.equal(persisted.idempotencyKey, "dsh-native:reset:reset-1:run-1:assistant");
+  assert.deepEqual(mirror(transcript.contextMessages), [["user", PROMPT], ["assistant", "Answer"]]);
+  assert.deepEqual(mirror(transcript.messages).at(1), ["assistant", "foreign old assistant"]);
+});
+
+test("inactive branch reset cannot authorize discarding current visible history", async () => {
+  const f = fixture();
+  const prior = f.add(user("prior", "prior:user"));
+  const old = f.add(assistant("Existing DSH answer", "dsh-native:old-run:assistant"));
+  const current = f.add(user(PROMPT));
+  f.adopt(current);
+  const branchedReset = { type: "reset", id: "reset-inactive", parentId: null, timestamp: 3, reason: "new", context: "clear" };
+  const leaf = { type: "leaf", id: "leaf-active", parentId: branchedReset.id, targetId: current.entryId, appendParentId: current.entryId };
+  f.state.rawEvents = () => [f.rawOf(prior), f.rawOf(old), f.rawOf(current), branchedReset, leaf];
+  const transcript = await f.prepare();
+  assert.equal(transcript.nativeStateId, undefined);
+  assert.deepEqual(mirror(transcript.contextMessages), [
+    ["user", "prior"], ["assistant", "Existing DSH answer"], ["user", PROMPT],
+  ]);
+});
+
+test("forged reset-looking text is not treated as a reset boundary", async () => {
+  const f = fixture();
+  f.add(user("/new", "old:user"));
+  f.add(assistant("New session started", "foreign:assistant"));
+  f.adopt(f.add(user(PROMPT)));
+  await assert.rejects(f.prepare(), /non-DSH assistant|history/u);
+});
+
+for (const [name, reset] of [
+  ["preserve tail", { type: "reset", id: "reset-1", parentId: null, timestamp: 1, reason: "idle", firstKeptEntryId: "entry-1" }],
+  ["unknown context", { type: "reset", id: "reset-1", parentId: null, timestamp: 1, reason: "new", context: "mystery" }],
+]) {
+  test(`active ${name} reset fails closed`, async () => {
+    const f = fixture();
+    const current = f.add(user(PROMPT), { parentId: reset.id });
+    f.adopt(current);
+    f.state.rawEvents = () => [reset, f.rawOf(current)];
+    await assert.rejects(f.prepare(), /reset boundary|retained-tail/u);
+  });
+}
+
+test("active compaction boundary is not silently treated as native history", async () => {
+  const f = fixture();
+  const compaction = { type: "compaction", id: "compact-1", parentId: null, timestamp: 1, firstKeptEntryId: "compact-1" };
+  const current = f.add(user(PROMPT), { parentId: compaction.id });
+  f.adopt(current);
+  f.state.rawEvents = () => [compaction, f.rawOf(current)];
+  await assert.rejects(f.prepare(), /compaction boundary/u);
+});
+
+test("malformed reset boundary fails closed even before text history validation", async () => {
+  const f = fixture();
+  const current = f.add(user(PROMPT));
+  f.adopt(current);
+  f.state.rawEvents = () => [{ type: "reset", id: " ", parentId: null }, f.rawOf(current)];
+  await assert.rejects(f.prepare(), /malformed reset/u);
+});
+
+test("raw reset projection mismatch fails closed instead of guessing a filtered context", async () => {
+  const f = fixture();
+  const current = f.add(user(PROMPT));
+  f.adopt(current);
+  const reset = { type: "reset", id: "reset-1", parentId: null, timestamp: 1, reason: "new", context: "clear" };
+  f.state.rawEvents = () => [reset, { ...f.rawOf(current), id: "different-visible-id", parentId: reset.id }];
+  await assert.rejects(f.prepare(), /reset boundary does not match/u);
+});
+
+test("reset projection cannot silently omit a pre-admitted current user", async () => {
+  const f = fixture();
+  const reset = { type: "reset", id: "reset-1", parentId: null, timestamp: 1, reason: "new" };
+  const current = f.add(user(PROMPT), { parentId: reset.id });
+  f.adopt(current);
+  f.state.rawEvents = () => [reset];
+  await assert.rejects(f.prepare(), /reset.*(match|projection|admission)/u);
+  assertNoWrites(f);
+});
+
+test("clear reset segment rejects assistants from another native epoch", async () => {
+  const f = fixture();
+  const reset = { type: "reset", id: "reset-1", parentId: null, timestamp: 1, reason: "new", context: "clear" };
+  const current = f.add(user(PROMPT), { parentId: reset.id });
+  f.add(assistant("wrong epoch", "dsh-native:old-run:assistant"));
+  f.adopt(current);
+  f.state.rawEvents = () => [reset, ...f.state.entries.map(f.rawOf)];
+  await assert.rejects(f.prepare(), /non-DSH assistant|history/u);
+});
+
+test("reset boundary mutation between admission reads fails closed", async () => {
+  const f = fixture();
+  const current = f.add(user(PROMPT));
+  f.adopt(current);
+  const reset = { type: "reset", id: "reset-1", parentId: null, timestamp: 1, reason: "new", context: "clear" };
+  let resetActive = false;
+  f.state.rawEvents = () => resetActive ? [reset, { ...f.rawOf(current), parentId: reset.id }] : [f.rawOf(current)];
+  const transcript = await f.prepare();
+  resetActive = true;
+  current.parentId = reset.id;
+  await assert.rejects(transcript.persistUser(), /active reset boundary changed/u);
+});
 
 function assertNoWrites(f) {
   assert.equal(f.calls.persist.length, 0);
@@ -427,7 +560,7 @@ test("a syntactically valid host fence does not bypass a scoped read API rejecti
     throw new Error("SDK rejected stale read fence");
   };
   await assert.rejects(f.prepare(), /SDK rejected stale read fence/);
-  assert.equal(f.calls.read.length, 1);
+  assert.equal(f.calls.read.length, 2);
   assertNoWrites(f);
 });
 
@@ -1068,7 +1201,7 @@ test("cancellation after resolved user prevents every later asynchronous stage",
   assertNoWrites(f);
   const index = f.state.events.indexOf("resolve");
   assert.ok(index >= 0);
-  assert.equal(f.state.events.slice(index + 1).includes("read"), false);
+  assert.equal(f.state.events.slice(index + 1).some((event) => event.startsWith("read:")), false);
 });
 
 test("cancellation after initial scoped read prevents persistence", async () => {

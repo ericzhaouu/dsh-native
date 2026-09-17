@@ -96,6 +96,23 @@ test("matching ready binding uses the hashed OpenClaw session and remains read-o
   assert.deepEqual(readdirSync(f.root, { recursive: true }).sort(), files);
 });
 
+test("same OpenClaw session after clear reset uses reset epoch state and key prefix", (t) => {
+  const f = fixture(t);
+  const nativeStateId = `${f.p.sessionId}\0reset\0reset-1`;
+  const bindingPath = f.pathFor(nativeStateId);
+  f.writeRaw(JSON.stringify(f.binding()), bindingPath);
+  f.writeBinding({ sessionId: "old-quarantined-native", lastRunId: "old-run" });
+  const assertActive = prepareNativeContinuity(
+    f.config,
+    f.p,
+    [assistant("reset:reset-1:previous:run-1"), user()],
+    nativeStateId,
+    "dsh-native:reset:reset-1:",
+  );
+  assert.doesNotThrow(assertActive);
+  assert.equal(existsSync(bindingPath), true);
+});
+
 test("a binding for another OpenClaw session, native ID or session key cannot replace the missing binding", (t) => {
   const f = fixture(t);
   const text = JSON.stringify(f.binding());

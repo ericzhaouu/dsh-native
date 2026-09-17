@@ -12,12 +12,21 @@ type Messages = Awaited<ReturnType<AgentHarnessV2["runAttempt"]>>["messagesSnaps
  * Read-only cross-store guard. The runtime alone creates, locks and mutates bindings;
  * this seam prevents a retained OpenClaw mirror from silently starting empty native history.
  */
-export function prepareNativeContinuity(config: DshConfig, p: Attempt, messages: Messages): () => void {
+export function prepareNativeContinuity(
+  config: DshConfig,
+  p: Attempt,
+  messages: Messages,
+  nativeStateId = p.sessionId,
+  assistantKeyPrefix = "dsh-native:",
+): () => void {
+  if (!nativeStateId || nativeStateId.trim() !== nativeStateId || !assistantKeyPrefix) {
+    throw new Error("dsh-native: invalid native reset state boundary; start /new");
+  }
   const previousAssistant = messages.findLast((message) => message.role === "assistant");
   const key: unknown = previousAssistant && Reflect.get(previousAssistant, "idempotencyKey");
-  const previousRunId = typeof key === "string" && key.startsWith("dsh-native:") && key.endsWith(":assistant")
-    ? key.slice("dsh-native:".length, -":assistant".length) : undefined;
-  const bindingPath = join(config.stateDir, createHash("sha256").update(p.sessionId).digest("hex"), "binding.json");
+  const previousRunId = typeof key === "string" && key.startsWith(assistantKeyPrefix) && key.endsWith(":assistant")
+    ? key.slice(assistantKeyPrefix.length, -":assistant".length) : undefined;
+  const bindingPath = join(config.stateDir, createHash("sha256").update(nativeStateId).digest("hex"), "binding.json");
   let nativeSessionId: string | undefined;
   let currentRunObserved = false;
   const fail = (): never => {

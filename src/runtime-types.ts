@@ -23,6 +23,7 @@ export interface DshConfig {
 export interface DshAttempt {
   provider?: ModelProvider;
   sessionId: string;
+  nativeStateId?: string;
   runId: string;
   workspaceDir: string;
   prompt: string;

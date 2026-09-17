@@ -1,6 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { isDeepStrictEqual } from "node:util";
 import type { AgentHarnessV2 } from "openclaw/plugin-sdk/agent-harness";
+import { resolveActiveResetBoundary, type ActiveResetBoundary } from "./reset-boundary.js";
 
 type Attempt = Parameters<AgentHarnessV2["runAttempt"]>[0];
 type Result = Awaited<ReturnType<AgentHarnessV2["runAttempt"]>>;
@@ -23,6 +24,7 @@ type Scope = {
 
 /** Local boundary for the public, JS-only OpenClaw 2026.9.2 transcript export. */
 export interface NativeTranscriptTransport {
+  readSessionTranscriptEvents(scope: Scope): Promise<unknown>;
   readVisibleSessionTranscriptMessageEntries(scope: Scope): Promise<unknown>;
   appendSessionTranscriptMessageByIdentityStrict(params: Scope & {
     config?: Attempt["config"];
@@ -144,7 +146,7 @@ function resolveScope(p: Attempt): Scope {
 function checkedTransport(value: unknown): NativeTranscriptTransport {
   if (!record(value)) return fail("invalid public transcript transport");
   for (const name of [
-    "readVisibleSessionTranscriptMessageEntries", "appendSessionTranscriptMessageByIdentityStrict",
+    "readSessionTranscriptEvents", "readVisibleSessionTranscriptMessageEntries", "appendSessionTranscriptMessageByIdentityStrict",
     "publishSessionTranscriptUpdateByIdentity", "runAgentHarnessBeforeMessageWriteHook",
   ]) {
     if (typeof value[name] !== "function") fail(`public transcript transport is missing ${name}`);
@@ -176,6 +178,11 @@ function readEntries(value: unknown): Entry[] {
   });
 }
 
+function readRawEvents(value: unknown): unknown[] {
+  if (!Array.isArray(value)) return fail("invalid raw transcript events");
+  return structuredClone(value);
+}
+
 function verifyAdmission(value: unknown, scope: Scope, entries: Entry[], message: unknown): Admission {
   if (!record(value) || value.role !== "user" || value.sessionId !== scope.sessionId ||
       value.sessionKey !== scope.sessionKey || value.agentId !== scope.agentId ||
@@ -196,7 +203,25 @@ function verifyAdmission(value: unknown, scope: Scope, entries: Entry[], message
   return value as Admission;
 }
 
-function validateHistory(entries: Entry[], current: Admission | undefined, assistantKey: string): void {
+function filterResetContext(entries: Entry[], boundary: ActiveResetBoundary): Entry[] {
+  if (boundary.kind === "none") return entries;
+  const filtered = entries.filter((entry) => boundary.messageIds.has(entry.entryId));
+  if (filtered.length !== boundary.messageIds.size) {
+    fail("reset boundary does not match the scoped visible transcript");
+  }
+  return filtered;
+}
+
+function boundarySignature(boundary: ActiveResetBoundary): string {
+  return boundary.kind === "clear" ? boundary.signature : "none";
+}
+
+function validateHistory(
+  entries: Entry[],
+  current: Admission | undefined,
+  assistantKey: string,
+  assistantPrefix: string,
+): void {
   let pending: Entry | undefined;
   const keys = new Set<string>();
   for (let index = 0; index < entries.length; index++) {
@@ -207,8 +232,8 @@ function validateHistory(entries: Entry[], current: Admission | undefined, assis
       pending = entry;
     } else if (entry.role === "assistant") {
       const key = keyOf(entry.message);
-      if (!nonblank(key) || !key.startsWith(PREFIX) || !key.endsWith(":assistant") ||
-          key.length <= PREFIX.length + ":assistant".length || keys.has(key)) {
+      if (!nonblank(key) || !key.startsWith(assistantPrefix) || !key.endsWith(":assistant") ||
+          key.length <= assistantPrefix.length + ":assistant".length || keys.has(key)) {
         historyError("history contains a non-DSH assistant or ambiguous ownership");
       }
       try { assistantMessage(entry.message); } catch { historyError("unsupported assistant history"); }
@@ -236,6 +261,9 @@ export async function prepareNativeTranscript(
   transport?: NativeTranscriptTransport,
 ): Promise<{
   messages: Result["messagesSnapshot"];
+  contextMessages: Result["messagesSnapshot"];
+  nativeStateId?: string;
+  assistantKeyPrefix?: string;
   persistUser(): Promise<void>;
   markSentToProvider(): void;
   persistAssistant(message: Assistant): Promise<NativeAssistantPersistence>;
@@ -247,7 +275,12 @@ export async function prepareNativeTranscript(
   const runInWriterScope = AsyncLocalStorage.snapshot();
   const scope = resolveScope(p);
   if (!nonblank(p.runId)) fail("an exact runId is required");
-  const assistantKey = `${PREFIX}${p.runId}:assistant`;
+  let resetBoundary: ActiveResetBoundary = { kind: "none" };
+  let fixedBoundary: string | undefined;
+  let assistantPrefix = PREFIX;
+  let assistantKey = `${assistantPrefix}${p.runId}:assistant`;
+  let nativeStateId: string | undefined;
+  let assistantKeyPrefix: string | undefined;
   const recorder = p.userTurnTranscriptRecorder ?? fail("a host user transcript recorder is required");
   const allowed = () => {
     check();
@@ -269,7 +302,18 @@ export async function prepareNativeTranscript(
   allowed();
   const read = async () => {
     allowed();
-    const entries = readEntries(await sdk.readVisibleSessionTranscriptMessageEntries({ ...scope }));
+    const [visible, raw] = await Promise.all([
+      sdk.readVisibleSessionTranscriptMessageEntries({ ...scope }),
+      sdk.readSessionTranscriptEvents({ ...scope }),
+    ]);
+    const entries = readEntries(visible);
+    resetBoundary = resolveActiveResetBoundary(readRawEvents(raw), scope.sessionId, entries);
+    const signature = boundarySignature(resetBoundary);
+    if (fixedBoundary !== undefined && fixedBoundary !== signature) fail("active reset boundary changed during native admission");
+    assistantKey = resetBoundary.kind === "clear"
+      ? `${resetBoundary.assistantKeyPrefix}${p.runId}:assistant`
+      : `${PREFIX}${p.runId}:assistant`;
+    assistantPrefix = resetBoundary.kind === "clear" ? resetBoundary.assistantKeyPrefix : PREFIX;
     allowed();
     return entries;
   };
@@ -284,11 +328,23 @@ export async function prepareNativeTranscript(
     return verifyAdmission(receipt, scope, entries, message);
   };
   const initial = await read();
-  validateHistory(initial, currentAdmission(initial), assistantKey);
+  fixedBoundary = boundarySignature(resetBoundary);
+  const boundaryAfterInitial = resetBoundary as ActiveResetBoundary;
+  if (boundaryAfterInitial.kind === "clear") {
+    nativeStateId = boundaryAfterInitial.stateId;
+    assistantKeyPrefix = boundaryAfterInitial.assistantKeyPrefix;
+  }
+  validateHistory(filterResetContext(initial, resetBoundary), currentAdmission(initial), assistantKey, assistantPrefix);
   const messages: Result["messagesSnapshot"] = initial.map((entry) => structuredClone(entry.message));
+  const contextMessages: Result["messagesSnapshot"] =
+    filterResetContext(initial, resetBoundary).map((entry) => structuredClone(entry.message));
   const snapshot = (entries: Entry[]) => {
     messages.length = 0;
     for (const entry of entries) messages.push(structuredClone(entry.message));
+    contextMessages.length = 0;
+    for (const entry of filterResetContext(entries, resetBoundary)) {
+      contextMessages.push(structuredClone(entry.message));
+    }
   };
   let userPromise: Promise<void> | undefined;
   let userCommitted = false;
@@ -308,7 +364,7 @@ export async function prepareNativeTranscript(
     verifyText(await recorder.resolveMessage());
     allowed();
     const before = await read();
-    validateHistory(before, currentAdmission(before), assistantKey);
+    validateHistory(filterResetContext(before, resetBoundary), currentAdmission(before), assistantKey, assistantPrefix);
     const alreadyPersisted = recorder.hasPersisted();
     const result = await recorder.persistApproved({
       target: {
@@ -343,7 +399,7 @@ export async function prepareNativeTranscript(
     }
     const recorded = currentAdmission(after);
     if (!recorded || !isDeepStrictEqual(recorded, admission)) fail("mismatched recorder admission receipt");
-    validateHistory(after, admission, assistantKey);
+    validateHistory(filterResetContext(after, resetBoundary), admission, assistantKey, assistantPrefix);
     persistedUser = structuredClone(message);
     snapshot(after);
     if (!alreadyPersisted && result?.appended === true) userUpdate = { messageId: result.messageId, message };
@@ -384,7 +440,7 @@ export async function prepareNativeTranscript(
     const before = await read();
     const current = currentAdmission(before);
     if (!isDeepStrictEqual(current, admission)) fail("user admission changed before assistant persistence");
-    validateHistory(before, current, assistantKey);
+    validateHistory(filterResetContext(before, resetBoundary), current, assistantKey, assistantPrefix);
     let hookSuppressed = false;
     // Stay in the host's async writer/mutation context; the public strict path enforces its inherited fence.
     const outcome = await sdk.appendSessionTranscriptMessageByIdentityStrict({
@@ -418,7 +474,7 @@ export async function prepareNativeTranscript(
       const after = await read();
       const currentAfter = currentAdmission(after);
       if (!isDeepStrictEqual(currentAfter, admission)) fail("user admission changed during assistant suppression");
-      validateHistory(after, currentAfter, assistantKey);
+      validateHistory(filterResetContext(after, resetBoundary), currentAfter, assistantKey, assistantPrefix);
       if (after.some((entry) => keyOf(entry.message) === assistantKey)) fail("suppression conflicts with a persisted assistant");
       snapshot(after);
       decision = { owned: true, message: undefined, suppressed: true };
@@ -433,7 +489,7 @@ export async function prepareNativeTranscript(
     const after = await read();
     const currentAfter = currentAdmission(after);
     if (!isDeepStrictEqual(currentAfter, admission)) fail("user admission changed during assistant persistence");
-    validateHistory(after, currentAfter, assistantKey);
+    validateHistory(filterResetContext(after, resetBoundary), currentAfter, assistantKey, assistantPrefix);
     const entry = after.find((item) => item.entryId === result.messageId);
     if (!entry || !isDeepStrictEqual(entry.message, result.message) || after.at(-1)?.entryId !== entry.entryId) {
       fail("assistant persistence result does not match the scoped visible transcript");
@@ -460,6 +516,9 @@ export async function prepareNativeTranscript(
 
   return {
     messages,
+    contextMessages,
+    nativeStateId,
+    assistantKeyPrefix,
     persistUser: () => runInWriterScope(persistUser),
     markSentToProvider: () => runInWriterScope(markSentToProvider),
     persistAssistant: (message) => runInWriterScope(persistAssistant, message),

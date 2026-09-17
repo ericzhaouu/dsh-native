@@ -1,4 +1,4 @@
-DSH NATIVE FOR OPENCLAW -- EXPERIMENTAL 0.5.0
+DSH NATIVE FOR OPENCLAW -- EXPERIMENTAL 0.5.1
 
 Source: https://github.com/ericzhaouu/dsh-native
 Author: https://github.com/ericzhaouu
@@ -7,6 +7,16 @@ Plugin / harness ID: dsh-native
 Example Agent: dsh-experiment
 License: MIT; Copyright (c) 2026 ericzhaouu.
 The Chinese README.md contains the complete guide.
+
+SAME-SESSION RESET REPAIR (0.5.1)
+
+The host's chat /new can keep sessionId and append a clear-context reset event.
+Visible history is retained; a new session ID is not guaranteed. The adapter uses
+the authoritative active-branch clear boundary for context and native-state
+isolation, preserving old transcript/state, full user admission and host identity.
+Reset-looking message text is not authority to import or discard runtime history.
+Unclear, retained-tail or concurrent conflicting boundaries still fail closed.
+This does not add search, channel business tools or proactive delivery permissions.
 
 HOST TOOL NARROWING (0.5.0)
 
@@ -123,7 +133,7 @@ PowerShell examples follow; C:\PATH\TO values are placeholders.
   node --version
   npm.cmd ci
 
-Confirm package.json version 0.5.0. OpenClaw is an optional peer to avoid
+Confirm package.json version 0.5.1. OpenClaw is an optional peer to avoid
 bundling a second production host. Development still needs the genuine SDK.
 If it is absent, obtain and verify the exact official 2026.9.2 artifact from
 the OpenClaw release workflow, then install it locally:
@@ -137,7 +147,7 @@ the OpenClaw release workflow, then install it locally:
 If the configured registry lacks that SDK, use the verified official artifact,
 not speculative npm versions, a newer preview or hand-written replacement SDK
 types. The check is read-only; it should report unpatched for the stock pinned
-artifact. npm pack runs prepack/build and creates openclaw-dsh-native-0.5.0.tgz.
+artifact. npm pack runs prepack/build and creates openclaw-dsh-native-0.5.1.tgz.
 Use npm.cmd if PowerShell blocks npm.ps1; do not change execution policy.
 
 MAINTENANCE BEFORE INSTALL / PATCH / CONFIGURATION
@@ -154,7 +164,7 @@ Use the correct installation/profile and keep its supervisor from respawning it.
 
   openclaw gateway stop --force
   openclaw gateway status --no-probe
-  openclaw plugins install "C:\PATH\TO\openclaw-dsh-native-0.5.0.tgz" --force --accept-capabilities
+  openclaw plugins install "C:\PATH\TO\openclaw-dsh-native-0.5.1.tgz" --force --accept-capabilities
 
 The operator must verify shutdown; service status alone is not proof that all
 old processes/tools have exited. For gateway stop, --force confirms a
@@ -169,7 +179,7 @@ a host version or rewriting shared host dependencies. A prepared-directory
 installation is an alternative, still with Gateway stopped:
 
   New-Item -ItemType Directory -Path .\artifacts\prepared-dsh-native
-  tar -xf .\openclaw-dsh-native-0.5.0.tgz -C .\artifacts\prepared-dsh-native
+  tar -xf .\openclaw-dsh-native-0.5.1.tgz -C .\artifacts\prepared-dsh-native
   Push-Location .\artifacts\prepared-dsh-native\package
   npm.cmd ci --omit=dev
   Pop-Location
@@ -415,7 +425,7 @@ read host-patch\USAGE.txt; --recover-stale-lock is NOT a native-session unlock.
 For upgrades, retain a known-good plugin archive/config, stop before reinstall,
 recheck the exact host artifact and use /new. Host updates can replace patched
 files; maintenance/rebasing is required. Do not apply this patch to new builds
-or replace individual live JS files. 0.5.0 retains the prior streaming/delivery fixes.
+or replace individual live JS files. 0.5.1 retains the prior streaming/delivery fixes.
 
 DEVELOPMENT / TEST LIMITS
 
