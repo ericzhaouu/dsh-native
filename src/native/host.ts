@@ -2,9 +2,13 @@ import { Ajv, type ValidateFunction } from "ajv";
 import { isAbsolute, relative, resolve } from "node:path";
 import type { AgentHarnessV2, AnyAgentTool } from "openclaw/plugin-sdk/agent-harness";
 import { resolveAgentConfig } from "openclaw/plugin-sdk/agent-scope-runtime";
-import type { BridgeTool, BridgeToolCall, BridgeToolResult, JsonObject } from "../protocol.js";
+import type { BridgeTool, BridgeToolCall, BridgeToolResult } from "../protocol.js";
 import { renderPreparationInstructions, type PreparationPolicy } from "../preparation.js";
 import { filterPreparationSkills, type PreparationGate } from "./preparation.js";
+import {
+  LEGACY_CODING_TOOLS, buildHostToolNotices, renderHostToolNotices, resolveHostToolAllowlist, selectHostTools,
+  type HostToolNotice, type HostToolSourceSnapshot,
+} from "./tool-bridge.js";
 
 type Attempt = Parameters<AgentHarnessV2["runAttempt"]>[0];
 type Runtime = typeof import("openclaw/plugin-sdk/agent-harness-runtime");
@@ -14,13 +18,12 @@ export interface NativeHost {
   systemPrompt: string;
   prompt: string;
   tools: BridgeTool[];
+  toolNotices?: readonly HostToolNotice[];
   executeTool(call: BridgeToolCall, signal: AbortSignal): Promise<BridgeToolResult>;
   getReplayState(): { hadPotentialSideEffects: boolean; replaySafe: boolean };
   getToolCounts(): { startedCount: number; completedCount: number; activeCount: number };
   dispose(): Promise<void>;
 }
-
-const CODING_TOOLS = new Set(["read", "edit", "write", "apply_patch", "exec", "process", "grep", "glob", "find", "ls"]);
 
 function record(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -85,17 +88,28 @@ export function renderNativeSystemPrompt(params: {
   replyGuidance: string;
   skillsPrompt?: string;
   extraSystemPrompt?: string;
+  genericTools?: boolean;
+  toolNotices?: readonly HostToolNotice[];
 }): string {
   return [
-    "You are an OpenClaw coding assistant running through the DSH callback-only host.",
-    "Use only the supplied host tools. DSH has no native filesystem, shell, MCP, messaging, or subagent capabilities.",
+    params.genericTools
+      ? "You are an OpenClaw assistant running through the DSH callback-only host. Perform actions only through the advertised host-tool callbacks."
+      : "You are an OpenClaw coding assistant running through the DSH callback-only host.",
+    params.genericTools
+      ? "The supplied callbacks reuse OpenClaw tool instances, policy, authentication, and lifecycle. DSH provides no independent tools, provider access, MCP connections, or dispatch routers."
+      : "Use only the supplied host tools. DSH has no native filesystem, shell, MCP, messaging, or subagent capabilities.",
     "Do not bypass tool policy or approvals. Do not claim a tool action succeeded without its result.",
     `Workspace: ${params.workspaceDir}\nWorking directory: ${params.cwd}\nWorkspace instruction root: ${params.bootstrapWorkspaceDir}`,
     `Available policy-filtered host tools: ${params.toolNames.join(", ") || "(none)"}.`,
-    params.toolNames.includes("exec")
+    params.genericTools
+      ? "Use only exact names in the available tool list. Never substitute exec or another provider/dispatcher for an unavailable tool."
+      : params.toolNames.includes("exec")
       ? "For content or filename searches, use an available grep/glob tool, or the policy-controlled host exec tool. There is no separate native search capability."
       : "Do not invent shell or search capabilities that are not in the available tool list.",
-    "Messaging, channel actions, delegation, and agent spawning are unavailable. Return your answer as text to the caller.",
+    params.genericTools
+      ? "Return text to the caller. Messaging and delegation controls, agent spawning, browser/vision tools, and media delivery are unsupported; ordinary advertised plugin/channel text callbacks remain available."
+      : "Messaging, channel actions, delegation, and agent spawning are unavailable. Return your answer as text to the caller.",
+    renderHostToolNotices(params.toolNotices ?? []),
     params.credentialSafety,
     params.replyGuidance,
     params.contextFiles.length
@@ -127,7 +141,8 @@ type ToolHostRuntime = Pick<Runtime,
   "isAgentToolReplaySafe" | "getPluginToolMeta" | "getChannelAgentToolMeta" |
   "isToolWrappedWithBeforeToolCallHook" | "consumeAdjustedParamsForToolCall" |
   "consumePreExecutionBlockedToolCall" | "runAgentHarnessAfterToolCallHook" |
-  "isToolResultError" | "formatToolExecutionErrorMessage" | "getBeforeToolCallFailureDisposition">;
+  "isToolResultError" | "formatToolExecutionErrorMessage" | "getBeforeToolCallFailureDisposition"> &
+  Partial<Pick<Runtime, "isHostScopedAgentToolActive">>;
 
 export interface NativeToolHostOptions {
   tools: AnyAgentTool[];
@@ -142,6 +157,9 @@ export interface NativeToolHostOptions {
   channelId?: string;
   cwd: string;
   toolExecutionAllow?: readonly string[];
+  toolAllowlist?: readonly string[];
+  toolSources?: ReadonlyMap<AnyAgentTool, HostToolSourceSnapshot>;
+  toolNotices?: readonly HostToolNotice[];
   initialReplayState?: Attempt["initialReplayState"];
   observeToolTerminal?: Attempt["observeToolTerminal"];
   onAgentToolResult?: Attempt["onAgentToolResult"];
@@ -156,7 +174,7 @@ export function createNativeToolHost(options: NativeToolHostOptions): Omit<Nativ
   const lifetime = AbortSignal.any([options.signal, controller.signal]);
   const pending = new Set<Promise<BridgeToolResult>>();
   const seen = new Set<string>();
-  const invocations = new Map<string, { started: boolean; args?: Record<string, unknown> }>();
+  const invocations = new Map<string, { name: string; started: boolean; args?: Record<string, unknown> }>();
   const definitions: BridgeTool[] = [];
   const validators = new Map<string, ValidateFunction>();
   const replaySafeTools = new Map<string, boolean>();
@@ -185,36 +203,35 @@ export function createNativeToolHost(options: NativeToolHostOptions): Omit<Nativ
     }
   };
 
-  for (const tool of options.tools) {
-    if (!CODING_TOOLS.has(tool.name) || sdk.getPluginToolMeta(tool) || sdk.getChannelAgentToolMeta(tool)) {
-      throw new Error(`Unsupported non-core coding tool: ${tool.name}`);
-    }
-    if (validators.has(tool.name)) throw new Error(`Duplicate host tool: ${tool.name}`);
-    if (sdk.isToolWrappedWithBeforeToolCallHook(tool)) {
-      throw new Error("Host dispatch instrumentation requires unwrapped core tools");
-    }
-    const schema: unknown = JSON.parse(JSON.stringify(tool.parameters));
-    if (!record(schema) || schema.type !== "object" || schema.$async) throw new Error(`Invalid host tool schema: ${tool.name}`);
-    validators.set(tool.name, ajv.compile(schema));
-    definitions.push({ name: tool.name, description: tool.description, parameters: schema as JsonObject });
-    replaySafeTools.set(tool.name, sdk.isAgentToolReplaySafe(tool));
+  const selection = selectHostTools({
+    tools: options.tools, runtime: sdk, toolAllowlist: options.toolAllowlist,
+    toolExecutionAllow: options.toolExecutionAllow, sources: options.toolSources, notices: options.toolNotices,
+  });
+  const sources = new Map<string, HostToolSourceSnapshot>();
+  for (const entry of selection.entries) {
+    validators.set(entry.source.name, entry.validator);
+    definitions.push(entry.definition);
+    replaySafeTools.set(entry.source.name, entry.replaySafe);
+    sources.set(entry.source.name, entry.source);
   }
-  for (const tool of options.tools) {
+  for (const { tool, source } of selection.entries) {
+    const name = source.name;
     const execute = tool.execute;
     // Mutate this attempt-local instance, rather than cloning away SDK ownership metadata.
     tool.execute = async (callId, args, signal, onUpdate) => {
       const invocation = invocations.get(callId);
-      if (!invocation || invocation.started) throw new Error("Uncorrelated or repeated host tool dispatch");
+      if (!invocation || invocation.name !== name || invocation.started) throw new Error("Uncorrelated or repeated host tool dispatch");
       const executionSignal = signal ? AbortSignal.any([lifetime, signal]) : lifetime;
       check(executionSignal);
-      if (executionAllow && !executionAllow.has(tool.name)) throw new Error(`Execution denied for ${tool.name}`);
-      validate(tool.name, args);
-      options.preparationGate?.start(tool.name);
+      source.assertUnchanged();
+      if (executionAllow && !executionAllow.has(name)) throw new Error(`Execution denied for ${name}`);
+      validate(name, args);
+      options.preparationGate?.start(name);
       invocation.args = args as Record<string, unknown>;
       invocation.started = true;
       startedCount++;
       activeCount++;
-      if (!replaySafeTools.get(tool.name)) hadPotentialSideEffects = true;
+      if (!replaySafeTools.get(name)) hadPotentialSideEffects = true;
       try {
         return await execute(callId, args, executionSignal, onUpdate);
       } catch (error) {
@@ -226,15 +243,16 @@ export function createNativeToolHost(options: NativeToolHostOptions): Omit<Nativ
       }
     };
   }
-  const bound = options.bindToolSurface(options.tools, { cwd: options.cwd });
+  const bound = options.bindToolSurface(selection.entries.map(({ tool }) => tool), { cwd: options.cwd });
   if (bound.length !== definitions.length || bound.some((tool, i) =>
     tool.name !== definitions[i]?.name || !sdk.isToolWrappedWithBeforeToolCallHook(tool))) {
     throw new Error("Host binding did not preserve the policy-wrapped tool surface");
   }
+  for (const { source } of selection.entries) source.assertUnchanged();
   const byName = new Map(bound.map((tool) => [tool.name, tool]));
 
   const executeOne = async (call: BridgeToolCall, signal: AbortSignal): Promise<BridgeToolResult> => {
-    const invocation = { started: false, args: undefined as Record<string, unknown> | undefined };
+    const invocation = { name: call.name, started: false, args: undefined as Record<string, unknown> | undefined };
     const startedAt = Date.now();
     const tool = byName.get(call.name)!;
     const executionSignal = AbortSignal.any([lifetime, signal]);
@@ -287,6 +305,7 @@ export function createNativeToolHost(options: NativeToolHostOptions): Omit<Nativ
 
   return {
     tools: definitions,
+    ...(options.toolAllowlist !== undefined ? { toolNotices: selection.toolNotices } : {}),
     executeTool(call, signal) {
       try {
         check(signal);
@@ -294,6 +313,7 @@ export function createNativeToolHost(options: NativeToolHostOptions): Omit<Nativ
           throw new Error("Invalid or duplicate host tool call id");
         }
         if (!byName.has(call.name)) throw new Error(`Unknown or unavailable host tool: ${call.name}`);
+        sources.get(call.name)!.assertUnchanged();
         if (executionAllow && !executionAllow.has(call.name)) throw new Error(`Execution denied for ${call.name}`);
         options.preparationGate?.assertAllowed(call.name);
         validate(call.name, call.arguments);
@@ -330,7 +350,8 @@ export function createNativeToolHost(options: NativeToolHostOptions): Omit<Nativ
 
 export async function prepareNativeHost(p: Parameters<AgentHarnessV2["runAttempt"]>[0], signal: AbortSignal,
   assertActive: () => void, history: Awaited<ReturnType<AgentHarnessV2["runAttempt"]>>["messagesSnapshot"] = [],
-  preparation?: { policy: PreparationPolicy; gate: PreparationGate }): Promise<NativeHost> {
+  preparation?: { policy: PreparationPolicy; gate: PreparationGate },
+  toolAllowlist?: readonly string[]): Promise<NativeHost> {
   assertNativeHostSupported(p);
   const controller = new AbortController();
   const lifetime = AbortSignal.any([signal, controller.signal, ...(p.abortSignal ? [p.abortSignal] : [])]);
@@ -352,10 +373,17 @@ export async function prepareNativeHost(p: Parameters<AgentHarnessV2["runAttempt
   assertNativeHostSupported({ ...p, agentId, sandboxAgentId: policyAgentId });
   const cwd = p.cwd ?? p.workspaceDir;
   const cleanups: Array<(reason: string) => Promise<void>> = [];
+  const requested = resolveHostToolAllowlist(toolAllowlist, preparation?.policy.executionTools);
+  const genericTools = requested !== undefined;
+  const toolSources = new Map<AnyAgentTool, HostToolSourceSnapshot>();
+  let toolNotices: HostToolNotice[] = [];
+  const restrict = (tools: AnyAgentTool[], allow: string[] | undefined) =>
+    sdk.applyEmbeddedAttemptToolsAllow(tools, allow, { toolMeta: sdk.getPluginToolMeta });
   let host: ReturnType<typeof createNativeToolHost> | undefined;
   try {
     const plan = sdk.resolveEmbeddedAttemptToolConstructionPlan({
-      disableTools: p.disableTools, toolsEnabled: sdk.supportsModelTools(p.model), toolsAllow: p.toolsAllow,
+      disableTools: p.disableTools, toolsEnabled: sdk.supportsModelTools(p.model),
+      toolsAllow: requested === undefined ? p.toolsAllow : [...requested],
     });
     let tools: AnyAgentTool[] = [];
     if (plan.constructTools) {
@@ -397,23 +425,37 @@ export async function prepareNativeHost(p: Parameters<AgentHarnessV2["runAttempt
         abortSignal: lifetime, wrapBeforeToolCallHook: false,
         includeCoreTools: plan.includeCoreTools, includeToolSearchControls: false,
         runtimeToolAllowlist: plan.runtimeToolAllowlist,
-        toolConstructionPlan: { ...plan.codingToolConstructionPlan,
+        toolConstructionPlan: genericTools ? plan.codingToolConstructionPlan : { ...plan.codingToolConstructionPlan,
           includeChannelTools: false, includePluginTools: false, includeOpenClawTools: false },
         registerRunCleanup: (cleanup) => cleanups.push(cleanup),
       });
-      tools = tools.filter((tool) => CODING_TOOLS.has(tool.name) &&
-        !sdk.getPluginToolMeta(tool) && !sdk.getChannelAgentToolMeta(tool));
-      tools = sdk.applyEmbeddedAttemptToolsAllow(tools, p.toolsAllow);
+      if (genericTools) {
+        // runtimeToolAllowlist guides construction, but does not filter every factory.
+        const selection = selectHostTools({ tools, runtime: sdk, toolAllowlist: requested, toolExecutionAllow: p.toolExecutionAllow });
+        tools = selection.entries.map(({ tool, source }) => {
+          toolSources.set(tool, source);
+          return tool;
+        });
+        toolNotices = selection.toolNotices;
+      } else {
+        tools = tools.filter((tool) => LEGACY_CODING_TOOLS.has(tool.name) &&
+          !sdk.getPluginToolMeta(tool) && !sdk.getChannelAgentToolMeta(tool));
+      }
+      tools = restrict(tools, p.toolsAllow);
       if (p.pluginHarnessToolPolicySafeDeniedTools?.length) {
-        const denied = new Set(sdk.applyEmbeddedAttemptToolsAllow(tools, [...p.pluginHarnessToolPolicySafeDeniedTools]));
+        const denied = new Set(restrict(tools, [...p.pluginHarnessToolPolicySafeDeniedTools]));
         tools = tools.filter((tool) => !denied.has(tool));
       }
       if (p.forceRestartSafeTools) tools = tools.filter((tool) => sdk.isAgentToolReplaySafe(tool));
-      if (preparation) {
+      if (preparation && !genericTools) {
         const allowed = new Set(preparation.policy.executionTools);
         tools = tools.filter((tool) => allowed.has(tool.name));
       }
     }
+    const updateNotices = () => {
+      toolNotices = buildHostToolNotices(requested ?? [], tools.map((tool) => tool.name), toolNotices);
+    };
+    updateNotices();
     check();
     const bootstrapWorkspaceDir = p.bootstrapWorkspaceDir ?? p.workspaceDir;
     const { contextFiles } = await sdk.resolveBootstrapContextForRun({
@@ -436,10 +478,12 @@ export async function prepareNativeHost(p: Parameters<AgentHarnessV2["runAttempt
       bootstrapContextRunKind: p.bootstrapContextRunKind,
       toolAuthority: { fingerprint: p.toolAuthorityFingerprint, activeToolNames: () => tools.map((tool) => tool.name), assertActive: check },
       developerInstructions: { build: ({ toolsAllow }) => {
-        tools = sdk.applyEmbeddedAttemptToolsAllow(tools, toolsAllow);
+        tools = restrict(tools, toolsAllow);
+        updateNotices();
         const prompt = renderNativeSystemPrompt({
         workspaceDir: foreground.workspaceDir, cwd, bootstrapWorkspaceDir, contextFiles,
         toolNames: tools.map((tool) => tool.name),
+        genericTools, toolNotices,
         credentialSafety: sdk.buildCredentialSafetyPrompt(),
         replyGuidance: sdk.buildHarnessVisibleReplyGuidance({
           sourceReplyDeliveryMode: foreground.sourceReplyDeliveryMode, messageToolAvailable: false,
@@ -453,7 +497,8 @@ export async function prepareNativeHost(p: Parameters<AgentHarnessV2["runAttempt
       } },
     });
     check();
-    tools = sdk.applyEmbeddedAttemptToolsAllow(tools, built.toolsAllow);
+    tools = restrict(tools, built.toolsAllow);
+    updateNotices();
     host = createNativeToolHost({
       tools, bindToolSurface: (surface, options) => p.hostCapabilities.bindToolSurface(surface, options),
       runtime: sdk, signal: lifetime, assertActive: check, cwd,
@@ -462,10 +507,22 @@ export async function prepareNativeHost(p: Parameters<AgentHarnessV2["runAttempt
       initialReplayState: p.initialReplayState, observeToolTerminal: p.observeToolTerminal,
       onAgentToolResult: p.onAgentToolResult, cleanups,
       preparationGate: preparation?.gate,
+      toolAllowlist: requested, toolSources, toolNotices,
     });
     const preparedHost = host;
     return {
-      ...preparedHost, systemPrompt: built.developerInstructions, prompt: built.prompt,
+      ...preparedHost,
+      systemPrompt: genericTools
+        ? [
+          built.developerInstructions,
+          "## Final DSH callback-only host tool surface",
+          "This final list supersedes earlier host execution tool lists. Separately supplied DSH preparation controls still apply. Actions use only these OpenClaw host-tool callbacks and their existing policy/authentication; no independent MCP connections or dispatch routers are provided.",
+          `Available policy-filtered host tools: ${preparedHost.tools.map((tool) => tool.name).join(", ") || "(none)"}.`,
+          "Never use exec, an alternate provider, or another dispatcher to work around a missing tool. Return text only; do not invent capabilities.",
+          renderHostToolNotices(preparedHost.toolNotices ?? []),
+        ].filter(Boolean).join("\n\n")
+        : built.developerInstructions,
+      prompt: built.prompt,
       dispose: () => {
         controller.abort(new Error("Native host disposed"));
         return preparedHost.dispose();

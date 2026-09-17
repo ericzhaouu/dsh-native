@@ -10,6 +10,7 @@ import { t as GatewayClient } from "../../node_modules/openclaw/dist/client-I-Ro
 import { s as resolveRuntimeServiceBuildId, t as OPENCLAW_VERSION } from "../../node_modules/openclaw/dist/version-v1kuAkGj.js";
 import { startResponsesServer } from "./responses-server.mjs";
 import { createPatchedHostFixture, createPluginFixture } from "./patched-host.mjs";
+import { createHostSearchFixture, HOST_SEARCH_PLUGIN_ID, HOST_SEARCH_PROVIDER_ID } from "./host-search-plugin.mjs";
 
 const packageRoot = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
 const TOKEN = "dashboard-gateway-fixture-token";
@@ -147,7 +148,10 @@ async function withTimeout(promise, ms, message) {
   } finally { clearTimeout(timer); }
 }
 
-export async function startDashboardGateway(responder, { agentPinned = true, redactTranscriptIdentity = false, taskPreparation } = {}) {
+export async function startDashboardGateway(responder, {
+  agentPinned = true, redactTranscriptIdentity = false, taskPreparation,
+  hostTools, searchFixture = false, agentToolPolicy, agentId = AGENT_ID,
+} = {}) {
   assert.equal(OPENCLAW_VERSION, "2026.9.2", "Dashboard fixture must use the inspected genuine SDK");
   const root = join(packageRoot, "artifacts", `dashboard-gateway-${randomUUID()}`);
   const workspace = join(root, "workspace");
@@ -213,6 +217,7 @@ export async function startDashboardGateway(responder, { agentPinned = true, red
     const originalHost = join(packageRoot, "node_modules", "openclaw");
     const fixture = agentPinned ? await createPatchedHostFixture(root)
       : { host: originalHost, plugin: await createPluginFixture(root, originalHost) };
+    const search = searchFixture ? await createHostSearchFixture(root, fixture.host) : undefined;
     const networkGuard = await createNetworkGuard(root);
     await writeFile(join(workspace, "fixture.txt"), "DASHBOARD-HOST-READ\n");
     responses = await startResponsesServer(async (request) => {
@@ -233,8 +238,9 @@ export async function startDashboardGateway(responder, { agentPinned = true, red
           sandbox: { mode: "off" },
         },
         entries: {
-          [AGENT_ID]: {
+          [agentId]: {
             workspace, agentDir,
+            ...(agentToolPolicy === undefined ? {} : { tools: agentToolPolicy }),
             ...(agentPinned ? { runtime: { type: "embedded", harness: "dsh-native" } }
               : { models: { [MODEL_REF]: { agentRuntime: { id: "dsh-native" } } } }),
           },
@@ -264,20 +270,24 @@ export async function startDashboardGateway(responder, { agentPinned = true, red
           },
         },
       },
-      tools: { profile: "coding", fs: { workspaceOnly: true }, exec: { host: "gateway" } },
+      tools: { profile: "coding", fs: { workspaceOnly: true }, exec: { host: "gateway" },
+        ...(search ? { web: { search: { enabled: true, provider: HOST_SEARCH_PROVIDER_ID } } } : {}),
+      },
       plugins: {
         slots: { memory: "none" },
         enabled: true,
-        allow: ["dsh-native"],
-        load: { paths: [fixture.plugin] },
+        allow: ["dsh-native", ...(search ? [HOST_SEARCH_PLUGIN_ID] : [])],
+        load: { paths: [fixture.plugin, ...(search ? [search.plugin] : [])] },
         entries: {
           "github-copilot": { enabled: false },
+          ...(search ? { [HOST_SEARCH_PLUGIN_ID]: { enabled: true, config: search.config } } : {}),
           "dsh-native": {
             enabled: true,
             config: {
               stateDir: dshState,
               startupTimeoutMs: 120000,
               allowedCopilotBaseUrls: [responses.baseUrl],
+              ...(hostTools === undefined ? {} : { toolAllowlist: hostTools }),
               ...(taskPreparation === undefined ? {} : { taskPreparation }),
             },
           },
@@ -377,13 +387,15 @@ export async function startDashboardGateway(responder, { agentPinned = true, red
     return {
       root,
       workspace,
+      agentDir,
       configPath,
       logPath,
       dshState,
       port,
       token: TOKEN,
       modelRef: MODEL_REF,
-      agentId: AGENT_ID,
+      agentId,
+      searchFixture: search,
       responses,
       chat,
       events,
@@ -417,7 +429,7 @@ export async function startDashboardGateway(responder, { agentPinned = true, red
           const binding = bindings.find((entry) => entry.value.lastRunId === runId);
           if (binding?.value.status === "blocked") throw new Error(`Native binding blocked for ${runId}`);
           const history = await chat.request("chat.history",
-            { sessionKey, agentId: AGENT_ID, limit: 20 }, { timeoutMs: 15000 });
+            { sessionKey, agentId, limit: 20 }, { timeoutMs: 15000 });
           assertTurnHealthy(sessionKey, runId);
           const assistant = history.messages?.find((message) => message.role === "assistant" &&
             (message.idempotencyKey ?? message.__openclaw?.idempotencyKey) === `dsh-native:${runId}:assistant`);

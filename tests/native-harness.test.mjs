@@ -373,6 +373,27 @@ test("missing explicit Agent identity is resolved before selecting the preparati
   assert.ok(f.input.taskPreparation);
 });
 
+test("explicit host narrowing reaches construction even when adaptive preparation is disabled", async (t) => {
+  const f = fixture(t);
+  f.harness = createNativeHarness({ ...config, toolAllowlist: ["web_search"] }, f.runtime, f.dependencies);
+  const result = await f.harness.runAttempt(f.p);
+  assert.equal(result.terminal.kind, "ok");
+  assert.equal(f.dependencies.prepareHost.mock.calls[0].arguments[4], undefined);
+  assert.deepEqual(f.dependencies.prepareHost.mock.calls[0].arguments[5], ["web_search"]);
+  assert.equal(f.input.taskPreparation, undefined);
+});
+
+test("explicit host narrowing delegates restricted tool policy to the host rather than clearing it", async (t) => {
+  const f = fixture(t, { pluginHarnessToolPolicyRestricted: true, toolsAllow: [] });
+  f.harness = createNativeHarness({ ...config, toolAllowlist: ["web_search"] }, f.runtime, f.dependencies);
+  const result = await f.harness.runAttempt(f.p);
+  assert.equal(result.terminal.kind, "ok");
+  const prepared = f.dependencies.prepareHost.mock.calls[0].arguments[0];
+  assert.equal(prepared.pluginHarnessToolPolicyRestricted, true);
+  assert.deepEqual(prepared.toolsAllow, []);
+  assert.deepEqual(f.input.tools, []);
+});
+
 test("returns the V2 result with OpenClaw identity, canonical assistant usage and unpriced billing", async (t) => {
   const f = fixture(t);
   const started = Date.now();

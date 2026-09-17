@@ -34,8 +34,31 @@ test("task preparation is absent by default and opt-in for exact Agent identitie
   assert.equal(config.taskPreparation.maxClarificationTurns, 3);
   assert.equal(config.taskPreparation.maxToolCalls, 24);
   for (const value of [
-    { agentIds: ["*"] }, { agentIds: ["main", "main"] }, { executionTools: ["web_search"] },
+    { agentIds: ["*"] }, { agentIds: ["main", "main"] }, { executionTools: ["web_*"] },
     { executionTools: ["dsh_prepare_task"] }, { maxToolCalls: 0 }, { maxClarificationTurns: 100 },
     { prompt: "grant all tools" },
   ]) assert.throws(() => parseDshConfig({ taskPreparation: value }));
+});
+
+test("one top-level allowlist supplies both host narrowing and the adaptive execution ceiling", () => {
+  assert.equal(parseDshConfig({}).toolAllowlist, undefined);
+  const raw = { toolAllowlist: ["read", "web_search", "fixture_lookup"], taskPreparation: { agentIds: ["experiment"] } };
+  const parsed = parseDshConfig(raw);
+  assert.deepEqual(parsed.toolAllowlist, raw.toolAllowlist);
+  assert.deepEqual(parsed.taskPreparation.executionTools, raw.toolAllowlist);
+  parsed.toolAllowlist.push("write");
+  assert.equal(raw.toolAllowlist.includes("write"), false);
+  assert.equal(parsed.taskPreparation.executionTools.includes("write"), false);
+  assert.deepEqual(parseDshConfig({ toolAllowlist: [], taskPreparation: { agentIds: ["experiment"] } })
+    .taskPreparation.executionTools, []);
+  assert.throws(() => parseDshConfig({
+    toolAllowlist: ["read", "web_search"], taskPreparation: { executionTools: ["read"] },
+  }), /conflicts.*configure one narrowing list/);
+  assert.deepEqual(parseDshConfig({
+    toolAllowlist: ["read", "web_search"], taskPreparation: { executionTools: ["web_search", "read"] },
+  }).taskPreparation.executionTools, ["read", "web_search"]);
+  assert.equal(parseDshConfig({ toolAllowlist: ["web_search"] }).taskPreparation, undefined);
+  for (const value of [null, "*", ["*"], ["tool*"], ["read", "read"], ["dsh_prepare_task"], ["run_code"]]) {
+    assert.throws(() => parseDshConfig({ toolAllowlist: value }));
+  }
 });

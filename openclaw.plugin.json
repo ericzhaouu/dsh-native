@@ -17,6 +17,11 @@
       "startupTimeoutMs": { "type": "integer", "minimum": 100, "maximum": 3600000, "default": 60000 },
       "shutdownTimeoutMs": { "type": "integer", "minimum": 100, "maximum": 3600000, "default": 15000 },
       "streamIdleTimeoutMs": { "type": "integer", "minimum": 100, "maximum": 3600000, "default": 120000 },
+      "toolAllowlist": {
+        "type": "array", "uniqueItems": true, "maxItems": 64,
+        "description": "Exact OpenClaw tool names to expose after host authorization and compatibility checks. Omit for legacy defaults.",
+        "items": { "type": "string", "pattern": "^(?!dsh_prepare_task$|run_code$)[A-Za-z0-9_-]{1,64}$" }
+      },
       "taskPreparation": {
         "type": "object",
         "additionalProperties": false,
@@ -27,9 +32,9 @@
             "items": { "type": "string", "pattern": "^[a-z][a-z0-9_-]{0,63}$" }
           },
           "executionTools": {
-            "type": "array", "uniqueItems": true, "maxItems": 12,
-            "default": ["read", "write", "edit", "apply_patch", "exec", "process", "grep", "glob", "find", "ls"],
-            "items": { "enum": ["read", "write", "edit", "apply_patch", "exec", "process", "grep", "glob", "find", "ls"] }
+            "type": "array", "uniqueItems": true, "maxItems": 64,
+            "description": "Legacy narrowing list. Prefer top-level toolAllowlist; explicit conflicting lists are rejected.",
+            "items": { "type": "string", "pattern": "^(?!dsh_prepare_task$|run_code$)[A-Za-z0-9_-]{1,64}$" }
           },
           "skillAllowlist": {
             "type": "array", "uniqueItems": true, "maxItems": 12, "default": [],

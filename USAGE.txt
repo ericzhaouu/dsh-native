@@ -1,4 +1,4 @@
-DSH NATIVE FOR OPENCLAW -- EXPERIMENTAL 0.4.0
+DSH NATIVE FOR OPENCLAW -- EXPERIMENTAL 0.5.0
 
 Source: https://github.com/ericzhaouu/dsh-native
 Author: https://github.com/ericzhaouu
@@ -7,6 +7,34 @@ Plugin / harness ID: dsh-native
 Example Agent: dsh-experiment
 License: MIT; Copyright (c) 2026 ericzhaouu.
 The Chinese README.md contains the complete guide.
+
+HOST TOOL NARROWING (0.5.0)
+
+Configure toolAllowlist with up to 64 unique exact host tool names, for example
+["read", "web_search", "web_fetch"]. OpenClaw must already provide and authorize
+them. An empty list exposes no tools. Missing configuration keeps legacy defaults.
+No wildcard or private bridge control names are accepted.
+
+OpenClaw owns tool construction, credentials, policy, approvals, transport and
+cleanup. DSH chooses from the narrowed compatible instances and calls them back
+through the host. This is not a new tool lifecycle/connection platform.
+Core web_search continues using the host's configured search provider.
+
+The top-level list works without adaptive preparation. When preparation is enabled,
+omit its legacy executionTools field to derive the ceiling from toolAllowlist.
+Explicit conflicting lists are rejected, not silently merged or widened.
+See examples\openclaw.host-tools.json.
+
+Missing, filtered, ambiguous or incompatible requested tools are explained without
+guessing secret/config causes. They are capability gaps, not endless clarification
+questions. Never bypass them using exec or new services. Only compatible text
+results cross the bridge; raw details/auth/transport metadata remain host-side.
+Standard plugin/channel tool instances retain their source and host policy.
+Unlisted plugin factories may still initialize during host construction; narrowing
+constrains exposure/execution, not a sandbox around installed native plugin code.
+No universal live requester-MCP, special approval continuation, media/browser,
+messaging/cron/delegation or nested Tool Search/Code Mode compatibility is claimed.
+Skills remain methods and their visible allowlist does not grant execution tools.
 
 ADAPTIVE TASK PREPARATION (0.4.0, DEFAULT OFF)
 
@@ -19,8 +47,8 @@ the same model response. Preparation text/reasoning stays out of visible replies
 but its usage and native decision record remain part of the private session.
 
 Defaults: agentIds=[], skillAllowlist=[], maxClarificationTurns=3 (1..5),
-maxToolCalls=24 (1..100 per attempt). executionTools defaults to the existing core
-coding tool family and can only narrow what the host provides. Every enabled turn
+maxToolCalls=24 (1..100 per attempt). Without toolAllowlist, legacy executionTools
+defaults to the core coding family and can only narrow what the host provides. Every enabled turn
 normally adds a model decision step; this is not zero-cost intent classification.
 See examples\openclaw.task-preparation.json and the complete Chinese README.
 
@@ -36,8 +64,8 @@ Natural-language intent classification can be wrong. Opt-in permits automatic
 handling of sufficiently clear requests within the configured ceiling; it is not
 a semantic authorization proof or an exec/network sandbox. Keep host approval
 rules. Remove exec/process from the ceiling when arbitrary programs are unwanted.
-No new search/browser/MCP/delegation or privilege-escalation support is added.
-Do not use another tool to bypass unavailable capabilities.
+External services are usable only through admitted host tools. The bridge does not
+install services, add privileges or bypass unavailable capabilities.
 
 RETAINED 0.3.1 FIXES
 
@@ -95,7 +123,7 @@ PowerShell examples follow; C:\PATH\TO values are placeholders.
   node --version
   npm.cmd ci
 
-Confirm package.json version 0.4.0. OpenClaw is an optional peer to avoid
+Confirm package.json version 0.5.0. OpenClaw is an optional peer to avoid
 bundling a second production host. Development still needs the genuine SDK.
 If it is absent, obtain and verify the exact official 2026.9.2 artifact from
 the OpenClaw release workflow, then install it locally:
@@ -109,7 +137,7 @@ the OpenClaw release workflow, then install it locally:
 If the configured registry lacks that SDK, use the verified official artifact,
 not speculative npm versions, a newer preview or hand-written replacement SDK
 types. The check is read-only; it should report unpatched for the stock pinned
-artifact. npm pack runs prepack/build and creates openclaw-dsh-native-0.4.0.tgz.
+artifact. npm pack runs prepack/build and creates openclaw-dsh-native-0.5.0.tgz.
 Use npm.cmd if PowerShell blocks npm.ps1; do not change execution policy.
 
 MAINTENANCE BEFORE INSTALL / PATCH / CONFIGURATION
@@ -126,7 +154,7 @@ Use the correct installation/profile and keep its supervisor from respawning it.
 
   openclaw gateway stop --force
   openclaw gateway status --no-probe
-  openclaw plugins install "C:\PATH\TO\openclaw-dsh-native-0.4.0.tgz" --force --accept-capabilities
+  openclaw plugins install "C:\PATH\TO\openclaw-dsh-native-0.5.0.tgz" --force --accept-capabilities
 
 The operator must verify shutdown; service status alone is not proof that all
 old processes/tools have exited. For gateway stop, --force confirms a
@@ -141,7 +169,7 @@ a host version or rewriting shared host dependencies. A prepared-directory
 installation is an alternative, still with Gateway stopped:
 
   New-Item -ItemType Directory -Path .\artifacts\prepared-dsh-native
-  tar -xf .\openclaw-dsh-native-0.4.0.tgz -C .\artifacts\prepared-dsh-native
+  tar -xf .\openclaw-dsh-native-0.5.0.tgz -C .\artifacts\prepared-dsh-native
   Push-Location .\artifacts\prepared-dsh-native\package
   npm.cmd ci --omit=dev
   Pop-Location
@@ -292,17 +320,20 @@ HTTP is forbidden. Explicit HTTP loopback entries are for local fixtures only.
 
 CAPABILITIES / DASHBOARD
 
-Text input and text coding-tool results only. The allowed core family is:
+Text input and text-compatible tool results only. The legacy default family is:
   read edit write apply_patch exec process grep glob find ls
+Explicit toolAllowlist may additionally select compatible core/search/plugin tools.
 Actual availability remains host-policy filtered; not all tools are promised.
 
 The ONLY absent-session-tool safe-deny exceptions are:
   sessions_list sessions_history sessions_send session_status
 Neither callback host nor DSH exposes these. Existing denies remain in force;
-other explicit native-surface restrictions fail before inference/tool setup.
+legacy runs reject other explicit native-surface restrictions before inference.
+Explicit top-level narrowing retains those restrictions in host construction and
+bound dispatch; it does not remove the policy or grant an ambient native tool.
 Do not delete required security rules to use the experiment.
 
-No workboard, browser, MCP, messaging, plugin-tool grants, subagents/delegation,
+No blanket browser, requester-MCP, messaging, plugin-tool grants, subagents/delegation,
 skill-library authoring, custom context engines, native compaction, migration/
 fork, media, Code Mode, live steering, session permission overrides, remote/
 node/sandbox placement or detached durable scheduled jobs. Use legacy context
@@ -384,7 +415,7 @@ read host-patch\USAGE.txt; --recover-stale-lock is NOT a native-session unlock.
 For upgrades, retain a known-good plugin archive/config, stop before reinstall,
 recheck the exact host artifact and use /new. Host updates can replace patched
 files; maintenance/rebasing is required. Do not apply this patch to new builds
-or replace individual live JS files. 0.4.0 retains the prior streaming/delivery fixes.
+or replace individual live JS files. 0.5.0 retains the prior streaming/delivery fixes.
 
 DEVELOPMENT / TEST LIMITS
 

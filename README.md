@@ -1,6 +1,6 @@
 # DSH Native for OpenClaw
 
-**实验性版本 0.4.0**：把官方 DeepSeek Harness（DSH）的模型／工具循环接入 OpenClaw 的原生 `AgentHarnessV2`，并保留 OpenClaw 对模型、认证、工具授权与会话入口的控制。
+**实验性版本 0.5.0**：把官方 DeepSeek Harness（DSH）的模型／工具循环接入 OpenClaw 的原生 `AgentHarnessV2`，并保留 OpenClaw 对模型、认证、工具授权与会话入口的控制。
 
 - 源码仓库：[ericzhaouu/dsh-native](https://github.com/ericzhaouu/dsh-native)
 - 作者：[ericzhaouu](https://github.com/ericzhaouu)
@@ -16,6 +16,7 @@
 
 ## 目录
 
+- [继承宿主工具与收窄清单](#继承宿主工具与收窄清单)
 - [自适应任务准备](#自适应任务准备)
 - [0.3.1 修复](#031-修复)
 - [运行基线与兼容范围](#运行基线与兼容范围)
@@ -35,6 +36,50 @@
 - [排错](#排错)
 - [致谢与许可证](#致谢与许可证)
 
+## 继承宿主工具与收窄清单
+
+0.5.0 的原则是：**OpenClaw 管理工具，DSH 挑选和编排，dsh-native 只维护收窄清单与调用适配。** 不新建一套工具认证、连接或生命周期管理平台。
+
+```text
+有效工具 = 宿主实际构造且当前 Agent 获准使用的工具
+         ∩ dsh-native 精确收窄清单
+         ∩ 当前桥接支持的工具契约
+```
+
+在 `plugins.entries.dsh-native.config` 配置：
+
+```json
+{
+  "toolAllowlist": ["read", "web_search", "web_fetch"],
+  "taskPreparation": {
+    "agentIds": ["dsh-experiment"],
+    "skillAllowlist": [],
+    "maxClarificationTurns": 3,
+    "maxToolCalls": 24
+  }
+}
+```
+
+参考 [examples\openclaw.host-tools.json](examples/openclaw.host-tools.json)。工具必须已由宿主安装、启用并允许该 Agent 使用；示例不会配置搜索服务或授予网络／账号权限。`web_search` 调用宿主原有搜索提供商，不在 DSH 中重新实现搜索 API，也不导出搜索凭据。
+
+- `toolAllowlist` 最多 64 个唯一、精确的可调用工具名，不支持通配符；`[]` 表示不暴露任何宿主工具。
+- 未配置该字段时，保持旧的默认 coding 行为；已启用自适应准备的 Agent 也可继续使用旧字段 `taskPreparation.executionTools`。
+- 新配置只维护顶层这一份名单。若省略旧字段，自适应执行上限自动从顶层派生；若显式配置两份不同名单，报错而不是静默扩大权限。
+- 允许兼容的宿主核心工具及标准插件／渠道工具，保留原工具实例和来源。不会把任意 plugin 的 UI、hook 或后台服务转换成模型工具。
+- 构造、授权、执行 hooks、认证及资源清理由宿主负责；DSH 仅接收参数 schema 和获准的文本结果。原始结果仍在宿主执行链中，不能把 `details`、环境变量或认证对象整体发送给模型。
+- 名单不保证所有未入选的插件工厂都不会初始化；它约束最终暴露和执行。插件本身仍是需要信任的本机代码。
+- 同名冲突、来源变化、已绑定但无法安全插入最终校验的工具或不兼容参数 schema 不会被静默接受。插件替换和启停遵循宿主维护／重载规则，不给正在执行的尝试偷偷增加权限。
+
+**工具缺失不是需求不清楚。** 请求但未能获得的工具会进入有界的不可用说明；不能证明具体原因时，只说“不可用或被宿主策略过滤”，不猜测是否缺凭据。模型应直接解释能力缺口，不继续反复追问，也不能通过 `exec`、其他账号或新连接绕过它。
+
+### SKILL、MCP 与特殊工具
+
+SKILL 是方法说明，不是可执行工具。`skillAllowlist` 控制哪些技能说明可见；实际步骤仍必须使用本轮工具集合。单独把技能加入名单不会添加搜索、飞书或 MCP 工具。
+
+MCP 连接和认证应由 OpenClaw 管理。本版只接纳宿主能安全提供的兼容工具实例；不会自行读取 MCP 配置并建立新连接，也不会把缓存的 advertised catalog 当成当前请求者已连接的证明。需要单独物化请求者连接、特殊审批续接或其他未支持上下文的工具，应明确报告不兼容，而不是宣称所有 MCP／插件都已完整接通。
+
+浏览器／媒体结果、消息投递、cron、委派、权限变更和 Tool Search／Code Mode 的二次派发控制器不属于通用文本工具的自动兼容承诺。它们需要各自的宿主契约；不能用一个控制器名字绕过对底层工具的收窄。
+
 ## 自适应任务准备
 
 0.4.0 新增**默认关闭、按 Agent 开启**的任务准备层。用户可以自然聊天，不需要特殊口令，也不必手动复制增强 Prompt：
@@ -52,9 +97,9 @@
 
 ```json
 {
+  "toolAllowlist": ["read", "write", "edit", "apply_patch", "exec", "process"],
   "taskPreparation": {
     "agentIds": ["dsh-experiment"],
-    "executionTools": ["read", "write", "edit", "apply_patch", "exec", "process"],
     "skillAllowlist": [],
     "maxClarificationTurns": 3,
     "maxToolCalls": 24
@@ -67,12 +112,12 @@
 | 配置 | 默认值／限制 |
 | --- | --- |
 | `agentIds` | `[]`，未列出的 Agent 沿用原路径；精确 ID，不支持通配符 |
-| `executionTools` | 当前核心 coding 工具家族；可以收窄，不会创建宿主没有提供的工具 |
+| `executionTools` | 旧版兼容字段；优先使用顶层 `toolAllowlist`，省略时从顶层派生，否则默认为 coding 工具家族 |
 | `skillAllowlist` | `[]`；准备模式不再默认广告整份技能目录，仅显示操作者明确列出的技能 |
 | `maxClarificationTurns` | `3`，允许 `1..5`；达到上限后返回草稿／未决事项，不强迫执行 |
 | `maxToolCalls` | `24`，允许 `1..100`；每次执行尝试的宿主调用预算，内部控制调用不计入 |
 
-三个名称列表最多各 12 项且不接受重复；技能使用精确的字母／数字／点／下划线／连字符名称。当前原始输入和保存的请求上下文上限为 24,000 字符；超过限额时明确报错，请缩小任务，不会静默截断成另一项授权。
+工具名单最多 64 项，Agent 与技能名单最多各 12 项，均不接受重复。工具名只接受字母、数字、下划线和连字符（最多 64 字符），内部控制名被保留；技能名称还可包含点。当前原始输入和保存的请求上下文上限为 24,000 字符；超过限额时明确报错，请缩小任务，不会静默截断成另一项授权。
 
 ### 权限边界
 
@@ -80,7 +125,7 @@
 
 阶段门禁在子进程、父进程和实际宿主派发处检查。准备阶段的工具调用不能越过门禁；同一模型响应中把决策与写文件混在一起，也不能提前获得权限。宿主的 `toolsAllow`、`toolExecutionAllow`、hooks 和审批仍有效。推导出的任务摘要是数据，不是高于用户原话、`AGENTS.md` 或宿主策略的新授权。
 
-`exec` 可以执行任意本地程序，并不是只读工具或网络沙箱。若不接受这种能力，显式从 `executionTools` 移除 `exec` 和 `process`。本版本不新增联网搜索、浏览器、MCP、消息发送、委派或提权能力；不能通过另一工具绕过不可用功能。需要额外权限的事项应明确说明并交由既有宿主／操作者流程处理。
+`exec` 可以执行任意本地程序，并不是只读工具或网络沙箱。若不接受这种能力，从收窄名单中移除 `exec` 和 `process`。搜索等外部服务只能经本轮已提供的宿主工具使用，不得自行新增连接、提权或通过另一工具绕过不可用功能。需要额外权限的事项应明确说明并交由既有宿主／操作者流程处理。
 
 ### 会话状态与技能
 
@@ -143,7 +188,7 @@ DSH 子进程：一次 attempt 的模型／工具循环 → 已批准的模型�
               |
         callback 工具调用
               |
-OpenClaw：参数校验、工具授权／审批、执行钩子、核心 coding 工具
+OpenClaw：参数校验、工具授权／审批、执行钩子、已收窄的宿主工具
 ```
 
 只有宿主提供的 callback 工具可以被模型调用。DSH profile 禁用自身原生 shell、编辑器／文件系统工具、stock SDK server 及相关自主执行入口，并核验最终工具目录；不启用环境中的 MCP、subagent 或产品集成。**工具在宿主执行**，不是在隔离沙箱内执行。
@@ -161,7 +206,7 @@ node --version
 npm.cmd ci
 ```
 
-确认所用源码的 `package.json` 版本为 `0.4.0`。本项目把 OpenClaw 声明为 **optional peer**，避免在生产插件内部自动安装第二份宿主；开发／类型检查／真实 SDK 测试仍需要匹配的 SDK。
+确认所用源码的 `package.json` 版本为 `0.5.0`。本项目把 OpenClaw 声明为 **optional peer**，避免在生产插件内部自动安装第二份宿主；开发／类型检查／真实 SDK 测试仍需要匹配的 SDK。
 
 若开发目录尚未提供精确 SDK，先从 [OpenClaw 官方仓库](https://github.com/openclaw/openclaw)的发行流程取得并验证上述 **2026.9.2 官方制品**，然后本地安装：
 
@@ -175,7 +220,7 @@ npm.cmd pack
 
 `--check` 只检查，不会应用补丁。未修改的匹配制品应报告 `unpatched`。如果所用 registry 没有这个版本，应使用已核验的精确官方制品，**不要猜测可用的 npm 版本、改用最新预览版或伪造 SDK 类型**。无法取得匹配制品时，应停止需要该 SDK 的构建／集成验证。
 
-`npm pack` 的 `prepack` 会再次执行构建，生成本地 `openclaw-dsh-native-0.4.0.tgz`。不要把开发目录中的 OpenClaw SDK、账号或会话状态随插件复制出去。
+`npm pack` 的 `prepack` 会再次执行构建，生成本地 `openclaw-dsh-native-0.5.0.tgz`。不要把开发目录中的 OpenClaw SDK、账号或会话状态随插件复制出去。
 
 ## 维护窗口安装与 Agent 级启用
 
@@ -199,7 +244,7 @@ openclaw gateway status --no-probe
 仍保持 Gateway 停止：
 
 ```powershell
-openclaw plugins install "C:\PATH\TO\openclaw-dsh-native-0.4.0.tgz" --force --accept-capabilities
+openclaw plugins install "C:\PATH\TO\openclaw-dsh-native-0.5.0.tgz" --force --accept-capabilities
 ```
 
 `--force` 用于确认本地来源／覆盖安装；`--accept-capabilities` 是官方安装器对声明能力的接受选项，**仅用于已审阅并信任的代码**，不是规避安全策略。先阅读安装器说明和能力提示，不要无条件接受陌生代码。归档安装会处理运行依赖；已有 provider 及认证应留在 OpenClaw，不填入插件设置。
@@ -208,7 +253,7 @@ openclaw plugins install "C:\PATH\TO\openclaw-dsh-native-0.4.0.tgz" --force --ac
 
 ```powershell
 New-Item -ItemType Directory -Path .\artifacts\prepared-dsh-native
-tar -xf .\openclaw-dsh-native-0.4.0.tgz -C .\artifacts\prepared-dsh-native
+tar -xf .\openclaw-dsh-native-0.5.0.tgz -C .\artifacts\prepared-dsh-native
 Push-Location .\artifacts\prepared-dsh-native\package
 npm.cmd ci --omit=dev
 Pop-Location
@@ -352,7 +397,7 @@ Agent 级 pin 是可选项。原始 2026.9.2 宿主仍可使用显式的**逐模
 
 ## 插件配置项
 
-位置：`plugins.entries.dsh-native.config`。接受下列基础字段，以及上文说明的可选 `taskPreparation`；未知字段报错。默认值以 `openclaw.plugin.json` 和 `src\config.ts` 为准。
+位置：`plugins.entries.dsh-native.config`。接受下列基础字段，以及上文说明的可选 `toolAllowlist`、`taskPreparation`；未知字段报错。默认值以 `openclaw.plugin.json` 和 `src\config.ts` 为准。
 
 | 字段 | 默认值 | 约束／用途 |
 | --- | --- | --- |
@@ -380,13 +425,13 @@ Copilot 默认列表：
 
 ## 能力边界与 Dashboard
 
-支持普通前台文本输入、文本工具结果，以及宿主实际提供并允许的核心 coding 工具：
+支持普通前台文本输入、文本工具结果。没有显式扩展收窄名单时，默认使用宿主实际提供并允许的核心 coding 工具：
 
 ```text
 read  edit  write  apply_patch  exec  process  grep  glob  find  ls
 ```
 
-这是允许的工具家族，**不是承诺每次都提供所有工具**。实际目录来自 OpenClaw 的策略过滤、审批与工具执行 hooks。DSH 不自行补充原生 shell 或搜索工具。
+这是默认工具家族，**不是承诺每次都提供所有工具**。显式 `toolAllowlist` 可选择兼容的宿主搜索及标准插件工具，实际目录仍来自 OpenClaw 的策略过滤、审批与工具执行 hooks。DSH 不自行补充原生 shell、搜索实现或插件连接。
 
 已知 safe-deny 例外仅有：
 
@@ -394,11 +439,12 @@ read  edit  write  apply_patch  exec  process  grep  glob  find  ls
 sessions_list  sessions_history  sessions_send  session_status
 ```
 
-这些能力在 callback host 和 DSH 中都不存在，因此可以保留对应 deny；这不授予任何 session 工具。其余显式 native-surface 限制会在推理／工具构造前拒绝。**不要删除原有 deny／审批规则来让 DSH 启动**；不兼容时使用内置 runtime。
+这些能力在 callback host 和 DSH 中都不存在，因此可以保留对应 deny；这不授予任何 session 工具。旧默认模式仍在推理／工具构造前拒绝其他显式 native-surface 限制；使用顶层 `toolAllowlist` 时，保留原限制并由宿主工具构造、过滤和绑定后的派发执行。**不要删除原有 deny／审批规则来让 DSH 启动**；不兼容时使用内置 runtime。
 
 不支持／不授予：
 
-- `workboard`、browser、MCP、消息／渠道操作、subagent／delegation、插件工具 grants；
+- browser／多媒体、消息投递、cron、subagent／delegation、需要额外 authority 的插件工具 grants；
+- 尚未由宿主安全物化的 requester MCP 工具，以及需要不受支持会话／审批上下文的工具；
 - skill-library authoring／Skill Workshop；读取宿主提供的 skill 指令不等于获得额外工具；
 - 自定义 context engine／compaction、原生压缩、会话迁移／fork；
 - 媒体输入或非文本工具结果、Code Mode、live steering、会话权限覆盖；
@@ -466,7 +512,7 @@ node .\host-patch\apply.mjs --root $HostRoot --check
 
 备份当前可回退的插件制品和配置，在停机窗口构建／安装新包。OpenClaw 升级可能替换补丁文件：先规划恢复／迁移，重新核对目标制品，不把旧补丁强加给新版本。发生 `partial` 时保持停止并按补丁文档恢复，不能带半套补丁启动。
 
-0.1 的旧绑定缺少后续版本的模型／账号指纹；保留但不静默迁移。无论升级、切 runtime、换模型还是换账号，都使用 `/new`，不要直接重放旧任务。0.4.0 保留此前模型归属、最终正文及 reasoning 尾部空白的修正，不需要也不建议对运行中的安装做零散 JS 替换。
+0.1 的旧绑定缺少后续版本的模型／账号指纹；保留但不静默迁移。无论升级、切 runtime、换模型还是换账号，都使用 `/new`，不要直接重放旧任务。0.5.0 保留此前模型归属、最终正文及 reasoning 尾部空白的修正，不需要也不建议对运行中的安装做零散 JS 替换。
 
 ## 安全与公开发布
 

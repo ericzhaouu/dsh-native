@@ -17,6 +17,7 @@ export interface DshConfig {
   allowedBaseUrls: string[];
   allowedCopilotBaseUrls?: string[];
   taskPreparation?: TaskPreparationConfig;
+  toolAllowlist?: string[];
 }
 
 export interface DshAttempt {

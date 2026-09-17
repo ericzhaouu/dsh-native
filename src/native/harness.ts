@@ -37,11 +37,11 @@ function failure(message: string): never {
   throw new Error(`dsh-native: ${message}`);
 }
 
-export function assertNativeAttemptSupported(p: Attempt): void {
+export function assertNativeAttemptSupported(p: Attempt, hostToolAllowlist?: readonly string[]): void {
   if (p.hostCapabilities?.kind !== "agent-harness-host-capability" || p.hostCapabilities.version !== 1) {
     failure("requires a versioned, host-prepared AgentHarnessV2 capability");
   }
-  if (p.pluginHarnessToolPolicyRestricted) {
+  if (p.pluginHarnessToolPolicyRestricted && hostToolAllowlist === undefined) {
     failure("this explicit tool-policy restriction is not supported; retain the policy and use the built-in runtime");
   }
   const selected = p.agentHarnessRuntimeOverride ?? p.agentHarnessId ?? p.runtimePlan?.resolvedRef.harnessId;
@@ -249,7 +249,7 @@ export function createNativeHarness(
 
     try {
       try {
-        assertNativeAttemptSupported(p);
+        assertNativeAttemptSupported(p, config.toolAllowlist);
         if (disposed) failure("harness is disposed");
         if (active.has(p.sessionId)) failure("another DSH native attempt owns this session");
         active.set(p.sessionId, owner);
@@ -298,7 +298,8 @@ export function createNativeHarness(
         assertContinuity = dependencies.prepareContinuity?.(config, p, transcript.messages);
         assertContinuity?.();
         host = await dependencies.prepareHost(p, signal, assertActive, transcript.messages,
-          preparationPolicy && preparationGate ? { policy: preparationPolicy, gate: preparationGate } : undefined);
+          preparationPolicy && preparationGate ? { policy: preparationPolicy, gate: preparationGate } : undefined,
+          config.toolAllowlist);
         assertActive();
         await transcript.persistUser();
         assertActive();
@@ -488,8 +489,8 @@ export function createNativeHarness(
     id: RUNTIME_ID, label: "DeepSeek Harness (native, opt-in)", pluginId: RUNTIME_ID,
     autoSelection: { providerIds: [] }, deliveryDefaults: { visibleReplies: "automatic" },
     // The host requires exact enforcement before honoring safe-deny declarations.
-    // Only absent session controls qualify; all other explicit restrictions are
-    // rejected by runAttempt before inference or tool construction.
+    // Only absent session controls qualify as exceptions. Explicit host narrowing
+    // enforces other restrictions through host construction and bound dispatch.
     conversationToolPolicySupport: "exact",
     conversationToolPolicySafeDenyTools: Object.freeze([
       "sessions_list", "sessions_history", "sessions_send", "session_status",

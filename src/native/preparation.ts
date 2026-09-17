@@ -47,7 +47,7 @@ export function filterPreparationSkills(prompt: string | undefined, allowlist: r
   return [
     "Only the following operator-selected skills are advertised for task execution.",
     "A listed skill is guidance, not permission. Check its dependencies against the currently supplied tools.",
-    "Do not invoke unavailable search, browser, MCP, messaging or delegation through another tool.",
+    "Use only the tools actually supplied by the host. Do not bypass an unavailable capability through another tool.",
     "<available_skills>", ...skills, "</available_skills>",
   ].join("\n");
 }

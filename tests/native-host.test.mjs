@@ -2,7 +2,28 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { join } from "node:path";
 import { registerHooks } from "node:module";
-import { assertNativeHostSupported, createNativeToolHost, prepareNativeHost, projectNativeToolResult, renderNativeSystemPrompt } from "../dist/native/host.js";
+import { readFileSync } from "node:fs";
+import ts from "typescript";
+
+// Load source in memory, including the main-owned preparation contract; never write shared dist output.
+const sourceModules = new Map(["native/host", "native/tool-bridge", "preparation"].map((name) => [
+  new URL(`../dist/${name}.js`, import.meta.url).href,
+  new URL(`../src/${name}.ts`, import.meta.url),
+]));
+const sourceHooks = registerHooks({
+  resolve(specifier, context, next) {
+    const url = context.parentURL && new URL(specifier, context.parentURL).href;
+    return sourceModules.has(url) ? { url, shortCircuit: true } : next(specifier, context);
+  },
+  load(url, context, next) {
+    return sourceModules.has(url) ? { format: "module", shortCircuit: true,
+      source: ts.transpileModule(readFileSync(sourceModules.get(url), "utf8"),
+        { compilerOptions: { target: ts.ScriptTarget.ES2023, module: ts.ModuleKind.ESNext } }).outputText } : next(url, context);
+  },
+});
+const { assertNativeHostSupported, createNativeToolHost, prepareNativeHost, projectNativeToolResult, renderNativeSystemPrompt } =
+  await import("../dist/native/host.js");
+sourceHooks.deregister();
 
 const schema = { type: "object", properties: { path: { type: "string" } }, required: ["path"], additionalProperties: false };
 const signal = () => new AbortController().signal;
@@ -280,6 +301,11 @@ test("prepareNativeHost composes public SDK seams without granting tools during 
   let bootstrapOptions;
   let hookOptions;
   let hookRestriction;
+  let finalRestriction;
+  let planOptions;
+  let makeTools = () => [tool("read"), tool("write")];
+  let afterPromptBuild;
+  let constructionCount = 0;
   let failBootstrap = false;
   let cleaned = 0;
   const runtime = {
@@ -290,17 +316,22 @@ test("prepareNativeHost composes public SDK seams without granting tools during 
     resolveAgentDir: () => "agent-home",
     buildEmbeddedForegroundPromptContext: (run, agentDir) =>
       ({ ...run, agentDir, sandboxSessionKey: run.sandboxSessionKey ?? run.sessionKey }),
-    resolveEmbeddedAttemptToolConstructionPlan: ({ disableTools, toolsAllow }) => ({
+    resolveEmbeddedAttemptToolConstructionPlan: (options) => {
+      planOptions = options;
+      const { disableTools, toolsAllow } = options;
+      return {
       constructTools: !disableTools && toolsAllow?.length !== 0,
       includeCoreTools: true, runtimeToolAllowlist: toolsAllow,
       codingToolConstructionPlan: { includeBaseCodingTools: true, includeShellTools: true,
         includeOpenClawTools: true, includePluginTools: true, includeChannelTools: true },
-    }),
+      };
+    },
     buildEmbeddedAttemptToolRunContext: (p) => ({ trigger: p.trigger }),
     supportsModelTools: () => true,
     resolveModelAuthMode: () => "api-key",
-    applyEmbeddedAttemptToolsAllow: (tools, allow) => allow === undefined
-      ? tools : tools.filter((tool) => allow.includes("*") || allow.includes(tool.name)),
+    applyEmbeddedAttemptToolsAllow: (tools, allow, options) => allow === undefined
+      ? tools : tools.filter((tool) => allow.includes("*") || allow.includes(tool.name) ||
+        options?.toolMeta?.(tool) && (allow.includes(options.toolMeta(tool).pluginId) || allow.includes("group:plugins"))),
     resolveBootstrapContextForRun: async (options) => {
       bootstrapOptions = options;
       if (failBootstrap) throw new Error("bootstrap failed");
@@ -315,16 +346,18 @@ test("prepareNativeHost composes public SDK seams without granting tools during 
       hookOptions = options;
       const developerInstructions = options.developerInstructions.build({ toolsAllow: hookRestriction });
       if (hookRestriction?.length === 0) assert.deepEqual(options.toolAuthority.activeToolNames(), []);
+      afterPromptBuild?.();
       return {
         prompt: `prefix ${options.prompt} suffix`,
         developerInstructions: `system prefix\n${developerInstructions}\nsystem suffix`,
-        toolsAllow: hookRestriction,
+        toolsAllow: finalRestriction ?? hookRestriction,
       };
     },
     createOpenClawCodingTools: (options) => {
       construction = options;
+      constructionCount++;
       options.registerRunCleanup(async () => { cleaned++; });
-      return [tool("read"), tool("write")];
+      return makeTools();
     },
   };
   const key = Symbol.for("dsh.native-host.test-sdk");
@@ -425,6 +458,121 @@ test("prepareNativeHost composes public SDK seams without granting tools during 
   assert.match(gated.systemPrompt, /Bootstrap rules/);
   await assert.rejects(gated.executeTool(call("read", "before-preparation"), signal()), /preparation closed/);
   await gated.dispose();
+
+  hookRestriction = ["*"];
+  makeTools = () => [
+    tool("read"), tool("web_search"), tool("web_fetch"),
+    { ...tool("lookup"), plugin: { pluginId: "ordinary", optional: true } },
+    { ...tool("team_status"), channel: { channelId: "teams" } },
+    tool("message"),
+  ];
+  const genericBase = {
+    ...base, toolsAllow: ["*"], toolExecutionAllow: undefined, config: { tools: { profile: "coding" } },
+  };
+  const requested = ["web_search", "web_fetch", "lookup", "team_status", "message", "unknown"];
+  const generic = await prepareNativeHost(genericBase, signal(), () => {}, [], undefined, requested);
+  assert.deepEqual(planOptions.toolsAllow, requested);
+  assert.deepEqual(construction.runtimeToolAllowlist, requested);
+  assert.equal(construction.config, genericBase.config);
+  assert.equal(construction.toolConstructionPlan.includeOpenClawTools, true);
+  assert.equal(construction.toolConstructionPlan.includeChannelTools, true);
+  assert.equal(construction.toolConstructionPlan.includePluginTools, true);
+  assert.equal(construction.includeToolSearchControls, false);
+  assert.equal(construction.wrapBeforeToolCallHook, false);
+  assert.deepEqual(generic.tools.map((t) => t.name), ["web_search", "web_fetch", "lookup", "team_status"]);
+  assert.deepEqual(generic.toolNotices, [
+    { name: "message", reason: "unsupported" }, { name: "unknown", reason: "unavailable-or-denied" },
+  ]);
+  assert.match(generic.systemPrompt, /DSH callback-only host/);
+  assert.match(generic.systemPrompt, /host-tool callbacks/);
+  assert.match(generic.systemPrompt, /unknown: unavailable-or-denied/);
+  assert.match(generic.systemPrompt, /Do not repeatedly request clarification/);
+  assert.doesNotMatch(generic.systemPrompt, /coding assistant|channel actions, delegation|no native filesystem/);
+  assert.equal((await generic.executeTool(call("web_search"), signal())).text, "ok");
+  await generic.dispose();
+
+  const ceiling = await prepareNativeHost({
+    ...genericBase, toolsAllow: ["web_search", "ordinary", "team_status"],
+    toolExecutionAllow: ["web_search", "lookup"], pluginHarnessToolPolicySafeDeniedTools: ["web_search"],
+  }, signal(), () => {}, [], undefined, requested);
+  assert.deepEqual(ceiling.tools.map((t) => t.name), ["lookup"]);
+  assert.equal(ceiling.toolNotices.find((n) => n.name === "web_search").reason, "unavailable-or-denied");
+  assert.equal(ceiling.toolNotices.find((n) => n.name === "web_fetch").reason, "unavailable-or-denied");
+  assert.equal(ceiling.toolNotices.find((n) => n.name === "team_status").reason, "unavailable-or-denied");
+  await ceiling.dispose();
+
+  const groupDenied = await prepareNativeHost({
+    ...genericBase, toolsAllow: ["group:plugins"], pluginHarnessToolPolicySafeDeniedTools: ["ordinary"],
+  }, signal(), () => {}, [], undefined, ["lookup"]);
+  assert.deepEqual(groupDenied.tools, []);
+  await groupDenied.dispose();
+
+  for (const fields of [{ disableTools: true }, { toolsAllow: [] }, { forceRestartSafeTools: true }]) {
+    const unavailable = await prepareNativeHost({ ...genericBase, ...fields }, signal(), () => {}, [], undefined, ["web_search"]);
+    assert.deepEqual(unavailable.tools, []);
+    assert.deepEqual(unavailable.toolNotices, [{ name: "web_search", reason: "unavailable-or-denied" }]);
+    assert.match(unavailable.systemPrompt, /web_search: unavailable-or-denied/);
+    await unavailable.dispose();
+  }
+
+  const preparation = {
+    policy: { version: 1, executionTools: ["web_search"], skillAllowlist: [], maxClarificationTurns: 3, maxToolCalls: 24 },
+    gate: { assertAllowed() {}, start() {} },
+  };
+  const legacyGeneric = await prepareNativeHost(genericBase, signal(), () => {}, [], preparation);
+  assert.deepEqual(legacyGeneric.tools.map((t) => t.name), ["web_search"]);
+  assert.deepEqual(planOptions.toolsAllow, ["web_search"]);
+  await legacyGeneric.dispose();
+  const emptyCount = constructionCount;
+  const explicitEmpty = await prepareNativeHost(genericBase, signal(), () => {}, [], preparation, []);
+  assert.deepEqual(explicitEmpty.tools, []);
+  assert.equal(constructionCount, emptyCount);
+  await explicitEmpty.dispose();
+  const explicitCanonical = await prepareNativeHost(genericBase, signal(), () => {}, [], preparation, ["lookup"]);
+  assert.deepEqual(explicitCanonical.tools.map((t) => t.name), ["lookup"]);
+  await explicitCanonical.dispose();
+
+  hookRestriction = ["lookup", "not_requested"];
+  const narrowed = await prepareNativeHost(genericBase, signal(), () => {}, [], undefined, ["web_search", "lookup"]);
+  assert.deepEqual(narrowed.tools.map((t) => t.name), ["lookup"]);
+  assert.deepEqual(hookOptions.toolAuthority.activeToolNames(), ["lookup"]);
+  assert.deepEqual(narrowed.toolNotices, [{ name: "web_search", reason: "unavailable-or-denied" }]);
+  assert.match(narrowed.systemPrompt, /web_search: unavailable-or-denied/);
+  assert.doesNotMatch(narrowed.systemPrompt, /host tools: web_search/);
+  await narrowed.dispose();
+  hookRestriction = ["*"];
+  finalRestriction = [];
+  const finalNarrowed = await prepareNativeHost(genericBase, signal(), () => {}, [], undefined, ["lookup"]);
+  assert.deepEqual(finalNarrowed.tools, []);
+  assert.match(finalNarrowed.systemPrompt.split("## Final DSH callback-only host tool surface")[1], /host tools: \(none\)/);
+  assert.deepEqual(finalNarrowed.toolNotices, [{ name: "lookup", reason: "unavailable-or-denied" }]);
+  await finalNarrowed.dispose();
+  finalRestriction = undefined;
+
+  const malformed = { ...tool("bad_schema"), parameters: { type: "string" } };
+  makeTools = () => [malformed, tool("web_search")];
+  const compatible = await prepareNativeHost(genericBase, signal(), () => {}, [], undefined, ["bad_schema", "web_search"]);
+  assert.deepEqual(compatible.tools.map((t) => t.name), ["web_search"]);
+  assert.match(compatible.systemPrompt, /bad_schema: unsupported/);
+  assert.doesNotMatch(compatible.systemPrompt, /host tools: bad_schema/);
+  await compatible.dispose();
+
+  const changing = { ...tool("lookup"), plugin: { pluginId: "ordinary" } };
+  makeTools = () => [changing];
+  afterPromptBuild = () => { changing.plugin.pluginId = "changed"; };
+  const cleanupBeforeCorruption = cleaned;
+  await assert.rejects(prepareNativeHost(genericBase, signal(), () => {}, [], undefined, ["lookup"]), /source identity changed/);
+  assert.equal(cleaned, cleanupBeforeCorruption + 1);
+  afterPromptBuild = undefined;
+  makeTools = () => {
+    construction.runtimeToolAllowlist.push("write");
+    return [tool("web_search"), tool("write")];
+  };
+  const immutableCeiling = await prepareNativeHost(genericBase, signal(), () => {}, [], undefined, ["web_search"]);
+  assert.deepEqual(immutableCeiling.tools.map((t) => t.name), ["web_search"]);
+  await immutableCeiling.dispose();
+  makeTools = () => [tool("read"), tool("write")];
+  hookRestriction = ["read", "write"];
 
   for (const policy of [{ sandbox: { mode: "all" } }, { tools: { exec: { host: "node" } } }]) {
     await assert.rejects(prepareNativeHost({

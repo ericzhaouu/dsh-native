@@ -3,11 +3,12 @@ import { isAbsolute, join } from "node:path";
 import { isRecord } from "./protocol.js";
 import type { DshConfig } from "./runtime-types.js";
 import { COPILOT_ENDPOINTS } from "./copilot-policy.js";
-import { parseTaskPreparationConfig } from "./preparation.js";
+import { parseTaskPreparationConfig, parseToolAllowlist } from "./preparation.js";
 
 const KEYS = new Set([
   "stateDir", "startupTimeoutMs", "shutdownTimeoutMs", "streamIdleTimeoutMs", "allowedBaseUrls", "allowedCopilotBaseUrls",
   "taskPreparation",
+  "toolAllowlist",
 ]);
 
 export function normalizeBaseUrl(value: string): string {
@@ -40,6 +41,16 @@ export function parseDshConfig(value: unknown): DshConfig {
   if (!Array.isArray(copilotUrls) || copilotUrls.length === 0 || copilotUrls.some((url) => typeof url !== "string")) {
     throw new Error("allowedCopilotBaseUrls must be a nonempty array of exact endpoint URLs.");
   }
+  const toolAllowlist = input.toolAllowlist === undefined ? undefined : parseToolAllowlist(input.toolAllowlist);
+  let taskPreparation = input.taskPreparation === undefined ? undefined : parseTaskPreparationConfig(input.taskPreparation);
+  if (toolAllowlist && taskPreparation) {
+    const nested = isRecord(input.taskPreparation) && Object.hasOwn(input.taskPreparation, "executionTools");
+    if (nested && (taskPreparation.executionTools.length !== toolAllowlist.length ||
+        taskPreparation.executionTools.some((name) => !toolAllowlist.includes(name)))) {
+      throw new Error("toolAllowlist conflicts with taskPreparation.executionTools; configure one narrowing list.");
+    }
+    taskPreparation = { ...taskPreparation, executionTools: [...toolAllowlist] };
+  }
   return {
     stateDir,
     startupTimeoutMs: timeout(input.startupTimeoutMs, 60_000, "startupTimeoutMs"),
@@ -47,7 +58,8 @@ export function parseDshConfig(value: unknown): DshConfig {
     streamIdleTimeoutMs: timeout(input.streamIdleTimeoutMs, 120_000, "streamIdleTimeoutMs"),
     allowedBaseUrls: urls.map((url: string) => normalizeBaseUrl(url)),
     allowedCopilotBaseUrls: copilotUrls.map((url: string) => normalizeBaseUrl(url)),
-    ...(input.taskPreparation === undefined ? {} : { taskPreparation: parseTaskPreparationConfig(input.taskPreparation) }),
+    ...(taskPreparation ? { taskPreparation } : {}),
+    ...(toolAllowlist ? { toolAllowlist } : {}),
   };
 }
 

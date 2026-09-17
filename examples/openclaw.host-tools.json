@@ -4,23 +4,13 @@
       "dsh-native": {
         "enabled": true,
         "config": {
-          "toolAllowlist": ["read", "write", "edit", "apply_patch", "exec", "process"],
+          "toolAllowlist": ["read", "web_search", "web_fetch"],
           "taskPreparation": {
             "agentIds": ["dsh-experiment"],
             "skillAllowlist": [],
             "maxClarificationTurns": 3,
             "maxToolCalls": 24
           }
-        }
-      }
-    }
-  },
-  "agents": {
-    "entries": {
-      "dsh-experiment": {
-        "runtime": {
-          "type": "embedded",
-          "harness": "dsh-native"
         }
       }
     }
