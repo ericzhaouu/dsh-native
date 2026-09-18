@@ -455,6 +455,15 @@ These 0.6.0 changes require an explicit upgrade of previously installed versions
 Existing foreign-compacted or inconsistent mirrors are not rewritten/imported:
 retain them for inspection and use /new. Deployment/restart remains separate.
 
+KNOWN PRODUCTION BLOCKER: host-initiated Copilot compact is not yet accepted.
+OpenClaw 2026.9.2 prepares account-specific endpoints and runtime headers for
+ordinary turns, but its native compact() handoff omits the equivalent preparation.
+When the account route differs from the configured route, 0.6.0 rejects compaction
+with "DSH model route or account changed"; account isolation is not weakened.
+Live ordinary chat, write and continuation after rejection passed, not live
+compaction. The host handoff and real-account repeated compaction must pass before
+claiming 1.0 readiness; passing loopback-model tests is not a substitute.
+
 Each host session has a hashed state directory, private DSH_HOME and binding.
 A fresh child resumes native history each turn. Success flushes persistence,
 drains the bridge and closes the child before making the binding reusable.

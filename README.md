@@ -51,6 +51,8 @@
 
 摘要质量仍取决于模型。已有外部压缩／损坏的镜像不会被自动改写或导入；此类旧会话仍需保留记录并使用 `/new`。生产升级与共享 Gateway 重启需要单独安排维护。
 
+**已知生产限制：Copilot 宿主发起的压缩尚未通过验收。** OpenClaw 2026.9.2 的普通对话会准备 Copilot 账户专属端点和运行时请求头，但原生 `compact()` 交接路径未执行相同准备。账户端点不同于配置端点时，0.6.0 会明确拒绝压缩，报 `DSH model route or account changed`，而不是放宽账号隔离。真实模型验收已确认普通对话、写入及拒绝后的续聊可用，但这不等于真实账户压缩可用。修复宿主交接并完成真实账户连续压缩验收前，**不应将 0.6.0 视为 1.0-ready**；离线模型压缩通过不能替代这项门槛。
+
 ## 0.5.2 Agent 级 SKILL 可见性覆盖
 
 0.5.2 增加 `taskPreparation.skillAllowlistByAgent`。键必须同时出现在 `taskPreparation.agentIds` 中；值使用与 `skillAllowlist` 相同的精确 Skill 名称校验，最多 12 项，不支持通配符。列出的 Agent 使用该数组**替换**共享 `skillAllowlist`；`[]` 明确表示不广告任何 Skill；未列出的 Agent 继续继承共享列表。此覆盖只影响准备阶段可见的 Skill 说明，不改变宿主工具、认证、MCP 连接或子进程协议。
