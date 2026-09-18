@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -125,5 +126,26 @@ test("Copilot host-tool cancellation drains, and tokens cannot cross provider al
       });
       assert.equal(drained, true);
       assert.equal(result.stopReason, "aborted");
+    });
+});
+
+test("Copilot compaction keeps source-account and request-identity isolation before inference", { timeout: 150000 }, async () => {
+  await fixture(({ text, finish }) => { text("ACCOUNT-BOUND"); finish(); },
+    async ({ input, root, runtime, server }) => {
+      await runtime.run({ ...input, tools: [] });
+      const bindingPath = join(root, createHash("sha256").update(input.sessionId).digest("hex"), "binding.json");
+      const before = await readFile(bindingPath, "utf8");
+      for (const [name, patch] of [
+        ["different-source-account", { apiKey: "different-source-account" }],
+        ["different-model", { modelId: "gpt-5.6-sol" }],
+        ["different-request-identity", { headers: { ...input.headers, "Copilot-Integration-Id": "vscode-chat" } }],
+      ]) {
+        await assert.rejects(runtime.compact({ ...input, ...patch, runId: name }), /route or account changed/u);
+        assert.equal(await readFile(bindingPath, "utf8"), before, "Rejected compaction must not mutate the established binding");
+      }
+      assert.equal(server.requests.length, 1, "Cross-account compaction must never reach the model");
+      await runtime.run({ ...input, tools: [], runId: "same-source-continuation", prompt: "Continue." });
+      assert.equal(server.requests.length, 2);
+      assert.equal(JSON.parse(await readFile(bindingPath, "utf8")).status, "ready");
     });
 });

@@ -150,6 +150,27 @@ test("fails closed for a wrong archive hash", async () => {
   assert.equal(report.findings[0].code, "archive-sha-mismatch");
 });
 
+test("accepts only the explicit reversible compaction companion patch modules", async () => {
+  const allowed = goodEntries([
+    ["package/host-patch/engine.mjs", "export {};\n"],
+    ["package/host-patch/compact-auth/apply.mjs", "export {};\n"],
+    ["package/host-patch/compact-auth/spec.mjs", "export {};\n"],
+  ]);
+  const report = await checkPackage({ packagePath: await writeTgz("compact-auth.tgz", allowed) });
+  assert.equal(report.ok, true, JSON.stringify(report.findings));
+  const unexpected = await checkPackage({ packagePath: await writeTgz("unexpected-host-code.tgz", [
+    ...allowed, ["package/host-patch/compact-auth/private-config.json", "{}"],
+  ]) });
+  assert.equal(unexpected.ok, false);
+  assert.ok(unexpected.findings.some((item) => item.path === "package/host-patch/compact-auth/private-config.json"));
+  for (const missing of ["engine.mjs", "compact-auth/apply.mjs", "compact-auth/spec.mjs"]) {
+    const result = await checkPackage({ packagePath: await writeTgz(`missing-${missing.replaceAll("/", "-")}.tgz`,
+      allowed.filter(([path]) => path !== `package/host-patch/${missing}`)) });
+    assert.equal(result.ok, false);
+    assert.ok(result.findings.some((item) => item.path === `package/host-patch/${missing}`));
+  }
+});
+
 test("requires explicit --package and gives clear CLI usage", async () => {
   const result = await runChecker([]);
   assert.notEqual(result.code, 0);

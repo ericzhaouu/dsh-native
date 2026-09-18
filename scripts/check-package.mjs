@@ -169,7 +169,8 @@ function isAllowedPackageFile(path) {
   if (["package/package.json", "package/npm-shrinkwrap.json", "package/README.md", "package/LICENSE", "package/USAGE.txt", "package/openclaw.plugin.json"].includes(path)) return true;
   if (/^package\/dist\/[A-Za-z0-9._/-]+\.(?:js|d\.ts|js\.map)$/.test(path)) return true;
   if (/^package\/examples\/[A-Za-z0-9._-]+\.json$/.test(path)) return true;
-  if (/^package\/host-patch\/(?:apply|spec)\.mjs$/.test(path)) return true;
+  if (/^package\/host-patch\/(?:apply|spec|engine)\.mjs$/.test(path)) return true;
+  if (/^package\/host-patch\/compact-auth\/(?:apply|spec)\.mjs$/.test(path)) return true;
   if (path === "package/host-patch/USAGE.txt") return true;
   return false;
 }
@@ -317,6 +318,12 @@ export async function checkPackage(options) {
   requireFile(byPath, findings, "package/dist/index.d.ts");
   requireFile(byPath, findings, "package/host-patch/apply.mjs");
   requireFile(byPath, findings, "package/host-patch/spec.mjs");
+  const companionFiles = ["package/host-patch/compact-auth/apply.mjs", "package/host-patch/compact-auth/spec.mjs"];
+  if (companionFiles.some((path) => byPath.has(path))) {
+    for (const path of [...companionFiles, "package/host-patch/engine.mjs"]) requireFile(byPath, findings, path);
+  } else if (byPath.get("package/host-patch/apply.mjs")?.data.toString("utf8").includes("./engine.mjs")) {
+    requireFile(byPath, findings, "package/host-patch/engine.mjs");
+  }
   if (manifest && shrinkwrap) {
     if (shrinkwrap.name !== manifest.name || shrinkwrap.version !== manifest.version) findings.push({ code: "shrinkwrap-root", path: "package/npm-shrinkwrap.json", detail: "root shrinkwrap name/version must match package.json" });
     if (shrinkwrap.packages?.[""]?.version !== manifest.version) findings.push({ code: "shrinkwrap-root-package", path: "package/npm-shrinkwrap.json", detail: "packages[''].version must match package.json" });

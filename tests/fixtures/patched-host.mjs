@@ -5,7 +5,7 @@ import { patchHost } from "../../host-patch/apply.mjs";
 
 export const projectRoot = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
 
-export async function createPatchedHostFixture(root) {
+export async function createPatchedHostFixture(root, { compactionAuth = false } = {}) {
   const source = join(projectRoot, "node_modules", "openclaw");
   const host = join(root, "openclaw");
   await mkdir(host);
@@ -15,6 +15,10 @@ export async function createPatchedHostFixture(root) {
   // A separately installed optional SDK has its own dependency tree.
   await symlink(dirname(await realpath(source)), join(host, "node_modules"), "junction");
   await patchHost(host, { action: "apply", offlineConfirmed: true });
+  if (compactionAuth) {
+    const { patchHost: patchCompactionAuth } = await import("../../host-patch/compact-auth/apply.mjs");
+    await patchCompactionAuth(host, { action: "apply", offlineConfirmed: true });
+  }
   return { host, plugin: await createPluginFixture(root, host) };
 }
 

@@ -10,6 +10,7 @@ import { t as GatewayClient } from "../../node_modules/openclaw/dist/client-I-Ro
 import { s as resolveRuntimeServiceBuildId, t as OPENCLAW_VERSION } from "../../node_modules/openclaw/dist/version-v1kuAkGj.js";
 import { startResponsesServer } from "./responses-server.mjs";
 import { createPatchedHostFixture, createPluginFixture } from "./patched-host.mjs";
+import { createHostCopilotAuthFixture, HOST_COPILOT_AUTH_PLUGIN_ID, HOST_COPILOT_AUTH_SOURCE_KEY } from "./host-copilot-auth-plugin.mjs";
 import { createHostSearchFixture, HOST_SEARCH_PLUGIN_ID, HOST_SEARCH_PROVIDER_ID } from "./host-search-plugin.mjs";
 import { createHostMemoryFixture, HOST_MEMORY_PLUGIN_ID } from "./host-memory-plugin.mjs";
 
@@ -153,9 +154,11 @@ export async function startDashboardGateway(responder, {
   agentPinned = true, redactTranscriptIdentity = false, taskPreparation,
   hostTools, searchFixture = false, agentToolPolicy, agentId = AGENT_ID,
   additionalAgentIds = [], setupWorkspaces, modelContextWindow = 1_000_000,
-  compaction, memoryFixture = false,
+  compaction, memoryFixture = false, copilotAuthFixture = false,
+  compactionAuthPatch = copilotAuthFixture,
 } = {}) {
   assert.equal(OPENCLAW_VERSION, "2026.9.2", "Dashboard fixture must use the inspected genuine SDK");
+  assert.ok(!copilotAuthFixture || agentPinned, "Synthetic provider replacement requires a private copied host");
   assert.ok(Array.isArray(additionalAgentIds), "additionalAgentIds must be an array");
   assert.equal(new Set([agentId, ...additionalAgentIds]).size, 1 + additionalAgentIds.length,
     "Fixture agent ids must be unique");
@@ -236,11 +239,6 @@ export async function startDashboardGateway(responder, {
     await Promise.all([root, home, state, dshState,
       ...allAgents.flatMap((agent) => [agent.workspace, agent.agentDir]),
     ].map((path) => mkdir(path, { recursive: true })));
-    const originalHost = join(packageRoot, "node_modules", "openclaw");
-    const fixture = agentPinned ? await createPatchedHostFixture(root)
-      : { host: originalHost, plugin: await createPluginFixture(root, originalHost) };
-    const search = searchFixture ? await createHostSearchFixture(root, fixture.host) : undefined;
-    const memory = memoryFixture ? await createHostMemoryFixture(root, fixture.host) : undefined;
     const networkGuard = await createNetworkGuard(root);
     await writeFile(join(workspace, "fixture.txt"), "DASHBOARD-HOST-READ\n");
     await setupWorkspaces?.({ root, agents: allAgents, agentWorkspaces, agentDirs });
@@ -248,6 +246,20 @@ export async function startDashboardGateway(responder, {
       try { await responder(request); }
       catch (error) { failFixture(error); throw error; }
     });
+    const originalHost = join(packageRoot, "node_modules", "openclaw");
+    const fixture = agentPinned ? await createPatchedHostFixture(root, { compactionAuth: compactionAuthPatch })
+      : { host: originalHost, plugin: await createPluginFixture(root, originalHost) };
+    if (copilotAuthFixture) {
+      // Replace the copied provider, not the installed SDK or its ownership checks.
+      await rm(join(fixture.host, "dist", "extensions", "github-copilot"), { recursive: true });
+    }
+    const accountBaseUrl = `${responses.baseUrl}/account`;
+    const configuredBaseUrl = `${responses.baseUrl}/configured`;
+    const copilotAuth = copilotAuthFixture
+      ? await createHostCopilotAuthFixture(root, fixture.host, { accountBaseUrl, configuredBaseUrl })
+      : undefined;
+    const search = searchFixture ? await createHostSearchFixture(root, fixture.host) : undefined;
+    const memory = memoryFixture ? await createHostMemoryFixture(root, fixture.host) : undefined;
     const port = await reserveLoopbackPort();
     const configPath = join(root, "openclaw.json");
     const logPath = join(root, "openclaw.log");
@@ -275,9 +287,9 @@ export async function startDashboardGateway(responder, {
         mode: "replace",
         providers: {
           "github-copilot": {
-            baseUrl: responses.baseUrl,
+            baseUrl: copilotAuth?.config.configuredBaseUrl ?? responses.baseUrl,
             api: "openai-responses",
-            apiKey: "dashboard-not-a-real-key",
+            apiKey: copilotAuth ? HOST_COPILOT_AUTH_SOURCE_KEY : "dashboard-not-a-real-key",
             headers: { "Copilot-Integration-Id": "copilot-developer-cli" },
             models: [{
               id: MODEL_ID,
@@ -301,10 +313,13 @@ export async function startDashboardGateway(responder, {
       plugins: {
         slots: { memory: memory ? HOST_MEMORY_PLUGIN_ID : "none" },
         enabled: true,
-        allow: ["dsh-native", ...(search ? [HOST_SEARCH_PLUGIN_ID] : []), ...(memory ? [HOST_MEMORY_PLUGIN_ID] : [])],
-        load: { paths: [fixture.plugin, ...(search ? [search.plugin] : []), ...(memory ? [memory.plugin] : [])] },
+        allow: ["dsh-native", ...(copilotAuth ? [HOST_COPILOT_AUTH_PLUGIN_ID] : []),
+          ...(search ? [HOST_SEARCH_PLUGIN_ID] : []), ...(memory ? [HOST_MEMORY_PLUGIN_ID] : [])],
+        load: { paths: [fixture.plugin, ...(copilotAuth ? [copilotAuth.plugin] : []),
+          ...(search ? [search.plugin] : []), ...(memory ? [memory.plugin] : [])] },
         entries: {
           "github-copilot": { enabled: false },
+          ...(copilotAuth ? { [HOST_COPILOT_AUTH_PLUGIN_ID]: { enabled: true, config: copilotAuth.config } } : {}),
           ...(search ? { [HOST_SEARCH_PLUGIN_ID]: { enabled: true, config: search.config } } : {}),
           ...(memory ? { [HOST_MEMORY_PLUGIN_ID]: { enabled: true } } : {}),
           "dsh-native": {
@@ -312,7 +327,8 @@ export async function startDashboardGateway(responder, {
             config: {
               stateDir: dshState,
               startupTimeoutMs: 120000,
-              allowedCopilotBaseUrls: [responses.baseUrl],
+              allowedCopilotBaseUrls: copilotAuth
+                ? [copilotAuth.config.configuredBaseUrl, copilotAuth.config.accountBaseUrl] : [responses.baseUrl],
               ...(hostTools === undefined ? {} : { toolAllowlist: hostTools }),
               ...(taskPreparation === undefined ? {} : { taskPreparation }),
             },
@@ -426,6 +442,7 @@ export async function startDashboardGateway(responder, {
       agentWorkspaces,
       agentDirs,
       searchFixture: search,
+      copilotAuthFixture: copilotAuth,
       responses,
       chat,
       events,

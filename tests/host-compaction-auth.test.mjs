@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { cp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
@@ -6,6 +7,8 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { inspectHost, patchHost } from "../host-patch/compact-auth/apply.mjs";
 import { edits, PATCH_ID, replaceExactly, stateName, transform } from "../host-patch/compact-auth/spec.mjs";
+import { patchHost as patchAgentPin } from "../host-patch/apply.mjs";
+import { edits as pinEdits } from "../host-patch/spec.mjs";
 
 const project = dirname(dirname(fileURLToPath(import.meta.url)));
 const genuineHost = join(project, "node_modules", "openclaw");
@@ -51,7 +54,8 @@ function baseParams(overrides = {}) {
   return {
     agentDir: "C:\\agent",
     apiKey: "source-gh-token",
-    authProfileId: "caller-profile",
+    authProfileId: "resolved-profile",
+    authMode: "token",
     config: { models: { providers: {} } },
     harness: { id: "dsh-native" },
     model: {
@@ -124,12 +128,40 @@ test("compaction auth patch rejects unsupported versions, tampering, corrupt bac
   await assert.rejects(patchHost(linkRoot, { action: "apply", offlineConfirmed: true }), /real directory/);
 });
 
+test("compaction companion and the genuine installed Agent-pin patch can be restored independently", async (t) => {
+  const root = await fixture(t);
+  for (const edit of pinEdits) {
+    const destination = join(root, ...edit.file.split("/"));
+    await mkdir(dirname(destination), { recursive: true });
+    await cp(join(genuineHost, ...edit.file.split("/")), destination);
+  }
+  await patchAgentPin(root, { action: "apply", offlineConfirmed: true });
+  const pinReceiptPath = join(root, ".dsh-agent-harness-patch", "receipt.json");
+  const pinReceipt = await readFile(pinReceiptPath, "utf8");
+  await patchHost(root, { action: "apply", offlineConfirmed: true });
+  assert.equal((await patchAgentPin(root)).status, "applied");
+  assert.equal(await readFile(pinReceiptPath, "utf8"), pinReceipt);
+  await patchHost(root, { action: "restore", offlineConfirmed: true });
+  assert.equal((await patchAgentPin(root)).status, "applied");
+  assert.equal(await readFile(pinReceiptPath, "utf8"), pinReceipt);
+  await patchHost(root, { action: "apply", offlineConfirmed: true });
+  await patchAgentPin(root, { action: "restore", offlineConfirmed: true });
+  assert.equal((await patchHost(root)).status, "applied");
+  await patchHost(root, { action: "restore", offlineConfirmed: true });
+  assert.equal((await patchHost(root)).status, "unpatched");
+  for (const edit of [...pinEdits, ...edits]) {
+    assert.equal(hash(await readFile(join(root, ...edit.file.split("/")))), edit.sha256);
+  }
+});
+
 test("transformed compaction successor syntax is valid and anchors are exact", async () => {
   const original = await readFile(join(genuineHost, ...edits[0].file.split("/")), "utf8");
   const patched = transform(original, edits[0]);
   assert.match(patched, /prepareDshNativeCopilotCompactionRuntimeAuth/);
   assert.match(patched, /apiKey: resolved\.auth\.apiKey/);
   assert.doesNotMatch(patched, /apiKey:\s*preparedAuth\.apiKey/);
+  const syntax = spawnSync(process.execPath, ["--input-type=module", "--check"], { input: patched, encoding: "utf8" });
+  assert.equal(syntax.status, 0, syntax.stderr);
   assert.throws(() => replaceExactly("x x", "x", "y", "fixture"), /one patch anchor/);
   assert.throws(() => replaceExactly("x", "missing", "y", "fixture"), /one patch anchor/);
 });
@@ -146,8 +178,8 @@ test("dsh-native Copilot compaction prepares runtime route without forwarding th
       assert.equal(params.context.modelId, "gpt-6-astra");
       assert.equal(params.context.model.baseUrl, "https://api.githubcopilot.com");
       assert.equal(params.context.apiKey, "source-gh-token");
-      assert.equal(params.context.authMode, "oauth");
-      assert.equal(params.context.profileId, "forwarded-profile");
+      assert.equal(params.context.authMode, "token");
+      assert.equal(params.context.profileId, "resolved-profile");
       return {
         apiKey: `derived-runtime-${++derived}`,
         baseUrl: "https://enterprise.githubcopilot.com",
@@ -158,7 +190,7 @@ test("dsh-native Copilot compaction prepares runtime route without forwarding th
     applyPreparedRuntimeAuthToModel: (model, preparedAuth) => ({
       ...model,
       baseUrl: preparedAuth.baseUrl,
-      headers: { ...model.headers, ...preparedAuth.request.headers, authorization: `Bearer ${preparedAuth.apiKey}` },
+      headers: { ...model.headers, ...preparedAuth.request.headers },
     }),
     unwrapSecretSentinelsForProviderEgress: (value) => value,
   });
@@ -171,7 +203,9 @@ test("dsh-native Copilot compaction prepares runtime route without forwarding th
   assert.equal(first.runtimeAuthPlan.modelRoute.api, first.runtimeModel.api);
   assert.equal(first.runtimeModel.id, "gpt-6-astra");
   assert.equal(first.runtimeModel.provider, "github-copilot");
-  assert.notEqual(first.runtimeModel.headers.authorization, second.runtimeModel.headers.authorization);
+  assert.equal(derived, 2);
+  assert.deepEqual(first.runtimeModel, second.runtimeModel, "Derived credential refresh must not change the source-bound handoff");
+  assert.equal(JSON.stringify([first, second]).includes("derived-runtime-"), false);
 });
 
 test("runtime prep is skipped for non-targets and unavailable hooks, and throws/cancels fail closed", async () => {
@@ -190,6 +224,9 @@ test("runtime prep is skipped for non-targets and unavailable hooks, and throws/
     runtimeAuthPlan: { modelRoute: { authRequirement: "provider-default" } },
   })), undefined);
   assert.equal(prepareCalls, 0);
+  assert.equal(await helpers.prepareDshNativeCopilotCompactionRuntimeAuth(baseParams({
+    harness: { id: "other" }, signal: AbortSignal.abort(new Error("non-target abort")),
+  })), undefined, "The companion must not change non-target cancellation behavior");
   assert.equal(await helpers.prepareDshNativeCopilotCompactionRuntimeAuth(baseParams()), undefined);
   assert.equal(prepareCalls, 1);
 
@@ -210,4 +247,13 @@ test("runtime prep is skipped for non-targets and unavailable hooks, and throws/
   await assert.rejects(cancelled.prepareDshNativeCopilotCompactionRuntimeAuth(baseParams({
     signal: { throwIfAborted: () => { throw new Error("aborted"); } },
   })), /aborted/);
+  const controller = new AbortController();
+  const aborting = makeHelpers({
+    prepareProviderRuntimeAuth: async () => { controller.abort(new Error("revoked during preparation")); return { apiKey: "derived" }; },
+    protectPreparedProviderRuntimeAuth: ({ preparedAuth }) => preparedAuth,
+    applyPreparedRuntimeAuthToModel: () => assert.fail("Revoked preparation must not reach model handoff"),
+    unwrapSecretSentinelsForProviderEgress: (value) => value,
+  });
+  await assert.rejects(aborting.prepareDshNativeCopilotCompactionRuntimeAuth(baseParams({ signal: controller.signal })),
+    /revoked during preparation/u);
 });

@@ -1,5 +1,22 @@
 OPENCLAW AGENT HARNESS PIN -- OPTIONAL EXPERIMENTAL HOST PATCH
-DSH Native 0.6.0 (unchanged patch specification from 0.3.0)
+DSH Native 0.6.1 (Agent-pin patch specification unchanged from 0.3.0)
+
+INDEPENDENT COPILOT COMPACTION COMPANION
+
+OpenClaw 2026.9.2 native compaction omits provider runtime-auth preparation.
+For dsh-native + github-copilot only, compact-auth\apply.mjs aligns the prepared
+account endpoint and headers with ordinary turns while preserving the source
+credential and strict account binding. It does not implement independent login.
+
+Stop the target Gateway before writes:
+  node host-patch\compact-auth\apply.mjs --root C:\PATH\TO\openclaw --check
+  node host-patch\compact-auth\apply.mjs --root C:\PATH\TO\openclaw --apply --offline-confirmed
+  node host-patch\compact-auth\apply.mjs --root C:\PATH\TO\openclaw --restore --offline-confirmed
+
+Apply and restore are alternatives, not consecutive installation steps.
+The companion uses .dsh-native-compaction-auth-patch and exact file hashes.
+It leaves this Agent-pin patch's receipt and files untouched. Check both patches
+after upgrading OpenClaw; unsupported host builds fail closed.
 
 Project: https://github.com/ericzhaouu/dsh-native
 Author: https://github.com/ericzhaouu
@@ -44,7 +61,7 @@ Do not change global defaults, credentials or policies merely to select DSH.
 If the Agent has no model override, it inherits the normal default.
 
 The pin takes precedence over model/provider runtime selection, including
-fallback candidates. That DOES NOT add provider support. DSH Native 0.6.0
+fallback candidates. That DOES NOT add provider support. DSH Native 0.6.1
 supports only deepseek / openai-completions and github-copilot GPT /
 openai-responses. Unsupported pins fail with a typed error, not a substitute
 model or an escape to the built-in runtime.
@@ -99,7 +116,7 @@ MAINTENANCE: STOP BEFORE INSTALL / PATCH / CONFIGURATION
    Gateway after plugin/runtime changes. Do not write live config first.
 4. Install the reviewed plugin while Gateway remains stopped:
 
-     openclaw plugins install "C:\PATH\TO\openclaw-dsh-native-0.6.0.tgz" --force --accept-capabilities
+     openclaw plugins install "C:\PATH\TO\openclaw-dsh-native-0.6.1.tgz" --force --accept-capabilities
 
    --force confirms the local source/overwrite; official --accept-capabilities
    accepts declared capabilities of reviewed code, not a policy bypass.

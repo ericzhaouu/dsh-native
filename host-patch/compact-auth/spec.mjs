@@ -9,8 +9,8 @@ function shouldPrepareDshNativeCopilotCompactionRuntimeAuth(params) {
 \t\t!(params.harness.authBootstrap === "harness" && !runtimePlanRequiresHostApiKey(params.runtimeAuthPlan));
 }
 async function prepareDshNativeCopilotCompactionRuntimeAuth(params) {
-\tparams.signal?.throwIfAborted();
 \tif (!shouldPrepareDshNativeCopilotCompactionRuntimeAuth(params)) return;
+\tparams.signal?.throwIfAborted();
 \tconst sourceApiKey = params.apiKey?.trim();
 \tif (!sourceApiKey) return;
 \tconst preparedAuth = protectPreparedProviderRuntimeAuth({
@@ -29,8 +29,8 @@ async function prepareDshNativeCopilotCompactionRuntimeAuth(params) {
 \t\t\t\tmodelId: params.modelId,
 \t\t\t\tmodel: params.model,
 \t\t\t\tapiKey: unwrapSecretSentinelsForProviderEgress(sourceApiKey, "provider runtime auth exchange"),
-\t\t\t\tauthMode: params.runtimeAuthPlan?.selectedAuthMode ?? "unknown",
-\t\t\t\tprofileId: params.runtimeAuthPlan?.forwardedAuthProfileId ?? params.authProfileId
+\t\t\t\tauthMode: params.authMode,
+\t\t\t\tprofileId: params.authProfileId ?? params.runtimeAuthPlan?.forwardedAuthProfileId
 \t\t\t}
 \t\t})
 \t});
@@ -64,8 +64,11 @@ export const edits = [
       before: 'function runtimePlanRequiresHostApiKey(plan) {\n\treturn plan?.modelRoute?.authRequirement === "api-key";\n}',
       after: `function runtimePlanRequiresHostApiKey(plan) {\n\treturn plan?.modelRoute?.authRequirement === "api-key";\n}\n${compactionRuntimeAuthHelpers}`,
     }, {
+      before: '\t\t\t\t\tauth: { apiKey: auth.auth.apiKey?.trim() || void 0 }',
+      after: '\t\t\t\t\tauth: { apiKey: auth.auth.apiKey?.trim() || void 0, mode: auth.auth.mode, profileId: auth.auth.profileId }',
+    }, {
       before: '\treturn {\n\t\tharness,\n\t\tapiKey: resolved.auth.apiKey,\n\t\truntimeModel: resolved.model,\n\t\truntimeAuthPlan: resolved.plan\n\t};',
-      after: `\tlet resolvedRuntimeModel = resolved.model;\n\tlet resolvedRuntimeAuthPlan = resolved.plan;\n\tconst preparedCompactionRuntimeAuth = await prepareDshNativeCopilotCompactionRuntimeAuth({\n\t\tagentDir,\n\t\tapiKey: resolved.auth.apiKey,\n\t\tauthProfileId: compactParams.authProfileId,\n\t\tconfig: compactParams.config,\n\t\tharness,\n\t\tmodel: resolvedRuntimeModel,\n\t\tmodelId,\n\t\tprovider,\n\t\truntimeAuthPlan: resolvedRuntimeAuthPlan,\n\t\tsignal: compactParams.abortSignal ?? compactParams.signal,\n\t\tworkspaceDir\n\t});\n\tif (preparedCompactionRuntimeAuth) {\n\t\tresolvedRuntimeModel = preparedCompactionRuntimeAuth.runtimeModel;\n\t\tresolvedRuntimeAuthPlan = preparedCompactionRuntimeAuth.runtimeAuthPlan;\n\t}\n\treturn {\n\t\tharness,\n\t\tapiKey: resolved.auth.apiKey,\n\t\truntimeModel: resolvedRuntimeModel,\n\t\truntimeAuthPlan: resolvedRuntimeAuthPlan\n\t};`,
+      after: `\tlet resolvedRuntimeModel = resolved.model;\n\tlet resolvedRuntimeAuthPlan = resolved.plan;\n\tconst preparedCompactionRuntimeAuth = await prepareDshNativeCopilotCompactionRuntimeAuth({\n\t\tagentDir,\n\t\tapiKey: resolved.auth.apiKey,\n\t\tauthMode: resolved.auth.mode ?? (resolved.plan.selectedAuthMode === "api_key" ? "api-key" : resolved.plan.selectedAuthMode),\n\t\tauthProfileId: resolved.auth.profileId ?? resolved.plan.forwardedAuthProfileId ?? compactParams.authProfileId,\n\t\tconfig: compactParams.config,\n\t\tharness,\n\t\tmodel: resolvedRuntimeModel,\n\t\tmodelId,\n\t\tprovider,\n\t\truntimeAuthPlan: resolvedRuntimeAuthPlan,\n\t\tsignal: compactParams.abortSignal,\n\t\tworkspaceDir\n\t});\n\tif (preparedCompactionRuntimeAuth) {\n\t\tresolvedRuntimeModel = preparedCompactionRuntimeAuth.runtimeModel;\n\t\tresolvedRuntimeAuthPlan = preparedCompactionRuntimeAuth.runtimeAuthPlan;\n\t}\n\treturn {\n\t\tharness,\n\t\tapiKey: resolved.auth.apiKey,\n\t\truntimeModel: resolvedRuntimeModel,\n\t\truntimeAuthPlan: resolvedRuntimeAuthPlan\n\t};`,
     }],
   },
 ];
