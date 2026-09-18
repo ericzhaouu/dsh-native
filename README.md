@@ -1,6 +1,6 @@
 # DSH Native for OpenClaw
 
-**实验性版本 0.6.1**：把官方 DeepSeek Harness（DSH）的模型／工具循环接入 OpenClaw 的原生 `AgentHarnessV2`，并保留 OpenClaw 对模型、认证、工具授权与会话入口的控制。
+**实验性版本 0.6.2**：把官方 DeepSeek Harness（DSH）的模型／工具循环接入 OpenClaw 的原生 `AgentHarnessV2`，并保留 OpenClaw 对模型、认证、工具授权与会话入口的控制。
 
 - 源码仓库：[ericzhaouu/dsh-native](https://github.com/ericzhaouu/dsh-native)
 - 作者：[ericzhaouu](https://github.com/ericzhaouu)
@@ -45,6 +45,8 @@
 OpenClaw 2026.9.2 的普通对话会准备 Copilot 账户专属端点和请求头，但原生 `compact()` 路径缺少相同准备。配置端点与账户端点不同时，0.6.0 的严格绑定会拒绝压缩。
 
 0.6.1 提供独立、可回滚的 **宿主兼容补丁**，仅处理 `dsh-native` + `github-copilot`、宿主拥有认证的压缩请求。它复用宿主 provider runtime-auth 准备及模型转换函数，并同步传入的认证路由计划。普通对话已向插件交付源凭据；压缩保持相同语义，不把短期派生 token 替换成绑定身份，也不放宽源账号、模型、端点或请求头指纹校验。
+
+0.6.2 将 provider 准备显式绑定到该次压缩持有的插件代际快照，避免队列回调使用不相关的环境作用域。若已经应用 0.6.1 的旧压缩补丁，先在停机窗口用**旧版补丁工具**执行 `--restore --offline-confirmed`，再用新版工具应用；未知的已修改宿主文件仍拒绝覆盖。
 
 **仅更新插件不会自动修改宿主。** 下载／构建包后，在停止该安装的 Gateway 的维护窗口中执行，`C:\PATH\TO\prepared-dsh-native` 指解包后的 `package` 目录：
 
@@ -275,7 +277,7 @@ node --version
 npm.cmd ci
 ```
 
-确认所用源码的 `package.json` 版本为 `0.6.1`。本项目把 OpenClaw 声明为 **optional peer**，避免在生产插件内部自动安装第二份宿主；开发／类型检查／真实 SDK 测试仍需要匹配的 SDK。
+确认所用源码的 `package.json` 版本为 `0.6.2`。本项目把 OpenClaw 声明为 **optional peer**，避免在生产插件内部自动安装第二份宿主；开发／类型检查／真实 SDK 测试仍需要匹配的 SDK。
 
 若开发目录尚未提供精确 SDK，先从 [OpenClaw 官方仓库](https://github.com/openclaw/openclaw)的发行流程取得并验证上述 **2026.9.2 官方制品**，然后本地安装：
 
@@ -289,7 +291,7 @@ npm.cmd pack
 
 `--check` 只检查，不会应用补丁。未修改的匹配制品应报告 `unpatched`。如果所用 registry 没有这个版本，应使用已核验的精确官方制品，**不要猜测可用的 npm 版本、改用最新预览版或伪造 SDK 类型**。无法取得匹配制品时，应停止需要该 SDK 的构建／集成验证。
 
-`npm pack` 的 `prepack` 会再次执行构建，生成本地 `openclaw-dsh-native-0.6.1.tgz`。不要把开发目录中的 OpenClaw SDK、账号或会话状态随插件复制出去。
+`npm pack` 的 `prepack` 会再次执行构建，生成本地 `openclaw-dsh-native-0.6.2.tgz`。不要把开发目录中的 OpenClaw SDK、账号或会话状态随插件复制出去。
 
 ## 维护窗口安装与 Agent 级启用
 
@@ -313,7 +315,7 @@ openclaw gateway status --no-probe
 仍保持 Gateway 停止：
 
 ```powershell
-openclaw plugins install "C:\PATH\TO\openclaw-dsh-native-0.6.1.tgz" --force --accept-capabilities
+openclaw plugins install "C:\PATH\TO\openclaw-dsh-native-0.6.2.tgz" --force --accept-capabilities
 ```
 
 `--force` 用于确认本地来源／覆盖安装；`--accept-capabilities` 是官方安装器对声明能力的接受选项，**仅用于已审阅并信任的代码**，不是规避安全策略。先阅读安装器说明和能力提示，不要无条件接受陌生代码。归档安装会处理运行依赖；已有 provider 及认证应留在 OpenClaw，不填入插件设置。
@@ -322,7 +324,7 @@ openclaw plugins install "C:\PATH\TO\openclaw-dsh-native-0.6.1.tgz" --force --ac
 
 ```powershell
 New-Item -ItemType Directory -Path .\artifacts\prepared-dsh-native
-tar -xf .\openclaw-dsh-native-0.6.1.tgz -C .\artifacts\prepared-dsh-native
+tar -xf .\openclaw-dsh-native-0.6.2.tgz -C .\artifacts\prepared-dsh-native
 Push-Location .\artifacts\prepared-dsh-native\package
 npm.cmd ci --omit=dev
 Pop-Location

@@ -1,13 +1,42 @@
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
+import { spawn } from "node:child_process";
 import { appendFileSync } from "node:fs";
 import { cp, mkdir, readFile, symlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 export const HOST_COPILOT_AUTH_PLUGIN_ID = "github-copilot";
 export const HOST_COPILOT_AUTH_PROVIDER_ID = "github-copilot";
 export const HOST_COPILOT_AUTH_SOURCE_KEY = "fixture-source-key";
+export const HOST_COPILOT_AUTH_PROFILE_ID = "github-copilot:fixture";
+
+export async function prepareHostCopilotAuthProfiles(host, agents, env) {
+  const script = `
+import assert from "node:assert/strict";
+import { upsertAuthProfile, ensureAuthProfileStoreForLocalUpdate } from ${JSON.stringify(pathToFileURL(join(host, "dist/plugin-sdk/provider-auth.js")).href)};
+for (const agentDir of JSON.parse(process.argv[1])) {
+  upsertAuthProfile({ agentDir, profileId: ${JSON.stringify(HOST_COPILOT_AUTH_PROFILE_ID)},
+    credential: { provider: "github-copilot", type: "token", token: ${JSON.stringify(HOST_COPILOT_AUTH_SOURCE_KEY)} } });
+  assert.equal(ensureAuthProfileStoreForLocalUpdate(agentDir).profiles[${JSON.stringify(HOST_COPILOT_AUTH_PROFILE_ID)}].token,
+    ${JSON.stringify(HOST_COPILOT_AUTH_SOURCE_KEY)});
+}
+`;
+  await new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ["--input-type=module", "-e", script, JSON.stringify(agents.map((agent) => agent.agentDir))],
+      { env, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+    let output = "";
+    const timer = setTimeout(() => child.kill(), 60000);
+    child.stdout.on("data", (chunk) => { output += chunk.toString(); });
+    child.stderr.on("data", (chunk) => { output += chunk.toString(); });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (code === 0) resolve();
+      else reject(new Error(`Synthetic auth profile import failed: ${output}`));
+    });
+  });
+}
 
 export const HOST_COPILOT_AUTH_HEADERS = {
   "Copilot-Integration-Id": "copilot-developer-cli",
@@ -16,7 +45,7 @@ export const HOST_COPILOT_AUTH_HEADERS = {
 
 export const HOST_COPILOT_AUTH_MANIFEST = {
   id: HOST_COPILOT_AUTH_PLUGIN_ID,
-  activation: { onStartup: true },
+  activation: { onStartup: false },
   providers: [HOST_COPILOT_AUTH_PROVIDER_ID],
   configSchema: {
     type: "object",

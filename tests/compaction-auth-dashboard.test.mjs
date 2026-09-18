@@ -88,12 +88,13 @@ async function runTurn(gateway, sessionKey, message, answer, state) {
   return settled;
 }
 
-for (const { compactionAuthPatch, trigger } of [
+for (const { compactionAuthPatch, trigger, authProfile = false } of [
   { compactionAuthPatch: false, trigger: "manual" },
   { compactionAuthPatch: true, trigger: "manual" },
   { compactionAuthPatch: true, trigger: "preflight" },
+  { compactionAuthPatch: true, trigger: "manual", authProfile: true },
 ]) {
-test(`Copilot runtime-auth ${trigger} handoff ${compactionAuthPatch ? "prepares the account route and preserves source identity" : "reproduces the unpatched compaction route rejection"}`,
+test(`Copilot runtime-auth ${trigger} ${authProfile ? "profile" : "config"} handoff ${compactionAuthPatch ? "prepares the account route and preserves source identity" : "reproduces the unpatched compaction route rejection"}`,
   { timeout: TIMEOUT },
   async () => {
     const state = { summaryRequests: 0, foregroundRequests: 0, routes: [] };
@@ -135,6 +136,7 @@ test(`Copilot runtime-auth ${trigger} handoff ${compactionAuthPatch ? "prepares 
         input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 0 } });
     }, {
       copilotAuthFixture: true,
+      copilotAuthProfile: authProfile,
       compactionAuthPatch,
       modelContextWindow: 65536,
       hostTools: [],

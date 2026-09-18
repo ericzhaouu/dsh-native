@@ -13,9 +13,7 @@ async function prepareDshNativeCopilotCompactionRuntimeAuth(params) {
 \tparams.signal?.throwIfAborted();
 \tconst sourceApiKey = params.apiKey?.trim();
 \tif (!sourceApiKey) return;
-\tconst preparedAuth = protectPreparedProviderRuntimeAuth({
-\t\tprovider: params.provider,
-\t\tpreparedAuth: await prepareProviderRuntimeAuth({
+\tconst prepareRuntime = () => prepareProviderRuntimeAuth({
 \t\t\tprovider: params.provider,
 \t\t\tconfig: params.config,
 \t\t\tworkspaceDir: params.workspaceDir,
@@ -32,7 +30,10 @@ async function prepareDshNativeCopilotCompactionRuntimeAuth(params) {
 \t\t\t\tauthMode: params.authMode,
 \t\t\t\tprofileId: params.authProfileId ?? params.runtimeAuthPlan?.forwardedAuthProfileId
 \t\t\t}
-\t\t})
+\t\t});
+\tconst preparedAuth = protectPreparedProviderRuntimeAuth({
+\t\tprovider: params.provider,
+\t\tpreparedAuth: await withPluginRuntimeGenerationScope(params.preparedModelRuntime, prepareRuntime)
 \t});
 \tparams.signal?.throwIfAborted();
 \tif (!preparedAuth) return;
@@ -59,7 +60,7 @@ export const edits = [
       after: 'import { a as unwrapSecretSentinelsForProviderEgress, i as unwrapModelHeaderSentinelsForProviderEgress, t as protectPreparedProviderRuntimeAuth } from "./provider-secret-egress-C-JiHB7J.js";',
     }, {
       before: 'import { r as prepareAgentRuntimeAuth, t as agentRuntimeAuthPlanMatchesTarget } from "./prepare-auth-Ci9igqt8.js";',
-      after: 'import { r as prepareAgentRuntimeAuth, t as agentRuntimeAuthPlanMatchesTarget } from "./prepare-auth-Ci9igqt8.js";\nimport { t as applyPreparedRuntimeAuthToModel } from "./provider-request-config-DIOYidiO.js";\nimport { v as prepareProviderRuntimeAuth } from "./provider-runtime-BRJDPNgk.js";',
+      after: 'import { r as prepareAgentRuntimeAuth, t as agentRuntimeAuthPlanMatchesTarget } from "./prepare-auth-Ci9igqt8.js";\nimport { t as applyPreparedRuntimeAuthToModel } from "./provider-request-config-DIOYidiO.js";\nimport { v as prepareProviderRuntimeAuth } from "./provider-runtime-BRJDPNgk.js";\nimport { n as withPluginRuntimeGenerationScope } from "./generation-scope-Cf83d_iq.js";',
     }, {
       before: 'function runtimePlanRequiresHostApiKey(plan) {\n\treturn plan?.modelRoute?.authRequirement === "api-key";\n}',
       after: `function runtimePlanRequiresHostApiKey(plan) {\n\treturn plan?.modelRoute?.authRequirement === "api-key";\n}\n${compactionRuntimeAuthHelpers}`,
@@ -68,7 +69,7 @@ export const edits = [
       after: '\t\t\t\t\tauth: { apiKey: auth.auth.apiKey?.trim() || void 0, mode: auth.auth.mode, profileId: auth.auth.profileId }',
     }, {
       before: '\treturn {\n\t\tharness,\n\t\tapiKey: resolved.auth.apiKey,\n\t\truntimeModel: resolved.model,\n\t\truntimeAuthPlan: resolved.plan\n\t};',
-      after: `\tlet resolvedRuntimeModel = resolved.model;\n\tlet resolvedRuntimeAuthPlan = resolved.plan;\n\tconst preparedCompactionRuntimeAuth = await prepareDshNativeCopilotCompactionRuntimeAuth({\n\t\tagentDir,\n\t\tapiKey: resolved.auth.apiKey,\n\t\tauthMode: resolved.auth.mode ?? (resolved.plan.selectedAuthMode === "api_key" ? "api-key" : resolved.plan.selectedAuthMode),\n\t\tauthProfileId: resolved.auth.profileId ?? resolved.plan.forwardedAuthProfileId ?? compactParams.authProfileId,\n\t\tconfig: compactParams.config,\n\t\tharness,\n\t\tmodel: resolvedRuntimeModel,\n\t\tmodelId,\n\t\tprovider,\n\t\truntimeAuthPlan: resolvedRuntimeAuthPlan,\n\t\tsignal: compactParams.abortSignal,\n\t\tworkspaceDir\n\t});\n\tif (preparedCompactionRuntimeAuth) {\n\t\tresolvedRuntimeModel = preparedCompactionRuntimeAuth.runtimeModel;\n\t\tresolvedRuntimeAuthPlan = preparedCompactionRuntimeAuth.runtimeAuthPlan;\n\t}\n\treturn {\n\t\tharness,\n\t\tapiKey: resolved.auth.apiKey,\n\t\truntimeModel: resolvedRuntimeModel,\n\t\truntimeAuthPlan: resolvedRuntimeAuthPlan\n\t};`,
+      after: `\tlet resolvedRuntimeModel = resolved.model;\n\tlet resolvedRuntimeAuthPlan = resolved.plan;\n\tconst preparedCompactionRuntimeAuth = await prepareDshNativeCopilotCompactionRuntimeAuth({\n\t\tagentDir,\n\t\tapiKey: resolved.auth.apiKey,\n\t\tauthMode: resolved.auth.mode ?? (resolved.plan.selectedAuthMode === "api_key" ? "api-key" : resolved.plan.selectedAuthMode),\n\t\tauthProfileId: resolved.auth.profileId ?? resolved.plan.forwardedAuthProfileId ?? compactParams.authProfileId,\n\t\tconfig: compactParams.config,\n\t\tharness,\n\t\tmodel: resolvedRuntimeModel,\n\t\tmodelId,\n\t\tprovider,\n\t\tpreparedModelRuntime: params.preparedModelRuntime,\n\t\truntimeAuthPlan: resolvedRuntimeAuthPlan,\n\t\tsignal: compactParams.abortSignal,\n\t\tworkspaceDir\n\t});\n\tif (preparedCompactionRuntimeAuth) {\n\t\tresolvedRuntimeModel = preparedCompactionRuntimeAuth.runtimeModel;\n\t\tresolvedRuntimeAuthPlan = preparedCompactionRuntimeAuth.runtimeAuthPlan;\n\t}\n\treturn {\n\t\tharness,\n\t\tapiKey: resolved.auth.apiKey,\n\t\truntimeModel: resolvedRuntimeModel,\n\t\truntimeAuthPlan: resolvedRuntimeAuthPlan\n\t};`,
     }],
   },
 ];

@@ -10,7 +10,10 @@ import { t as GatewayClient } from "../../node_modules/openclaw/dist/client-I-Ro
 import { s as resolveRuntimeServiceBuildId, t as OPENCLAW_VERSION } from "../../node_modules/openclaw/dist/version-v1kuAkGj.js";
 import { startResponsesServer } from "./responses-server.mjs";
 import { createPatchedHostFixture, createPluginFixture } from "./patched-host.mjs";
-import { createHostCopilotAuthFixture, HOST_COPILOT_AUTH_PLUGIN_ID, HOST_COPILOT_AUTH_SOURCE_KEY } from "./host-copilot-auth-plugin.mjs";
+import {
+  createHostCopilotAuthFixture, HOST_COPILOT_AUTH_PLUGIN_ID, HOST_COPILOT_AUTH_SOURCE_KEY,
+  HOST_COPILOT_AUTH_PROFILE_ID, prepareHostCopilotAuthProfiles,
+} from "./host-copilot-auth-plugin.mjs";
 import { createHostSearchFixture, HOST_SEARCH_PLUGIN_ID, HOST_SEARCH_PROVIDER_ID } from "./host-search-plugin.mjs";
 import { createHostMemoryFixture, HOST_MEMORY_PLUGIN_ID } from "./host-memory-plugin.mjs";
 
@@ -155,7 +158,7 @@ export async function startDashboardGateway(responder, {
   hostTools, searchFixture = false, agentToolPolicy, agentId = AGENT_ID,
   additionalAgentIds = [], setupWorkspaces, modelContextWindow = 1_000_000,
   compaction, memoryFixture = false, copilotAuthFixture = false,
-  compactionAuthPatch = copilotAuthFixture,
+  compactionAuthPatch = copilotAuthFixture, copilotAuthProfile = false,
 } = {}) {
   assert.equal(OPENCLAW_VERSION, "2026.9.2", "Dashboard fixture must use the inspected genuine SDK");
   assert.ok(!copilotAuthFixture || agentPinned, "Synthetic provider replacement requires a private copied host");
@@ -268,6 +271,9 @@ export async function startDashboardGateway(responder, {
       discovery: { mdns: { mode: "off" } },
       update: { checkOnStart: false, auto: { enabled: false } },
       browser: { enabled: false },
+      ...(copilotAuthProfile ? { auth: { profiles: {
+        [HOST_COPILOT_AUTH_PROFILE_ID]: { provider: "github-copilot", mode: "token" },
+      } } } : {}),
       agents: {
         ...(additionalAgentIds.length > 0 ? { ownership: "explicit" } : {}),
         defaults: {
@@ -289,7 +295,7 @@ export async function startDashboardGateway(responder, {
           "github-copilot": {
             baseUrl: copilotAuth?.config.configuredBaseUrl ?? responses.baseUrl,
             api: "openai-responses",
-            apiKey: copilotAuth ? HOST_COPILOT_AUTH_SOURCE_KEY : "dashboard-not-a-real-key",
+            ...(copilotAuthProfile ? {} : { apiKey: copilotAuth ? HOST_COPILOT_AUTH_SOURCE_KEY : "dashboard-not-a-real-key" }),
             headers: { "Copilot-Integration-Id": "copilot-developer-cli" },
             models: [{
               id: MODEL_ID,
@@ -339,6 +345,13 @@ export async function startDashboardGateway(responder, {
         ...(redactTranscriptIdentity ? { redactPatterns: ["^github-copilot$", "^gpt-6-astra$"] } : {}) },
       diagnostics: { enabled: false },
     }));
+    if (copilotAuthProfile) {
+      assert.ok(copilotAuthFixture);
+      await prepareHostCopilotAuthProfiles(fixture.host, allAgents, {
+        ...envSubset(), HOME: home, USERPROFILE: home,
+        OPENCLAW_STATE_DIR: state, OPENCLAW_CONFIG_PATH: configPath,
+      });
+    }
     child = spawn(process.execPath, [
       "--import", pathToFileURL(join(packageRoot, "tests", "fixtures", "loopback-only.mjs")).href,
       "--import", pathToFileURL(networkGuard).href,

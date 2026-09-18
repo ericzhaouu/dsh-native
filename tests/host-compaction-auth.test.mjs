@@ -40,6 +40,7 @@ async function loadCompactionAuthHelpers() {
     "protectPreparedProviderRuntimeAuth",
     "applyPreparedRuntimeAuthToModel",
     "unwrapSecretSentinelsForProviderEgress",
+    "withPluginRuntimeGenerationScope",
     `${helperSource}
 return { shouldPrepareDshNativeCopilotCompactionRuntimeAuth, prepareDshNativeCopilotCompactionRuntimeAuth };`,
   )(
@@ -47,6 +48,7 @@ return { shouldPrepareDshNativeCopilotCompactionRuntimeAuth, prepareDshNativeCop
     mocks.protectPreparedProviderRuntimeAuth,
     mocks.applyPreparedRuntimeAuthToModel,
     mocks.unwrapSecretSentinelsForProviderEgress,
+    mocks.withPluginRuntimeGenerationScope ?? ((_snapshot, run) => run()),
   );
 }
 
@@ -256,4 +258,45 @@ test("runtime prep is skipped for non-targets and unavailable hooks, and throws/
   });
   await assert.rejects(aborting.prepareDshNativeCopilotCompactionRuntimeAuth(baseParams({ signal: controller.signal })),
     /revoked during preparation/u);
+});
+
+test("compaction runtime auth is bound to its prepared generation rather than an unrelated queue context", async () => {
+  const { pathToFileURL } = await import("node:url");
+  const load = (name) => import(pathToFileURL(join(genuineHost, "dist", name)));
+  const { n: withGeneration } = await load("generation-scope-Cf83d_iq.js");
+  const { t: emptyRegistry } = await load("registry-empty-55wlVNzO.js");
+  const { v: prepareProviderRuntimeAuth } = await load("provider-runtime-BRJDPNgk.js");
+  const ambient = { pluginRegistry: emptyRegistry(), metadataSnapshot: {} };
+  const prepared = { pluginRegistry: emptyRegistry(), metadataSnapshot: {} };
+  let calls = 0;
+  prepared.pluginRegistry.providers.push({
+    pluginId: "github-copilot",
+    provider: { id: "github-copilot", prepareRuntimeAuth: async (ctx) => {
+      calls++;
+      assert.equal(ctx.apiKey, "source-gh-token");
+      return { apiKey: "derived-runtime-key", baseUrl: "https://api.enterprise.githubcopilot.com",
+        request: { headers: { "Copilot-Integration-Id": "copilot-developer-cli" } } };
+    } },
+  });
+  const params = baseParams({ config: {}, preparedModelRuntime: prepared });
+  const makeHelpers = await loadCompactionAuthHelpers();
+  const helper = makeHelpers({
+    prepareProviderRuntimeAuth,
+    protectPreparedProviderRuntimeAuth: ({ preparedAuth }) => preparedAuth,
+    unwrapSecretSentinelsForProviderEgress: (value) => value,
+    applyPreparedRuntimeAuthToModel: (model, auth) => ({ ...model, baseUrl: auth.baseUrl, headers: auth.request.headers }),
+    withPluginRuntimeGenerationScope: withGeneration,
+  });
+  await withGeneration(ambient, async () => {
+    assert.equal(await prepareProviderRuntimeAuth({
+      provider: params.provider, config: params.config, workspaceDir: params.workspaceDir,
+      context: { apiKey: params.apiKey, model: params.model, modelId: params.modelId },
+    }), undefined, "The old ambient lookup must reproduce the missing provider hook");
+    assert.equal(calls, 0);
+    const result = await helper.prepareDshNativeCopilotCompactionRuntimeAuth(params);
+    assert.equal(calls, 1);
+    assert.equal(result.runtimeModel.baseUrl, "https://api.enterprise.githubcopilot.com");
+    assert.equal(result.runtimeAuthPlan.modelRoute.baseUrl, result.runtimeModel.baseUrl);
+    assert.equal(JSON.stringify(result).includes("derived-runtime-key"), false);
+  });
 });
