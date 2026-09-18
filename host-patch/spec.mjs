@@ -1,6 +1,7 @@
 export const PATCH_ID = "openclaw-agent-harness-pin-v1";
 export const HOST_VERSION = "2026.9.2";
 export const SOURCE_COMMIT = "3928bad9badfcb6c7d140530435e806fb8092190";
+export const stateName = ".dsh-agent-harness-patch";
 
 const agentResolver = `
 /** Agent-owned harness pin; model/provider/auth selection remains host-owned. */
