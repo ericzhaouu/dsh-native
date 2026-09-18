@@ -12,7 +12,7 @@ const config = {
   startupTimeoutMs: 1000,
   shutdownTimeoutMs: 1000,
   streamIdleTimeoutMs: 1000,
-  allowedBaseUrls: [],
+  allowedBaseUrls: ["https://api.deepseek.com"],
 };
 
 /** @returns {SupportContext} */
@@ -133,7 +133,7 @@ test("resolved credentials, provider-facing model and URL are preserved without 
   p.model.baseUrl = "https://api.deepseek.com/v1/";
   Object.freeze(p.model);
   Object.freeze(p);
-  assert.deepEqual(resolve(p), {
+  assert.deepEqual(resolve(p, { ...config, allowedBaseUrls: ["https://api.deepseek.com/v1"] }), {
     modelId: "deepseek-v4-pro",
     apiKey: "  exact-host-key  ",
     baseUrl: "https://api.deepseek.com/v1/",
@@ -208,11 +208,17 @@ test("SDK-attached transport metadata is rejected using the real public helper",
   assert.equal(resolve(p).apiKey, p.resolvedApiKey);
 });
 
-test("DeepSeek HTTPS origin is trusted but custom URLs need an exact allowlist entry", () => {
-  for (const baseUrl of ["https://api.deepseek.com", "https://api.deepseek.com/v1"]) {
+test("DeepSeek endpoints require exact normalized allowlist matches", () => {
+  for (const baseUrl of ["https://api.deepseek.com", "https://api.deepseek.com/"]) {
     const p = attempt();
     p.model.baseUrl = baseUrl;
     assert.equal(resolve(p).baseUrl, baseUrl);
+  }
+  for (const baseUrl of ["https://api.deepseek.com/v1", "https://api.deepseek.com/unexpected/path"]) {
+    const p = attempt();
+    p.model.baseUrl = baseUrl;
+    assert.throws(() => resolve(p), /exact allowedBaseUrls/u);
+    assert.equal(resolve(p, { ...config, allowedBaseUrls: [baseUrl] }).baseUrl, baseUrl);
   }
   const p = attempt();
   for (const baseUrl of [
@@ -228,6 +234,18 @@ test("DeepSeek HTTPS origin is trusted but custom URLs need an exact allowlist e
     assert.throws(() => resolve(p, { ...config, allowedBaseUrls: [allowed] }), /not allowed/u);
   }
   assert.equal(resolve(p, { ...config, allowedBaseUrls: ["https://proxy.test/v1/"] }).baseUrl, p.model.baseUrl);
+  p.model.baseUrl = "https://proxy.test/v1/";
+  assert.equal(resolve(p, { ...config, allowedBaseUrls: ["https://proxy.test/v1"] }).baseUrl, p.model.baseUrl);
+  for (const baseUrl of [
+    "https://proxy.test/v1?key=fixture-secret", "https://proxy.test/v1#fragment",
+    "https://user:fixture-secret@proxy.test/v1",
+  ]) {
+    p.model.baseUrl = baseUrl;
+    assert.throws(() => resolve(p, { ...config, allowedBaseUrls: [baseUrl] }), (error) => {
+      assert.doesNotMatch(error.message, /fixture-secret/u);
+      return true;
+    });
+  }
 });
 
 test("unsafe URLs fail even when explicitly allowlisted, without echoing secrets", () => {

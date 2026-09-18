@@ -103,11 +103,13 @@ test("attaches in public setup before synchronous running/turn-start, streams be
   assert.throws(() => h.tracker.result(h.agent.id, false, 0), /whenIdle/);
   release.resolve();
   const result = await h.settle();
-  assert.deepEqual(result, {
-    text: "Hello", reasoning: "Think",
-    usage: { input: 7, output: 3, cacheRead: 11, cacheWrite: 2 },
-    stopReason: "stop", sessionId: h.agent.id, toolCalls: 0,
-  });
+    assert.deepEqual(result, {
+      text: "Hello", reasoning: "Think",
+      usage: { input: 7, output: 3, cacheRead: 11, cacheWrite: 2 },
+      contextUsage: { state: "available", promptTokens: 20, totalTokens: 23 },
+      lastCallUsage: { input: 7, output: 3, cacheRead: 11, cacheWrite: 2 },
+      stopReason: "stop", sessionId: h.agent.id, toolCalls: 0,
+    });
   assert.equal(result.text, channel(h.events, "text"));
   assert.equal(result.reasoning, channel(h.events, "reasoning"));
   assert.equal(h.events.filter((event) => event.type === "usage").length, 1);
@@ -151,6 +153,8 @@ test("concatenates tool-loop responses and emits only the last usage snapshot pe
     { input: 7, output: 3, cacheRead: 11, cacheWrite: 2 },
     { input: 2, output: 5, cacheRead: 13, cacheWrite: 1 },
   ]);
+  assert.deepEqual(result.contextUsage, { state: "available", promptTokens: 16, totalTokens: 21 });
+  assert.deepEqual(result.lastCallUsage, { input: 2, output: 5, cacheRead: 13, cacheWrite: 1 });
   assert.deepEqual(h.tracker.result(h.agent.id, false, 1), result);
   result.usage.input = 999;
   assert.equal(h.tracker.result(h.agent.id, false, 1).usage.input, 9);
@@ -169,6 +173,8 @@ test("block-end and committed message do not duplicate deltas; final-only suffix
   assert.equal(result.text, "Hello world");
   assert.deepEqual(h.events.filter((event) => event.type === "text").map((event) => event.text), ["Hello", " world"]);
   assert.deepEqual(result.usage, zero);
+  assert.deepEqual(result.contextUsage, { state: "unavailable" });
+  assert.equal(Object.hasOwn(result, "lastCallUsage"), false);
 });
 
 test("actual max-tokens turn ending is length", async (t) => {
@@ -326,7 +332,8 @@ test("pre-step cancellation has no invented output and no-stream cancellation ca
   h.agent.followup(prompt());
   h.agent.cancel({ kind: "user" });
   assert.deepEqual(await h.settle(true), {
-    text: "", usage: zero, stopReason: "aborted", sessionId: h.agent.id, toolCalls: 0,
+    text: "", usage: zero, contextUsage: { state: "unavailable" },
+    stopReason: "aborted", sessionId: h.agent.id, toolCalls: 0,
   });
   const idle = await harness(t);
   assert.equal((await idle.settle(true)).stopReason, "aborted");

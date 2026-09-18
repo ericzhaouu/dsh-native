@@ -97,8 +97,8 @@ export function renderHostToolNotices(notices: readonly HostToolNotice[]): strin
   return [
     "## Host tool availability",
     ...notices.slice(0, MAX_NOTICES).map(({ name, reason }) => `${name}: ${reason}.`),
-    "Unavailable-or-denied does not distinguish installation, authentication, or policy status.",
-    "Do not repeatedly request clarification for missing tools or use exec, another dispatcher, or an alternate provider to work around their absence. Explain the limitation and continue only with available capabilities.",
+    "Unavailable-or-denied does not distinguish installation, authentication, or policy status; do not claim CLI or alternate dispatch is authorized from this notice alone.",
+    "Do not repeatedly request clarification for missing tools. If an independently supplied host exec tool exists, it may use only existing host-authorized CLI for an otherwise authorized operation; never use it or another dispatcher/provider to evade an explicit denial, create credentials/connections, install capability, or invent network access. Explain unresolved limitations clearly.",
   ].join("\n");
 }
 

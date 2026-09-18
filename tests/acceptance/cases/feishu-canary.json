@@ -1,0 +1,874 @@
+{
+  "schemaVersion": "approved1.0testplan.acceptanceCorpus.v1",
+  "corpusKind": "feishu_canary",
+  "runnerIntegration": {
+    "proposedFormat": "manifest-driven node:test acceptance runner reads schema, expands variants and scripts, then records execution_status/business_result/authority_and_safety/skill_behavior without marking data-only cases passed",
+    "defaultMaxHostCalls": 24,
+    "submissionCountFormula": "singleTurn.cases*3 + multiTurn.turns + canary.cases",
+    "resultFields": [
+      "execution_status",
+      "business_result",
+      "authority_and_safety",
+      "skill_behavior",
+      "delivery",
+      "latency",
+      "usage"
+    ]
+  },
+  "cases": [
+    {
+      "caseId": "canary-dsh-assistant-01",
+      "schemaVersion": "approved1.0testplan.acceptanceCorpus.v1",
+      "layer": "L4-actual-feishu-canary",
+      "agentProfile": {
+        "agentId": "dsh-assistant",
+        "displayName": "Generic Assistant Agent",
+        "skillAllowlist": [
+          "content-distill"
+        ]
+      },
+      "taskClass": "feishu_channel_delivery_plain-nonce",
+      "critical": true,
+      "prerequisites": [
+        "live-feishu-canary-approved",
+        "dedicated-test-chat-resolved",
+        "private-logical-resource-map-present",
+        "no-production-resource-identifiers-in-corpus"
+      ],
+      "fixtures": [
+        "private-feishu-canary-map"
+      ],
+      "maxHostCalls": 24,
+      "modelVisible": {
+        "language": "zh-CN",
+        "text": "助手通道：请用普通中文回复测试口令“青松-417”，只回一句确认，不发送任何外部消息。",
+        "fixtureRefs": [
+          "private-feishu-canary-map"
+        ]
+      },
+      "expected": {
+        "modes": [
+          "chat",
+          "draft"
+        ],
+        "permittedOutcomes": [
+          "completed"
+        ]
+      },
+      "oracle": {
+        "businessAssertions": [
+          "if gated, reports prerequisite block instead of pass",
+          "if authorized, sends only to dedicated test chat"
+        ],
+        "safetyAssertions": [
+          "no production chat/resource use",
+          "no duplicate terminal output",
+          "no model-callable messaging tool; ordinary channel delivery only"
+        ],
+        "forbiddenEffects": [
+          "no real business write",
+          "no uncontrolled network access",
+          "no secret disclosure"
+        ],
+        "answerChecks": [],
+        "delivery": {
+          "requireReadbackReceipt": true
+        },
+        "modelVisibleRequiredTokens": [
+          "青松-417",
+          "确认"
+        ]
+      },
+      "adapterControls": [
+        {
+          "type": "plain-nonce",
+          "visibleToModel": false,
+          "prerequisiteGateBeforeDelivery": true
+        }
+      ],
+      "prerequisiteFailureOutcome": "infrastructure_blocked"
+    },
+    {
+      "caseId": "canary-dsh-assistant-02",
+      "schemaVersion": "approved1.0testplan.acceptanceCorpus.v1",
+      "layer": "L4-actual-feishu-canary",
+      "agentProfile": {
+        "agentId": "dsh-assistant",
+        "displayName": "Generic Assistant Agent",
+        "skillAllowlist": [
+          "content-distill"
+        ]
+      },
+      "taskClass": "feishu_channel_delivery_unicode-format",
+      "critical": true,
+      "prerequisites": [
+        "live-feishu-canary-approved",
+        "dedicated-test-chat-resolved",
+        "private-logical-resource-map-present",
+        "no-production-resource-identifiers-in-corpus"
+      ],
+      "fixtures": [
+        "private-feishu-canary-map"
+      ],
+      "maxHostCalls": 24,
+      "modelVisible": {
+        "language": "zh-CN",
+        "text": "助手通道：请按格式输出：状态=就绪；符号=雪花❄；数字=908。不要访问业务资源。",
+        "fixtureRefs": [
+          "private-feishu-canary-map"
+        ]
+      },
+      "expected": {
+        "modes": [
+          "chat",
+          "draft"
+        ],
+        "permittedOutcomes": [
+          "completed"
+        ]
+      },
+      "oracle": {
+        "businessAssertions": [
+          "if gated, reports prerequisite block instead of pass",
+          "if authorized, sends only to dedicated test chat"
+        ],
+        "safetyAssertions": [
+          "no production chat/resource use",
+          "no duplicate terminal output",
+          "no model-callable messaging tool; ordinary channel delivery only"
+        ],
+        "forbiddenEffects": [
+          "no real business write",
+          "no uncontrolled network access",
+          "no secret disclosure"
+        ],
+        "answerChecks": [],
+        "delivery": {
+          "requireReadbackReceipt": true
+        },
+        "modelVisibleRequiredTokens": [
+          "雪花",
+          "908"
+        ]
+      },
+      "adapterControls": [
+        {
+          "type": "unicode-format",
+          "visibleToModel": false,
+          "prerequisiteGateBeforeDelivery": true
+        }
+      ],
+      "prerequisiteFailureOutcome": "infrastructure_blocked"
+    },
+    {
+      "caseId": "canary-dsh-assistant-03",
+      "schemaVersion": "approved1.0testplan.acceptanceCorpus.v1",
+      "layer": "L4-actual-feishu-canary",
+      "agentProfile": {
+        "agentId": "dsh-assistant",
+        "displayName": "Generic Assistant Agent",
+        "skillAllowlist": [
+          "content-distill"
+        ]
+      },
+      "taskClass": "feishu_channel_delivery_long-bounded",
+      "critical": true,
+      "prerequisites": [
+        "live-feishu-canary-approved",
+        "dedicated-test-chat-resolved",
+        "private-logical-resource-map-present",
+        "no-production-resource-identifiers-in-corpus"
+      ],
+      "fixtures": [
+        "private-feishu-canary-map"
+      ],
+      "maxHostCalls": 24,
+      "modelVisible": {
+        "language": "zh-CN",
+        "text": "助手通道：请在120字以内概括本次通道健康检查的可见输入：仅包含合成文本、无业务数据、需前置授权。",
+        "fixtureRefs": [
+          "private-feishu-canary-map"
+        ]
+      },
+      "expected": {
+        "modes": [
+          "chat",
+          "draft"
+        ],
+        "permittedOutcomes": [
+          "completed"
+        ]
+      },
+      "oracle": {
+        "businessAssertions": [
+          "if gated, reports prerequisite block instead of pass",
+          "if authorized, sends only to dedicated test chat"
+        ],
+        "safetyAssertions": [
+          "no production chat/resource use",
+          "no duplicate terminal output",
+          "no model-callable messaging tool; ordinary channel delivery only"
+        ],
+        "forbiddenEffects": [
+          "no real business write",
+          "no uncontrolled network access",
+          "no secret disclosure"
+        ],
+        "answerChecks": [],
+        "delivery": {
+          "requireReadbackReceipt": true
+        },
+        "modelVisibleRequiredTokens": [
+          "120字",
+          "合成文本"
+        ]
+      },
+      "adapterControls": [
+        {
+          "type": "long-bounded",
+          "visibleToModel": false,
+          "prerequisiteGateBeforeDelivery": true
+        }
+      ],
+      "prerequisiteFailureOutcome": "infrastructure_blocked"
+    },
+    {
+      "caseId": "canary-dsh-assistant-04",
+      "schemaVersion": "approved1.0testplan.acceptanceCorpus.v1",
+      "layer": "L4-actual-feishu-canary",
+      "agentProfile": {
+        "agentId": "dsh-assistant",
+        "displayName": "Generic Assistant Agent",
+        "skillAllowlist": [
+          "content-distill"
+        ]
+      },
+      "taskClass": "feishu_channel_delivery_new-reset-prompt",
+      "critical": true,
+      "prerequisites": [
+        "live-feishu-canary-approved",
+        "dedicated-test-chat-resolved",
+        "private-logical-resource-map-present",
+        "no-production-resource-identifiers-in-corpus"
+      ],
+      "fixtures": [
+        "private-feishu-canary-map"
+      ],
+      "maxHostCalls": 24,
+      "modelVisible": {
+        "language": "zh-CN",
+        "text": "助手通道：适配器已完成/new重置；现在请回答“新上下文收到：蓝石-52”，不要引用旧消息。",
+        "fixtureRefs": [
+          "private-feishu-canary-map"
+        ]
+      },
+      "expected": {
+        "modes": [
+          "chat",
+          "draft"
+        ],
+        "permittedOutcomes": [
+          "completed"
+        ]
+      },
+      "oracle": {
+        "businessAssertions": [
+          "if gated, reports prerequisite block instead of pass",
+          "if authorized, sends only to dedicated test chat"
+        ],
+        "safetyAssertions": [
+          "no production chat/resource use",
+          "no duplicate terminal output",
+          "no model-callable messaging tool; ordinary channel delivery only"
+        ],
+        "forbiddenEffects": [
+          "no real business write",
+          "no uncontrolled network access",
+          "no secret disclosure"
+        ],
+        "answerChecks": [],
+        "delivery": {
+          "requireReadbackReceipt": true
+        },
+        "modelVisibleRequiredTokens": [
+          "蓝石-52",
+          "新上下文"
+        ]
+      },
+      "adapterControls": [
+        {
+          "type": "new-reset-prompt",
+          "visibleToModel": false,
+          "prerequisiteGateBeforeDelivery": true
+        }
+      ],
+      "prerequisiteFailureOutcome": "infrastructure_blocked"
+    },
+    {
+      "caseId": "canary-dsh-assistant-05",
+      "schemaVersion": "approved1.0testplan.acceptanceCorpus.v1",
+      "layer": "L4-actual-feishu-canary",
+      "agentProfile": {
+        "agentId": "dsh-assistant",
+        "displayName": "Generic Assistant Agent",
+        "skillAllowlist": [
+          "content-distill"
+        ]
+      },
+      "taskClass": "feishu_channel_delivery_duplicate-replay",
+      "critical": true,
+      "prerequisites": [
+        "live-feishu-canary-approved",
+        "dedicated-test-chat-resolved",
+        "private-logical-resource-map-present",
+        "test-write-authorization-required",
+        "no-production-resource-identifiers-in-corpus"
+      ],
+      "fixtures": [
+        "private-feishu-canary-map"
+      ],
+      "maxHostCalls": 24,
+      "modelVisible": {
+        "language": "zh-CN",
+        "text": "助手通道：如果同一条入站消息被适配器重复投递，请只产生一次答复：复述“单次回执-73”。",
+        "fixtureRefs": [
+          "private-feishu-canary-map"
+        ]
+      },
+      "expected": {
+        "modes": [
+          "chat",
+          "draft"
+        ],
+        "permittedOutcomes": [
+          "completed"
+        ]
+      },
+      "oracle": {
+        "businessAssertions": [
+          "if gated, reports prerequisite block instead of pass",
+          "if authorized, sends only to dedicated test chat"
+        ],
+        "safetyAssertions": [
+          "no production chat/resource use",
+          "no duplicate terminal output",
+          "no model-callable messaging tool; ordinary channel delivery only"
+        ],
+        "forbiddenEffects": [
+          "no real business write",
+          "no uncontrolled network access",
+          "no secret disclosure"
+        ],
+        "answerChecks": [],
+        "delivery": {
+          "requireReadbackReceipt": true
+        },
+        "modelVisibleRequiredTokens": [
+          "单次回执-73",
+          "一次"
+        ]
+      },
+      "adapterControls": [
+        {
+          "type": "duplicate-replay",
+          "visibleToModel": false,
+          "prerequisiteGateBeforeDelivery": true
+        }
+      ],
+      "prerequisiteFailureOutcome": "infrastructure_blocked"
+    },
+    {
+      "caseId": "canary-dsh-assistant-06",
+      "schemaVersion": "approved1.0testplan.acceptanceCorpus.v1",
+      "layer": "L4-actual-feishu-canary",
+      "agentProfile": {
+        "agentId": "dsh-assistant",
+        "displayName": "Generic Assistant Agent",
+        "skillAllowlist": [
+          "content-distill"
+        ]
+      },
+      "taskClass": "feishu_channel_delivery_reconnect-card",
+      "critical": true,
+      "prerequisites": [
+        "live-feishu-canary-approved",
+        "dedicated-test-chat-resolved",
+        "private-logical-resource-map-present",
+        "no-production-resource-identifiers-in-corpus"
+      ],
+      "fixtures": [
+        "private-feishu-canary-map"
+      ],
+      "maxHostCalls": 24,
+      "modelVisible": {
+        "language": "zh-CN",
+        "text": "助手通道：通道重连或卡片失败由适配器观察；你只需文本回答“已收到重连测试-19”。",
+        "fixtureRefs": [
+          "private-feishu-canary-map"
+        ]
+      },
+      "expected": {
+        "modes": [
+          "chat",
+          "draft"
+        ],
+        "permittedOutcomes": [
+          "completed"
+        ]
+      },
+      "oracle": {
+        "businessAssertions": [
+          "if gated, reports prerequisite block instead of pass",
+          "if authorized, sends only to dedicated test chat"
+        ],
+        "safetyAssertions": [
+          "no production chat/resource use",
+          "no duplicate terminal output",
+          "no model-callable messaging tool; ordinary channel delivery only"
+        ],
+        "forbiddenEffects": [
+          "no real business write",
+          "no uncontrolled network access",
+          "no secret disclosure"
+        ],
+        "answerChecks": [],
+        "delivery": {
+          "requireReadbackReceipt": true
+        },
+        "modelVisibleRequiredTokens": [
+          "重连测试-19",
+          "文本"
+        ]
+      },
+      "adapterControls": [
+        {
+          "type": "reconnect-card",
+          "visibleToModel": false,
+          "prerequisiteGateBeforeDelivery": true
+        }
+      ],
+      "prerequisiteFailureOutcome": "infrastructure_blocked"
+    },
+    {
+      "caseId": "canary-dsh-partner-01",
+      "schemaVersion": "approved1.0testplan.acceptanceCorpus.v1",
+      "layer": "L4-actual-feishu-canary",
+      "agentProfile": {
+        "agentId": "dsh-partner",
+        "displayName": "Generic Partner Agent",
+        "skillAllowlist": []
+      },
+      "taskClass": "feishu_channel_delivery_plain-nonce",
+      "critical": true,
+      "prerequisites": [
+        "live-feishu-canary-approved",
+        "dedicated-test-chat-resolved",
+        "private-logical-resource-map-present",
+        "no-production-resource-identifiers-in-corpus"
+      ],
+      "fixtures": [
+        "private-feishu-canary-map"
+      ],
+      "maxHostCalls": 24,
+      "modelVisible": {
+        "language": "zh-CN",
+        "text": "伙伴通道：请用普通中文回复测试口令“青松-417”，只回一句确认，不发送任何外部消息。",
+        "fixtureRefs": [
+          "private-feishu-canary-map"
+        ]
+      },
+      "expected": {
+        "modes": [
+          "chat",
+          "draft"
+        ],
+        "permittedOutcomes": [
+          "completed"
+        ]
+      },
+      "oracle": {
+        "businessAssertions": [
+          "if gated, reports prerequisite block instead of pass",
+          "if authorized, sends only to dedicated test chat"
+        ],
+        "safetyAssertions": [
+          "no production chat/resource use",
+          "no duplicate terminal output",
+          "no model-callable messaging tool; ordinary channel delivery only"
+        ],
+        "forbiddenEffects": [
+          "no real business write",
+          "no uncontrolled network access",
+          "no secret disclosure"
+        ],
+        "answerChecks": [],
+        "delivery": {
+          "requireReadbackReceipt": true
+        },
+        "modelVisibleRequiredTokens": [
+          "青松-417",
+          "确认"
+        ]
+      },
+      "adapterControls": [
+        {
+          "type": "plain-nonce",
+          "visibleToModel": false,
+          "prerequisiteGateBeforeDelivery": true
+        }
+      ],
+      "prerequisiteFailureOutcome": "infrastructure_blocked"
+    },
+    {
+      "caseId": "canary-dsh-partner-02",
+      "schemaVersion": "approved1.0testplan.acceptanceCorpus.v1",
+      "layer": "L4-actual-feishu-canary",
+      "agentProfile": {
+        "agentId": "dsh-partner",
+        "displayName": "Generic Partner Agent",
+        "skillAllowlist": []
+      },
+      "taskClass": "feishu_channel_delivery_unicode-format",
+      "critical": true,
+      "prerequisites": [
+        "live-feishu-canary-approved",
+        "dedicated-test-chat-resolved",
+        "private-logical-resource-map-present",
+        "no-production-resource-identifiers-in-corpus"
+      ],
+      "fixtures": [
+        "private-feishu-canary-map"
+      ],
+      "maxHostCalls": 24,
+      "modelVisible": {
+        "language": "zh-CN",
+        "text": "伙伴通道：请按格式输出：状态=就绪；符号=雪花❄；数字=908。不要访问业务资源。",
+        "fixtureRefs": [
+          "private-feishu-canary-map"
+        ]
+      },
+      "expected": {
+        "modes": [
+          "chat",
+          "draft"
+        ],
+        "permittedOutcomes": [
+          "completed"
+        ]
+      },
+      "oracle": {
+        "businessAssertions": [
+          "if gated, reports prerequisite block instead of pass",
+          "if authorized, sends only to dedicated test chat"
+        ],
+        "safetyAssertions": [
+          "no production chat/resource use",
+          "no duplicate terminal output",
+          "no model-callable messaging tool; ordinary channel delivery only"
+        ],
+        "forbiddenEffects": [
+          "no real business write",
+          "no uncontrolled network access",
+          "no secret disclosure"
+        ],
+        "answerChecks": [],
+        "delivery": {
+          "requireReadbackReceipt": true
+        },
+        "modelVisibleRequiredTokens": [
+          "雪花",
+          "908"
+        ]
+      },
+      "adapterControls": [
+        {
+          "type": "unicode-format",
+          "visibleToModel": false,
+          "prerequisiteGateBeforeDelivery": true
+        }
+      ],
+      "prerequisiteFailureOutcome": "infrastructure_blocked"
+    },
+    {
+      "caseId": "canary-dsh-partner-03",
+      "schemaVersion": "approved1.0testplan.acceptanceCorpus.v1",
+      "layer": "L4-actual-feishu-canary",
+      "agentProfile": {
+        "agentId": "dsh-partner",
+        "displayName": "Generic Partner Agent",
+        "skillAllowlist": []
+      },
+      "taskClass": "feishu_channel_delivery_long-bounded",
+      "critical": true,
+      "prerequisites": [
+        "live-feishu-canary-approved",
+        "dedicated-test-chat-resolved",
+        "private-logical-resource-map-present",
+        "no-production-resource-identifiers-in-corpus"
+      ],
+      "fixtures": [
+        "private-feishu-canary-map"
+      ],
+      "maxHostCalls": 24,
+      "modelVisible": {
+        "language": "zh-CN",
+        "text": "伙伴通道：请在120字以内概括本次通道健康检查的可见输入：仅包含合成文本、无业务数据、需前置授权。",
+        "fixtureRefs": [
+          "private-feishu-canary-map"
+        ]
+      },
+      "expected": {
+        "modes": [
+          "chat",
+          "draft"
+        ],
+        "permittedOutcomes": [
+          "completed"
+        ]
+      },
+      "oracle": {
+        "businessAssertions": [
+          "if gated, reports prerequisite block instead of pass",
+          "if authorized, sends only to dedicated test chat"
+        ],
+        "safetyAssertions": [
+          "no production chat/resource use",
+          "no duplicate terminal output",
+          "no model-callable messaging tool; ordinary channel delivery only"
+        ],
+        "forbiddenEffects": [
+          "no real business write",
+          "no uncontrolled network access",
+          "no secret disclosure"
+        ],
+        "answerChecks": [],
+        "delivery": {
+          "requireReadbackReceipt": true
+        },
+        "modelVisibleRequiredTokens": [
+          "120字",
+          "合成文本"
+        ]
+      },
+      "adapterControls": [
+        {
+          "type": "long-bounded",
+          "visibleToModel": false,
+          "prerequisiteGateBeforeDelivery": true
+        }
+      ],
+      "prerequisiteFailureOutcome": "infrastructure_blocked"
+    },
+    {
+      "caseId": "canary-dsh-partner-04",
+      "schemaVersion": "approved1.0testplan.acceptanceCorpus.v1",
+      "layer": "L4-actual-feishu-canary",
+      "agentProfile": {
+        "agentId": "dsh-partner",
+        "displayName": "Generic Partner Agent",
+        "skillAllowlist": []
+      },
+      "taskClass": "feishu_channel_delivery_new-reset-prompt",
+      "critical": true,
+      "prerequisites": [
+        "live-feishu-canary-approved",
+        "dedicated-test-chat-resolved",
+        "private-logical-resource-map-present",
+        "no-production-resource-identifiers-in-corpus"
+      ],
+      "fixtures": [
+        "private-feishu-canary-map"
+      ],
+      "maxHostCalls": 24,
+      "modelVisible": {
+        "language": "zh-CN",
+        "text": "伙伴通道：适配器已完成/new重置；现在请回答“新上下文收到：蓝石-52”，不要引用旧消息。",
+        "fixtureRefs": [
+          "private-feishu-canary-map"
+        ]
+      },
+      "expected": {
+        "modes": [
+          "chat",
+          "draft"
+        ],
+        "permittedOutcomes": [
+          "completed"
+        ]
+      },
+      "oracle": {
+        "businessAssertions": [
+          "if gated, reports prerequisite block instead of pass",
+          "if authorized, sends only to dedicated test chat"
+        ],
+        "safetyAssertions": [
+          "no production chat/resource use",
+          "no duplicate terminal output",
+          "no model-callable messaging tool; ordinary channel delivery only"
+        ],
+        "forbiddenEffects": [
+          "no real business write",
+          "no uncontrolled network access",
+          "no secret disclosure"
+        ],
+        "answerChecks": [],
+        "delivery": {
+          "requireReadbackReceipt": true
+        },
+        "modelVisibleRequiredTokens": [
+          "蓝石-52",
+          "新上下文"
+        ]
+      },
+      "adapterControls": [
+        {
+          "type": "new-reset-prompt",
+          "visibleToModel": false,
+          "prerequisiteGateBeforeDelivery": true
+        }
+      ],
+      "prerequisiteFailureOutcome": "infrastructure_blocked"
+    },
+    {
+      "caseId": "canary-dsh-partner-05",
+      "schemaVersion": "approved1.0testplan.acceptanceCorpus.v1",
+      "layer": "L4-actual-feishu-canary",
+      "agentProfile": {
+        "agentId": "dsh-partner",
+        "displayName": "Generic Partner Agent",
+        "skillAllowlist": []
+      },
+      "taskClass": "feishu_channel_delivery_duplicate-replay",
+      "critical": true,
+      "prerequisites": [
+        "live-feishu-canary-approved",
+        "dedicated-test-chat-resolved",
+        "private-logical-resource-map-present",
+        "test-write-authorization-required",
+        "no-production-resource-identifiers-in-corpus"
+      ],
+      "fixtures": [
+        "private-feishu-canary-map"
+      ],
+      "maxHostCalls": 24,
+      "modelVisible": {
+        "language": "zh-CN",
+        "text": "伙伴通道：如果同一条入站消息被适配器重复投递，请只产生一次答复：复述“单次回执-73”。",
+        "fixtureRefs": [
+          "private-feishu-canary-map"
+        ]
+      },
+      "expected": {
+        "modes": [
+          "chat",
+          "draft"
+        ],
+        "permittedOutcomes": [
+          "completed"
+        ]
+      },
+      "oracle": {
+        "businessAssertions": [
+          "if gated, reports prerequisite block instead of pass",
+          "if authorized, sends only to dedicated test chat"
+        ],
+        "safetyAssertions": [
+          "no production chat/resource use",
+          "no duplicate terminal output",
+          "no model-callable messaging tool; ordinary channel delivery only"
+        ],
+        "forbiddenEffects": [
+          "no real business write",
+          "no uncontrolled network access",
+          "no secret disclosure"
+        ],
+        "answerChecks": [],
+        "delivery": {
+          "requireReadbackReceipt": true
+        },
+        "modelVisibleRequiredTokens": [
+          "单次回执-73",
+          "一次"
+        ]
+      },
+      "adapterControls": [
+        {
+          "type": "duplicate-replay",
+          "visibleToModel": false,
+          "prerequisiteGateBeforeDelivery": true
+        }
+      ],
+      "prerequisiteFailureOutcome": "infrastructure_blocked"
+    },
+    {
+      "caseId": "canary-dsh-partner-06",
+      "schemaVersion": "approved1.0testplan.acceptanceCorpus.v1",
+      "layer": "L4-actual-feishu-canary",
+      "agentProfile": {
+        "agentId": "dsh-partner",
+        "displayName": "Generic Partner Agent",
+        "skillAllowlist": []
+      },
+      "taskClass": "feishu_channel_delivery_reconnect-card",
+      "critical": true,
+      "prerequisites": [
+        "live-feishu-canary-approved",
+        "dedicated-test-chat-resolved",
+        "private-logical-resource-map-present",
+        "no-production-resource-identifiers-in-corpus"
+      ],
+      "fixtures": [
+        "private-feishu-canary-map"
+      ],
+      "maxHostCalls": 24,
+      "modelVisible": {
+        "language": "zh-CN",
+        "text": "伙伴通道：通道重连或卡片失败由适配器观察；你只需文本回答“已收到重连测试-19”。",
+        "fixtureRefs": [
+          "private-feishu-canary-map"
+        ]
+      },
+      "expected": {
+        "modes": [
+          "chat",
+          "draft"
+        ],
+        "permittedOutcomes": [
+          "completed"
+        ]
+      },
+      "oracle": {
+        "businessAssertions": [
+          "if gated, reports prerequisite block instead of pass",
+          "if authorized, sends only to dedicated test chat"
+        ],
+        "safetyAssertions": [
+          "no production chat/resource use",
+          "no duplicate terminal output",
+          "no model-callable messaging tool; ordinary channel delivery only"
+        ],
+        "forbiddenEffects": [
+          "no real business write",
+          "no uncontrolled network access",
+          "no secret disclosure"
+        ],
+        "answerChecks": [],
+        "delivery": {
+          "requireReadbackReceipt": true
+        },
+        "modelVisibleRequiredTokens": [
+          "重连测试-19",
+          "文本"
+        ]
+      },
+      "adapterControls": [
+        {
+          "type": "reconnect-card",
+          "visibleToModel": false,
+          "prerequisiteGateBeforeDelivery": true
+        }
+      ],
+      "prerequisiteFailureOutcome": "infrastructure_blocked"
+    }
+  ]
+}

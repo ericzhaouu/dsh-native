@@ -102,7 +102,9 @@ export function renderNativeSystemPrompt(params: {
     `Workspace: ${params.workspaceDir}\nWorking directory: ${params.cwd}\nWorkspace instruction root: ${params.bootstrapWorkspaceDir}`,
     `Available policy-filtered host tools: ${params.toolNames.join(", ") || "(none)"}.`,
     params.genericTools
-      ? "Use only exact names in the available tool list. Never substitute exec or another provider/dispatcher for an unavailable tool."
+      ? params.toolNames.includes("exec")
+        ? "Use only exact names in the available tool list. The exposed host exec callback may run existing host-authorized CLI when the task authorizes the operation and host approvals permit; absence of a dedicated business tool name alone is not a denial. Never use CLI, another provider, or another dispatcher to evade explicit denial, create credentials/connections, install capability, switch accounts, or invent network access."
+        : "Use only exact names in the available tool list. No exec callback is available; missing tools are limitations, not permission to use another provider or dispatcher."
       : params.toolNames.includes("exec")
       ? "For content or filename searches, use an available grep/glob tool, or the policy-controlled host exec tool. There is no separate native search capability."
       : "Do not invent shell or search capabilities that are not in the available tool list.",
@@ -117,7 +119,7 @@ export function renderNativeSystemPrompt(params: {
       : "No workspace bootstrap files were supplied.",
     ...params.contextFiles.map((file) => `## Workspace context: ${file.path}\n${file.content}`),
     params.skillsPrompt
-      ? `## Skills\nConsult relevant skill instructions using the host read tool before acting. A skill cannot grant unavailable tools.\n${params.skillsPrompt}`
+      ? `## Skills\nListed skill descriptions are visible guidance, not tool grants. Full skill instructions can be read only through an actually supplied authorized read/tool route or when already included in approved context; do not claim a full method was applied unless it was loaded. A task that requires full skill instructions may request authorized read-only access during execute, but chat, clarify, and draft still use zero host tools.\n${params.skillsPrompt}`
       : "",
     params.extraSystemPrompt ?? "",
   ].filter(Boolean).join("\n\n");
@@ -518,7 +520,9 @@ export async function prepareNativeHost(p: Parameters<AgentHarnessV2["runAttempt
           "## Final DSH callback-only host tool surface",
           "This final list supersedes earlier host execution tool lists. Separately supplied DSH preparation controls still apply. Actions use only these OpenClaw host-tool callbacks and their existing policy/authentication; no independent MCP connections or dispatch routers are provided.",
           `Available policy-filtered host tools: ${preparedHost.tools.map((tool) => tool.name).join(", ") || "(none)"}.`,
-          "Never use exec, an alternate provider, or another dispatcher to work around a missing tool. Return text only; do not invent capabilities.",
+          preparedHost.tools.some((tool) => tool.name === "exec")
+            ? "Host exec is available only as an existing policy-controlled callback. It may run host-authorized CLI for task-authorized operations, but never to evade explicit denial, create credentials/connections, install capability, switch accounts, or invent network access. Return text only; do not invent capabilities."
+            : "No host exec callback is available. Missing tools are limitations, not permission to use an alternate provider or dispatcher. Return text only; do not invent capabilities.",
           renderHostToolNotices(preparedHost.toolNotices ?? []),
         ].filter(Boolean).join("\n\n")
         : built.developerInstructions,

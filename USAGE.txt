@@ -1,4 +1,4 @@
-DSH NATIVE FOR OPENCLAW -- EXPERIMENTAL 0.5.2
+DSH NATIVE FOR OPENCLAW -- EXPERIMENTAL 0.6.0
 
 Source: https://github.com/ericzhaouu/dsh-native
 Author: https://github.com/ericzhaouu
@@ -58,8 +58,12 @@ See examples\openclaw.host-tools.json.
 
 Missing, filtered, ambiguous or incompatible requested tools are explained without
 guessing secret/config causes. They are capability gaps, not endless clarification
-questions. Never bypass them using exec or new services. Only compatible text
-results cross the bridge; raw details/auth/transport metadata remain host-side.
+questions. An absent dedicated business-tool name does not itself deny an existing
+host-authorized CLI route, nor does an unavailable-or-denied notice authorize one.
+Only an actually exposed exec callback, task authorization and existing host
+permissions/approvals permit CLI use. Never evade explicit denial by installing
+capabilities, creating credentials/connections, switching accounts or dispatchers.
+Only compatible text results cross the bridge; raw details/auth/transport metadata remain host-side.
 Standard plugin/channel tool instances retain their source and host policy.
 Unlisted plugin factories may still initialize during host construction; narrowing
 constrains exposure/execution, not a sandbox around installed native plugin code.
@@ -72,6 +76,9 @@ ADAPTIVE TASK PREPARATION (0.4.0, DEFAULT OFF)
 Optional taskPreparation configuration applies only to exact agentIds.
 Chat/clarify/draft modes have no host tools; execute gets the intersection of
 executionTools and current host permissions. No model decision grants new authority.
+Skill catalog descriptions are not loaded full instructions. Non-execution modes
+cannot read missing Skill bodies or claim full method adherence unless those
+instructions are already in approved context.
 One first-step dsh_prepare_task control call is validated by the parent before
 any host tool can become available. Decision and execution cannot be batched in
 the same model response. Preparation text/reasoning stays out of visible replies,
@@ -111,8 +118,8 @@ Ownership is retained through publication; cancelled, reset, disposed and failed
 attempts do not publish a successful final. SDK best-effort hook error policy remains.
 Real Gateway tests inspect delivered agent/chat events, not only chat.history,
 including redacted metadata, tools, continuation and stock-host compatibility.
-The 0.3.0 host-patch specification is unchanged. Independent isolated completions
-such as automatic title generation remain unsupported. Install in a maintenance
+The 0.3.0 host-patch specification is unchanged. Version 0.3.1 did not support
+isolated completions; see the 0.6.0 support below. Install in a maintenance
 window and start /new; old history/notices are not rewritten or deleted.
 
 WHAT THIS IS
@@ -156,7 +163,7 @@ PowerShell examples follow; C:\PATH\TO values are placeholders.
   node --version
   npm.cmd ci
 
-Confirm package.json version 0.5.2. OpenClaw is an optional peer to avoid
+Confirm package.json version 0.6.0. OpenClaw is an optional peer to avoid
 bundling a second production host. Development still needs the genuine SDK.
 If it is absent, obtain and verify the exact official 2026.9.2 artifact from
 the OpenClaw release workflow, then install it locally:
@@ -170,8 +177,45 @@ the OpenClaw release workflow, then install it locally:
 If the configured registry lacks that SDK, use the verified official artifact,
 not speculative npm versions, a newer preview or hand-written replacement SDK
 types. The check is read-only; it should report unpatched for the stock pinned
-artifact. npm pack runs prepack/build and creates openclaw-dsh-native-0.5.2.tgz.
+artifact. npm pack runs prepack/build and creates openclaw-dsh-native-0.6.0.tgz.
 Use npm.cmd if PowerShell blocks npm.ps1; do not change execution policy.
+
+PACKAGE ACCEPTANCE AND CI
+
+The repository has a read-only package checker. It does not rebuild, repack or
+assume a historical .tgz exists in a clean checkout; pass an explicit candidate
+path when auditing a real archive:
+
+  npm.cmd run test:package
+  npm.cmd run package:check -- --package C:\PATH\TO\openclaw-dsh-native-<version>.tgz
+  # optional: --expected-sha <sha256> --root C:\PATH\TO\BUILT\WORKSPACE
+
+The checker emits JSON with the archive SHA-256 plus per-file hashes/byte counts.
+It fails on hash mismatch, malformed gzip/tar/PAX data, truncation, trailing junk,
+traversal, duplicate members, links, Windows-unsafe paths, unknown files, bundled
+node_modules/tests/private config, credential-like content, invalid JSON, package
+/ shrinkwrap root version drift, missing declared exports/OpenClaw extension/host
+patch entrypoints, or bundling OpenClaw as a dependency/payload. Optional --root
+compares package files to an already built workspace and rejects symlink/junction
+escapes; do not use it to compare old archives with changed source trees.
+
+Dry-run acceptance wiring is intentionally thin:
+
+  npm.cmd run acceptance:dry-run -- --manifest C:\PATH\TO\manifest.json --run-root C:\ABS\RUNS
+
+That forwards to scripts\run-acceptance.mjs --dry-run. The manifest format,
+fixtures and live execution contract are owned by the acceptance runner.
+
+The GitHub workflow runs only the pure Node checker fixture job by default on pull
+requests across Windows/Ubuntu and Node 22.23.1/24.15.0. This isolated gate does
+not build or certify the current candidate package and needs no account, publish
+permission or OpenClaw SDK. Full SDK acceptance is manual dispatch only and
+requires an approved OpenClaw GitHub release/artifact URL plus the pinned 2026.9.2
+SHA 3431f4cd2d8dbd6b936def2694ac27e19fa0256295cf4ada0f652ecf1c9ee520. If the
+artifact is missing or unavailable, the full job fails with instructions instead
+of passing as skipped; without that approved URL, remote full-SDK CI remains
+blocked. CI does not publish, tag, claim 1.0 readiness or run live canaries.
+
 
 MAINTENANCE BEFORE INSTALL / PATCH / CONFIGURATION
 
@@ -187,7 +231,7 @@ Use the correct installation/profile and keep its supervisor from respawning it.
 
   openclaw gateway stop --force
   openclaw gateway status --no-probe
-  openclaw plugins install "C:\PATH\TO\openclaw-dsh-native-0.5.2.tgz" --force --accept-capabilities
+  openclaw plugins install "C:\PATH\TO\openclaw-dsh-native-0.6.0.tgz" --force --accept-capabilities
 
 The operator must verify shutdown; service status alone is not proof that all
 old processes/tools have exited. For gateway stop, --force confirms a
@@ -202,7 +246,7 @@ a host version or rewriting shared host dependencies. A prepared-directory
 installation is an alternative, still with Gateway stopped:
 
   New-Item -ItemType Directory -Path .\artifacts\prepared-dsh-native
-  tar -xf .\openclaw-dsh-native-0.5.2.tgz -C .\artifacts\prepared-dsh-native
+  tar -xf .\openclaw-dsh-native-0.6.0.tgz -C .\artifacts\prepared-dsh-native
   Push-Location .\artifacts\prepared-dsh-native\package
   npm.cmd ci --omit=dev
   Pop-Location
@@ -367,7 +411,7 @@ bound dispatch; it does not remove the policy or grant an ambient native tool.
 Do not delete required security rules to use the experiment.
 
 No blanket browser, requester-MCP, messaging, plugin-tool grants, subagents/delegation,
-skill-library authoring, custom context engines, native compaction, migration/
+skill-library authoring, custom context engines or external compaction, migration/
 fork, media, Code Mode, live steering, session permission overrides, remote/
 node/sandbox placement or detached durable scheduled jobs. Use legacy context
 and ordinary foreground coding work. Reading host-provided skill instructions
@@ -381,6 +425,35 @@ skill-management tools are added. Unknown delivery modes and explicit Skill
 Workshop workflows still fail closed.
 
 STATE / FAILURE / SECURITY
+
+NATIVE COMPACTION / MAINTENANCE (0.6.0)
+
+Current source separates aggregate billed usage from the final model call's
+contextUsage. SDK contextTokens is window capacity, not consumed tokens.
+The Dashboard history projection may omit contextUsage; canonical raw transcript
+events and attemptUsage retain the authoritative accounting fields.
+
+Official DSH pressure compaction and public host compact() replace only the native
+model-visible surface, retaining original durable events. Summary calls use the
+same host-prepared model/auth and zero tools. Compaction request IDs survive later
+foreground turns. A pending compact can be inspected without model/tool replay
+before the next foreground attempt; partial/uncertain records and live owner locks
+still fail closed. This does not recover or replay interrupted business operations.
+
+Host memory-trigger maintenance uses a separate native binding and a bounded
+canonical evidence snapshot, never a foreground user/assistant transcript pair.
+Limits: 60 seconds, four host callbacks, 4096 output tokens. Only policy-admitted
+read and the host's exact-target append-only write wrapper are exposed; no exec.
+Earlier messages can be omitted from its explicitly labelled bounded snapshot.
+
+runIsolatedCompletionV2 accepts host-owned prepared auth/model with strict visible
+text and no tools, uses disposable private state and supports cancellation.
+Harness-owned auth, temperature overrides and non-text/output-policy extensions
+remain unsupported; not every title/auxiliary workflow is promised compatible.
+
+These 0.6.0 changes require an explicit upgrade of previously installed versions.
+Existing foreign-compacted or inconsistent mirrors are not rewritten/imported:
+retain them for inspection and use /new. Deployment/restart remains separate.
 
 Each host session has a hashed state directory, private DSH_HOME and binding.
 A fresh child resumes native history each turn. Success flushes persistence,

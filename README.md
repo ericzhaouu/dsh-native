@@ -1,6 +1,6 @@
 # DSH Native for OpenClaw
 
-**实验性版本 0.5.2**：把官方 DeepSeek Harness（DSH）的模型／工具循环接入 OpenClaw 的原生 `AgentHarnessV2`，并保留 OpenClaw 对模型、认证、工具授权与会话入口的控制。
+**实验性版本 0.6.0**：把官方 DeepSeek Harness（DSH）的模型／工具循环接入 OpenClaw 的原生 `AgentHarnessV2`，并保留 OpenClaw 对模型、认证、工具授权与会话入口的控制。
 
 - 源码仓库：[ericzhaouu/dsh-native](https://github.com/ericzhaouu/dsh-native)
 - 作者：[ericzhaouu](https://github.com/ericzhaouu)
@@ -16,6 +16,7 @@
 
 ## 目录
 
+- [0.6.0 原生压缩与独立维护](#060-原生压缩与独立维护)
 - [0.5.2 Agent 级 SKILL 可见性覆盖](#052-agent-级-skill-可见性覆盖)
 - [0.5.1 会话重置修复](#051-会话重置修复)
 - [继承宿主工具与收窄清单](#继承宿主工具与收窄清单)
@@ -37,6 +38,18 @@
 - [仓库结构](#仓库结构)
 - [排错](#排错)
 - [致谢与许可证](#致谢与许可证)
+
+## 0.6.0 原生压缩与独立维护
+
+0.6.0 新增以下能力；已安装的旧版本需要显式升级，不会自动更新：
+
+- 累计计费用量与最后一次模型调用的 `contextUsage` 分开。SDK 的 `contextTokens` 是窗口容量，不是占用量；Dashboard 的历史投影可能省略 `contextUsage`，应以原始转录事件与 attempt usage 为准。
+- 使用官方 DSH token meter 和 compaction engine 执行原生压力压缩，以及宿主公开的 `compact()` 调用。摘要没有宿主工具权限，沿用已准备的模型与凭据；原始事件保留，仅更新 DSH 模型可见上下文，不把 OpenClaw 镜像摘要当作原生历史。
+- 压缩事务保留调用 ID 和检查点。已确认关闭子进程后的待定压缩，可以在下一轮先只读核对持久记录，再恢复；不会重做模型请求或工具动作。缺失／不完整记录、活动所有者锁和普通工具执行的不确定结果仍需人工处理。
+- 宿主 `trigger="memory"` 维护使用独立原生状态、最多 60 秒、4 次宿主工具调用和 4096 输出 token。仅保留已授权 `read` 与宿主针对指定文件包装的 append-only `write`；不经过用户任务规划、不添加前台用户／助手行、不授予 `exec`。维护证据是明确标注可能省略早期消息的有界快照。
+- `runIsolatedCompletionV2` 支持宿主准备的文本、模型和认证，零工具、独立临时状态、可取消。暂不支持 harness 自有认证、温度覆盖、非文本或非 strict-visible 输出策略；因此不是对所有自动标题或辅助任务的兼容承诺。
+
+摘要质量仍取决于模型。已有外部压缩／损坏的镜像不会被自动改写或导入；此类旧会话仍需保留记录并使用 `/new`。生产升级与共享 Gateway 重启需要单独安排维护。
 
 ## 0.5.2 Agent 级 SKILL 可见性覆盖
 
@@ -101,11 +114,13 @@ OpenClaw 的聊天 `/new` 可以保留原 `sessionId`，通过宿主转录中的
 - 名单不保证所有未入选的插件工厂都不会初始化；它约束最终暴露和执行。插件本身仍是需要信任的本机代码。
 - 同名冲突、来源变化、已绑定但无法安全插入最终校验的工具或不兼容参数 schema 不会被静默接受。插件替换和启停遵循宿主维护／重载规则，不给正在执行的尝试偷偷增加权限。
 
-**工具缺失不是需求不清楚。** 请求但未能获得的工具会进入有界的不可用说明；不能证明具体原因时，只说“不可用或被宿主策略过滤”，不猜测是否缺凭据。模型应直接解释能力缺口，不继续反复追问，也不能通过 `exec`、其他账号或新连接绕过它。
+**工具缺失不是需求不清楚。** 请求但未能获得的工具会进入有界的不可用说明；不能证明具体原因时，只说“不可用或被宿主策略过滤”，不猜测是否缺凭据。缺少专用业务工具名，不等于宿主已有的授权 CLI 路线必然不可用；但该说明本身也不证明 CLI 获准使用。仅在本轮提供 `exec`、任务授权该操作且宿主权限与审批允许时，才可使用已经安装、已经授权的 CLI。明确被拒绝的操作不能通过命令、其他账号、新连接或安装新能力绕过。
 
 ### SKILL、MCP 与特殊工具
 
 SKILL 是方法说明，不是可执行工具。`skillAllowlist` 控制共享可见技能说明；`skillAllowlistByAgent` 可按已启用 Agent 精确替换它。实际步骤仍必须使用本轮工具集合。单独把技能加入名单不会添加搜索、飞书或 MCP 工具。
+
+`chat`、`clarify`、`draft` 仍没有宿主工具。目录中的技能描述不等于完整方法已加载；若正文尚未进入授权上下文，这些模式不能读取技能文件，也不能声称已经完整执行该方法。此限制不通过给草稿模式开放通用命令来规避。
 
 MCP 连接和认证应由 OpenClaw 管理。本版只接纳宿主能安全提供的兼容工具实例；不会自行读取 MCP 配置并建立新连接，也不会把缓存的 advertised catalog 当成当前请求者已连接的证明。需要单独物化请求者连接、特殊审批续接或其他未支持上下文的工具，应明确报告不兼容，而不是宣称所有 MCP／插件都已完整接通。
 
@@ -161,7 +176,7 @@ MCP 连接和认证应由 OpenClaw 管理。本版只接纳宿主能安全提供
 
 阶段门禁在子进程、父进程和实际宿主派发处检查。准备阶段的工具调用不能越过门禁；同一模型响应中把决策与写文件混在一起，也不能提前获得权限。宿主的 `toolsAllow`、`toolExecutionAllow`、hooks 和审批仍有效。推导出的任务摘要是数据，不是高于用户原话、`AGENTS.md` 或宿主策略的新授权。
 
-`exec` 可以执行任意本地程序，并不是只读工具或网络沙箱。若不接受这种能力，从收窄名单中移除 `exec` 和 `process`。搜索等外部服务只能经本轮已提供的宿主工具使用，不得自行新增连接、提权或通过另一工具绕过不可用功能。需要额外权限的事项应明确说明并交由既有宿主／操作者流程处理。
+`exec` 可以执行任意本地程序，并不是只读工具、业务命令白名单或网络沙箱。通过它使用已有 CLI 时，实际权限仍来自宿主操作系统、服务账号和审批；工具名收窄不限制下游程序的全部业务能力。若不接受这种能力，从收窄名单中移除 `exec` 和 `process`，或由宿主提供更严格的执行控制。不得自行新增连接、提权、切换账号或绕过明确拒绝；需要额外权限的事项交由既有宿主／操作者流程处理。
 
 ### 会话状态与技能
 
@@ -178,7 +193,7 @@ MCP 连接和认证应由 OpenClaw 管理。本版只接纳宿主能安全提供
 - **取消与收尾**：等待公开的 `agent_end` 完成接口，并保持尝试所有权直到发布结束。取消、重置、停用、过期或失败的尝试不能继续宣布成功正文。SDK 对 hook 错误的 best-effort 策略不变。
 - **回归验收**：真实隔离 Gateway 测试直接检查客户端 `assistant`／`chat.delta`／`chat.final` 内容、重复消息和错误回退，同时检查脱敏历史、工具及第二轮续聊。仅检查历史里有答案，不再视为送达证明。
 
-此版本不新增独立的 `isolated completion` 能力；自动标题生成等辅助模型调用仍不在支持范围内。Agent 级宿主补丁规格与 0.3.0 相同；已有补丁先执行 `--check`，不要为了升级插件手动重写宿主文件。升级仍需维护窗口和新会话，不会自动部署或清除旧告警／历史。
+0.3.1 当时未提供独立补全；0.6.0 的受限支持见上方版本说明。Agent 级宿主补丁规格与 0.3.0 相同；已有补丁先执行 `--check`，不要为了升级插件手动重写宿主文件。升级仍需维护窗口和新会话，不会自动部署或清除旧告警／历史。
 
 ## 运行基线与兼容范围
 
@@ -242,7 +257,7 @@ node --version
 npm.cmd ci
 ```
 
-确认所用源码的 `package.json` 版本为 `0.5.2`。本项目把 OpenClaw 声明为 **optional peer**，避免在生产插件内部自动安装第二份宿主；开发／类型检查／真实 SDK 测试仍需要匹配的 SDK。
+确认所用源码的 `package.json` 版本为 `0.6.0`。本项目把 OpenClaw 声明为 **optional peer**，避免在生产插件内部自动安装第二份宿主；开发／类型检查／真实 SDK 测试仍需要匹配的 SDK。
 
 若开发目录尚未提供精确 SDK，先从 [OpenClaw 官方仓库](https://github.com/openclaw/openclaw)的发行流程取得并验证上述 **2026.9.2 官方制品**，然后本地安装：
 
@@ -256,7 +271,7 @@ npm.cmd pack
 
 `--check` 只检查，不会应用补丁。未修改的匹配制品应报告 `unpatched`。如果所用 registry 没有这个版本，应使用已核验的精确官方制品，**不要猜测可用的 npm 版本、改用最新预览版或伪造 SDK 类型**。无法取得匹配制品时，应停止需要该 SDK 的构建／集成验证。
 
-`npm pack` 的 `prepack` 会再次执行构建，生成本地 `openclaw-dsh-native-0.5.2.tgz`。不要把开发目录中的 OpenClaw SDK、账号或会话状态随插件复制出去。
+`npm pack` 的 `prepack` 会再次执行构建，生成本地 `openclaw-dsh-native-0.6.0.tgz`。不要把开发目录中的 OpenClaw SDK、账号或会话状态随插件复制出去。
 
 ## 维护窗口安装与 Agent 级启用
 
@@ -280,7 +295,7 @@ openclaw gateway status --no-probe
 仍保持 Gateway 停止：
 
 ```powershell
-openclaw plugins install "C:\PATH\TO\openclaw-dsh-native-0.5.2.tgz" --force --accept-capabilities
+openclaw plugins install "C:\PATH\TO\openclaw-dsh-native-0.6.0.tgz" --force --accept-capabilities
 ```
 
 `--force` 用于确认本地来源／覆盖安装；`--accept-capabilities` 是官方安装器对声明能力的接受选项，**仅用于已审阅并信任的代码**，不是规避安全策略。先阅读安装器说明和能力提示，不要无条件接受陌生代码。归档安装会处理运行依赖；已有 provider 及认证应留在 OpenClaw，不填入插件设置。
@@ -289,7 +304,7 @@ openclaw plugins install "C:\PATH\TO\openclaw-dsh-native-0.5.2.tgz" --force --ac
 
 ```powershell
 New-Item -ItemType Directory -Path .\artifacts\prepared-dsh-native
-tar -xf .\openclaw-dsh-native-0.5.2.tgz -C .\artifacts\prepared-dsh-native
+tar -xf .\openclaw-dsh-native-0.6.0.tgz -C .\artifacts\prepared-dsh-native
 Push-Location .\artifacts\prepared-dsh-native\package
 npm.cmd ci --omit=dev
 Pop-Location
@@ -482,7 +497,7 @@ sessions_list  sessions_history  sessions_send  session_status
 - browser／多媒体、消息投递、cron、subagent／delegation、需要额外 authority 的插件工具 grants；
 - 尚未由宿主安全物化的 requester MCP 工具，以及需要不受支持会话／审批上下文的工具；
 - skill-library authoring／Skill Workshop；读取宿主提供的 skill 指令不等于获得额外工具；
-- 自定义 context engine／compaction、原生压缩、会话迁移／fork；
+- 自定义 context engine／外部 compaction、会话迁移／fork；受控 DSH 原生压缩见 0.6.0 说明；
 - 媒体输入或非文本工具结果、Code Mode、live steering、会话权限覆盖；
 - remote／node／sandbox 执行放置、定时运行权限及 detached durable job scheduling。
 
@@ -562,6 +577,47 @@ node .\host-patch\apply.mjs --root $HostRoot --check
 
 ## 开发与测试
 
+### 安装包验收与 CI
+
+安装包检查器只读取显式指定的 `.tgz`，不会重新构建、打包，也不依赖干净克隆中并不存在的历史安装包：
+
+```powershell
+npm.cmd run test:package
+npm.cmd run package:check -- --package C:\PATH\TO\openclaw-dsh-native-<version>.tgz
+# optional: --expected-sha <sha256> --root C:\PATH\TO\BUILT\WORKSPACE
+```
+
+`scripts\check-package.mjs` 输出安装包及各文件的 SHA-256、大小和问题清单。检查归档结构、截断／非法路径／链接、重复条目、必要入口、依赖及 manifest 一致性、夹带宿主／测试／私有配置和敏感内容。`--root` 比较已构建工作区与归档的实际字节，并拒绝链接越界；不要拿旧安装包与已修改的源码比较后声称制品一致。
+
+### 行为用例与预演
+
+固定语料包含 56 个单轮案例的三种表达、8 组四轮对话和 12 个飞书通道案例，共 **212 次计划用户输入**。这是待执行语料，不是 212 次通过记录。编译后为 188 个用例单元，多轮脚本保持分组；评分规则保存在单独的 `oracles.json`，不得混入模型输入。
+
+```powershell
+$PlanRoot = Join-Path $env:TEMP ("dsh-acceptance-" + [guid]::NewGuid().ToString())
+npm.cmd run acceptance:compile -- --output-root $PlanRoot
+npm.cmd run acceptance:dry-run -- --manifest "$PlanRoot\manifest.json" --run-root "$PlanRoot\runs"
+```
+
+预演只验证格式并输出 `planned`、`passed: false`，不调用模型、不连接飞书。`acceptance:evaluate -- --report <report.json>` 会拒绝把预演当验收证据。`local-fixture-adapter.mjs` 只用于评分器自测，不能作为真实 Agent 成功证明。
+
+真实执行没有内置生产适配器，必须显式使用 `--execute --live --trusted-capable-adapter --adapter <绝对模块路径> --scope <私有授权文件>`，并提供测试账号／资源映射、所有预算字段和前置条件。适配器须独立验证 oracle、持续报告实际用量、支持取消并返回清理回执；未满足条件即阻断。预算同时受用例、整批和私有授权上限约束；未计价必须标记为 `unpriced`。适配器是受信任本机代码，JavaScript 信号不是操作系统沙箱。
+
+报告分别记录执行、业务结果、权限、Skill 加载／遵循、交付和耗时。零副作用等关键门槛不能由总体 95% 成功率抵消；样本少于 20 时不宣称测得可靠的 p95。事实、引用和方法质量需要实际工具记录及独立评分，不能仅凭模型自称完成。
+
+### 有界原生运行压测
+
+```powershell
+npm.cmd run soak:dry-run
+node .\scripts\run-native-soak.mjs --execute --turns 4
+node .\scripts\run-native-soak.mjs --execute --turns 200
+```
+
+压测显式执行后使用真实 DSH 子进程和本地合成模型，交替运行两个隔离身份、定期切换原生状态 epoch；不会访问生产账号。它不替代真实 Gateway／飞书端到端压力测试。启动失败必须失败，不能因为环境异常自动算通过；子进程 RSS 未测量时也不得冒充已观测。
+
+`.github\workflows\test.yml` 在 PR 上默认只运行纯 Node 安装包检查器测试矩阵（Windows／Ubuntu，Node 22.23.1／24.15.0），不依赖真实账号或 SDK，也不等于当前源码包已通过全部验收。完整 SDK 工作流仅在 `workflow_dispatch` 启动，需要配置 `OPENCLAW_SDK_ARTIFACT_URL`／`OPENCLAW_SDK_ARTIFACT_SHA256` 或对应输入；只接受 OpenClaw 官方 GitHub Release／Actions 制品，内部 SDK 包摘要固定为 `3431f4cd2d8dbd6b936def2694ac27e19fa0256295cf4ada0f652ecf1c9ee520`。未配置或下载失败会明确失败，不能显示虚假的全量通过。工作流不发布、不打标签、不运行真实账号用例，也不使用 `pull_request_target`。
+
+
 先按上文提供精确官方 optional peer SDK，再运行仓库已有命令：
 
 ```powershell
@@ -636,6 +692,7 @@ dsh-native\
 | `OpenClaw mirror and native history no longer agree`／`Cannot resume a missing DSH session` | 核对原状态完整性或 `/new`；不造空绑定、不删历史强行续聊 |
 | `owner.lock`、uncertain outcome、already submitted | 确认旧进程／工具已停止并核对副作用，使用新会话；禁止自动解锁重放 |
 | 启动／关闭超时、unconfirmed termination | 检查实际 Node、依赖、子进程和工具状态；必要时维护窗口处理，不靠反复提交重试 |
+| `working directory exceeds the Windows process limit` | 为 `stateDir` 选择更短的绝对路径；Windows 可读写长路径并不代表可用它启动子进程。运行时会在生成绑定或启动前拒绝过长目录，不自动迁移旧状态 |
 | reasoning mapping／custom transport 被拒绝 | 保留宿主要求；选择可支持的模型／参数或内置 runtime，不静默忽略参数 |
 | `INVALID_ARGS`／`HOST_TOOL_ERROR` | 检查宿主工具 schema、实际工具结果和授权；模型声称成功不能代替结果 |
 

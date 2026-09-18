@@ -1,18 +1,25 @@
 import type { Context } from "@deepseek-ai/cordis";
 import type {} from "@deepseek-ai/cordis-plugin-loader";
+import type {} from "@deepseek-ai/dsh-token-meter";
+import type {} from "@deepseek-ai/dsh-compaction";
 import { assembleContextFor, type Agent, type AgentHandle, type AgentOptions } from "@deepseek-ai/dsh-agent";
-import { createUserMessage, HarnessError, ReasoningEffortId, type GenerateOptions, type ToolSchema } from "@deepseek-ai/dsh-llm";
+import { createUserMessage, HarnessError, ReasoningEffortId, type GenerateOptions, type TokenUsage, type ToolSchema } from "@deepseek-ai/dsh-llm";
 import { SessionId, type SessionEvent } from "@deepseek-ai/dsh-session";
 import type {} from "@deepseek-ai/dsh-session-persistence";
 import { renderContextSnapshot, renderPrompt } from "@deepseek-ai/dsh-system-prompt";
 import type { ToolDefinition, ToolExecution, ToolExecutionResult, ToolRunContext } from "@deepseek-ai/dsh-tools";
+import type { CompactionResult } from "@deepseek-ai/dsh-compaction";
+import { CommandId } from "@deepseek-ai/dsh-commands";
 import { Ajv } from "ajv";
 import { realpath, stat } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { normalize } from "node:path";
 import type { Readable, Writable } from "node:stream";
 import { isDeepStrictEqual } from "node:util";
-import { BRIDGE_VERSION, DSH_VERSION, type BridgeEvent, type BridgeResult, type BridgeRun, type BridgeTool } from "../protocol.js";
+import {
+  BRIDGE_VERSION, DSH_VERSION, type BridgeCompact, type BridgeCompactResult, type BridgeEvent, type BridgeResult,
+  isRecord, type BridgeRun, type BridgeTool,
+} from "../protocol.js";
 import {
   createPreparationTool, parsePreparationDecision, parsePreparationResolution, PREPARATION_TOOL_NAME,
   type PreparationDecision, type PreparationResolution,
@@ -20,11 +27,11 @@ import {
 import { JsonRpcPeer } from "../rpc.js";
 import { TurnTracker } from "./turn.js";
 import { assertCopilotReplaySafe, sanitizeCopilotStream } from "./copilot-replay.js";
-import { emptyParams, jsonObject, keys, parseRun, parseToolResult, positiveInteger, record } from "./validation.js";
+import { emptyParams, jsonObject, keys, parseCompact, parseRun, parseToolResult, record } from "./validation.js";
 
 export { createBridgePatch } from "./profile.js";
 export const name = "openclaw-stdio-bridge";
-export const inject = ["agents", "agentLoop", "sessions", "sessionPersistence", "tools", "systemPrompt", "llm"];
+export const inject = ["agents", "agentLoop", "sessions", "sessionPersistence", "tools", "systemPrompt", "llm", "tokenMeter", "compaction"];
 
 function errorOf(value: unknown): Error {
   return value instanceof Error ? value : new Error("DSH bridge failed", { cause: value });
@@ -54,6 +61,80 @@ function auditSchemas(actual: readonly ToolSchema[], expected: readonly ToolSche
   }
 }
 
+function bridgeUsage(usage: TokenUsage): BridgeResult["usage"] {
+  return {
+    input: usage.inputTokens ?? 0,
+    output: usage.outputTokens ?? 0,
+    cacheRead: usage.cacheReadTokens ?? 0,
+    cacheWrite: usage.cacheWriteTokens ?? 0,
+  };
+}
+
+function usageFromCompactionSummary(event: SessionEvent | undefined): BridgeResult["usage"] | undefined {
+  if (event?.type !== "compaction/summary" || !event.data.usage) return undefined;
+  return bridgeUsage(event.data.usage);
+}
+
+function sourceCompactionId(event: SessionEvent | undefined): string | undefined {
+  if (event?.type !== "user/message") return undefined;
+  const source: unknown = event.data.source;
+  if (!isRecord(source)) return undefined;
+  return source.kind === "plugin" && source.plugin === "compact" && typeof source.compactionId === "string"
+    ? source.compactionId : undefined;
+}
+
+function inspectCompactionEvents(
+  events: readonly SessionEvent[],
+  sessionId: string,
+  runId: string,
+): BridgeCompactResult {
+  const starts = events.filter((event) => event.type === "compaction/start" && event.data.sourceCommandId === runId);
+  if (starts.length === 0) {
+    return { compacted: false, sessionId, details: { recovered: true, noChange: true } };
+  }
+  if (starts.length > 1) throw new Error("Compaction recovery found duplicate matching start events.");
+  const start = starts[0]!;
+  if (start.type !== "compaction/start") throw new Error("Invalid compaction opening event");
+  const startData = start.data;
+  const compactionId = String(startData.compactionId);
+  const matching = events.filter((event) =>
+    (event.type === "compaction/summary" || event.type === "compaction/end") &&
+    event.data.compactionId === compactionId && event.data.sourceCommandId === runId);
+  const summaries = matching.filter((event) => event.type === "compaction/summary");
+  const ends = matching.filter((event) => event.type === "compaction/end");
+  if (ends.length === 0) throw new Error("Compaction recovery found an unclosed compaction transaction.");
+  if (ends.length > 1 || summaries.length > 1) throw new Error("Compaction recovery found duplicate lifecycle events.");
+  const end = ends[0]!;
+  if (end.seq < start.seq) throw new Error("Compaction recovery found an invalid lifecycle order.");
+  if (end.data.error) {
+    if (summaries.length || events.some((event) => sourceCompactionId(event) === compactionId)) {
+      throw new Error("Failed compaction left a partial replacement; explicit reconciliation is required.");
+    }
+    return { compacted: false, sessionId, details: { recovered: true, compactionId, error: end.data.error } };
+  }
+  const summary = summaries[0];
+  if (!summary || summary.seq <= start.seq || summary.seq + 2 !== end.seq ||
+    sourceCompactionId(events[summary.seq + 1]) !== compactionId) {
+    throw new Error("Compaction recovery found an incomplete committed replacement.");
+  }
+  const summaryText = summary.data.summary.filter((block) => block.type === "text").map((block) => block.text).join("");
+  const summaryUsage = usageFromCompactionSummary(summary);
+  return {
+    compacted: true,
+    sessionId,
+    summary: summaryText,
+    ...(summaryUsage ? { summaryUsage } : {}),
+    details: {
+      recovered: true,
+      compactionId,
+      startSeq: start.seq,
+      summarySeq: summary.seq,
+      endSeq: end.seq,
+      shadowedTokenCount: summary.data.shadowedTokenCount,
+    },
+  };
+}
+
 interface ExpectedCall {
   readonly block: Readonly<{ id: string; name: string; arguments: string }>;
   seq?: number;
@@ -73,6 +154,11 @@ interface PreparationStep {
   ended: boolean;
 }
 
+interface ActiveCompaction {
+  compactionId: string;
+  turn: number | null;
+}
+
 /** Owns a single request and Agent handle; never changes the process workspace. */
 export class BridgeWorker {
   readonly peer: JsonRpcPeer;
@@ -81,6 +167,7 @@ export class BridgeWorker {
   private agent?: Agent;
   private tracker?: TurnTracker;
   private runPromise?: Promise<BridgeResult>;
+  private operationPromise?: Promise<unknown>;
   private cleanupPromise?: Promise<void>;
   private stopping = false;
   private cancelled = false;
@@ -96,11 +183,13 @@ export class BridgeWorker {
   private readonly registrations = new Map<string, () => void>();
   private readonly writes = new Set<Promise<void>>();
   private request?: BridgeRun;
+  private compactRequest?: BridgeCompact;
   private preparationTool?: BridgeTool;
   private controlStep?: PreparationStep;
   private activeStep?: PreparationStep;
   private preparation?: PreparationResolution;
   private preparationReady = false;
+  private activeCompaction?: ActiveCompaction;
 
   constructor(
     private readonly ctx: Context,
@@ -225,8 +314,29 @@ export class BridgeWorker {
     this.assertHealthy();
     this.auditTools();
     const run = this.request;
-    if (!run || !this.armed || options.sessionId !== run.sessionId ||
-      options.provider !== providerRoute(run.provider) || options.model !== run.modelId || options.purpose !== undefined ||
+    if (this.compactRequest) {
+      const compact = this.compactRequest;
+      if (options.sessionId !== compact.sessionId ||
+        options.provider !== providerRoute(compact.provider) || options.model !== compact.modelId ||
+        options.purpose !== "compaction" || this.ctx.agents.currentInitiator() !== this.agent) {
+        throw new Error("Unowned, auxiliary, or rerouted DSH compaction model request");
+      }
+      auditSchemas(options.tools ?? [], []);
+      return;
+    }
+    if (!run || !this.armed || options.sessionId !== run.sessionId) {
+      throw new Error("Unowned, auxiliary, or rerouted DSH model request");
+    }
+    if (options.purpose === "compaction") {
+      if (!this.activeCompaction || this.activeCompaction.turn === null ||
+        options.provider !== providerRoute(run.provider) || options.model !== run.modelId ||
+        this.ctx.agents.currentInitiator() !== this.agent) {
+        throw new Error("Unowned, auxiliary, or rerouted DSH compaction model request");
+      }
+      auditSchemas(options.tools ?? [], []);
+      return;
+    }
+    if (options.provider !== providerRoute(run.provider) || options.model !== run.modelId || options.purpose !== undefined ||
       this.ctx.agents.currentInitiator() !== this.agent) {
       throw new Error("Unowned, auxiliary, or rerouted DSH model request");
     }
@@ -268,7 +378,26 @@ export class BridgeWorker {
       this.used = true;
       this.request = run;
       this.runPromise = this.run(run);
+      this.operationPromise = this.runPromise;
       return this.runPromise;
+    }
+    if (method === "compact") {
+      if (!this.initialized) throw new Error("DSH bridge is not ready");
+      if (this.used || this.stopping) throw new Error("Only one operation is permitted per bridge process");
+      const compact = parseCompact(params);
+      this.used = true;
+      this.compactRequest = compact;
+      this.operationPromise = this.compact(compact);
+      return this.operationPromise;
+    }
+    if (method === "inspectCompact") {
+      if (!this.initialized) throw new Error("DSH bridge is not ready");
+      if (this.used || this.stopping) throw new Error("Only one operation is permitted per bridge process");
+      const compact = parseCompact(params);
+      this.used = true;
+      this.compactRequest = compact;
+      this.operationPromise = this.inspectCompact(compact);
+      return this.operationPromise;
     }
     if (method === "shutdown") {
       emptyParams(params);
@@ -380,6 +509,10 @@ export class BridgeWorker {
         try { this.observePreparation(event); } catch (error) { this.fail(error); }
       });
     }
+    agentCtx.on("session/event", (session, event) => {
+      if (session !== agent.session) return;
+      try { this.observeCompaction(event); } catch (error) { this.fail(error); }
+    });
     agentCtx.tools.guard((execution) => {
       try {
         this.assertHealthy();
@@ -422,6 +555,66 @@ export class BridgeWorker {
       if (this.ctx.agents.list().length) throw new Error("Unexpected preexisting DSH agent");
       this.armed = true;
     } };
+  }
+
+  private async setupCompact(agentCtx: Context, run: BridgeCompact, workspace: string): Promise<{ commit(): void }> {
+    const agent = agentCtx.agent;
+    if (!agent || agent.id !== run.sessionId || agent.session.id !== run.sessionId) {
+      throw new Error("DSH created a mismatched session identity");
+    }
+    this.agent = agent;
+    const storedWorkspace = agent.session.header.cwd;
+    if (!storedWorkspace || canonicalPath(await realpath(storedWorkspace)) !== canonicalPath(workspace)) {
+      throw new Error("DSH persisted workspace does not match the requested workspace");
+    }
+    if (agent.session.header.parentSession || agent.session.header.origin || agent.session.header.agentPreset) {
+      throw new Error("Cannot resume a delegated or preset-owned DSH session");
+    }
+    agentCtx.tools.restrict({ allow: [] });
+    agentCtx.tools.presentAs("native");
+    agentCtx.systemPrompt.suppressRuntimeContext();
+    agentCtx.on("agent/request", async (_event, next) => {
+      await next();
+      return {
+        provider: providerRoute(run.provider), model: run.modelId,
+        ...(run.reasoningEffort === undefined ? {} : { reasoningEffort: ReasoningEffortId(run.reasoningEffort) }),
+        ...(run.maxTokens === undefined ? {} : { maxTokens: run.maxTokens }),
+      };
+    });
+    auditSchemas(agentCtx.tools.schemas(agent), []);
+    return { commit: () => {
+      this.assertHealthy();
+      this.auditGlobal();
+      if (this.ctx.agents.list().length) throw new Error("Unexpected preexisting DSH agent");
+      this.armed = true;
+    } };
+  }
+
+  private observeCompaction(event: SessionEvent): void {
+    const run = this.request;
+    if (!run || !this.agent) return;
+    if (event.type === "compaction/start") {
+      if (this.activeCompaction) throw new Error("Overlapping DSH compaction lifecycle");
+      if (event.data.turn === null || this.agent.status !== "running") {
+        throw new Error("DSH automatic compaction must be owned by the active turn");
+      }
+      this.activeCompaction = { compactionId: event.data.compactionId, turn: event.data.turn };
+      return;
+    }
+    if (event.type === "compaction/summary") {
+      if (!this.activeCompaction || event.data.compactionId !== this.activeCompaction.compactionId ||
+        event.data.provider !== providerRoute(run.provider) || event.data.model !== run.modelId) {
+        throw new Error("Unowned or rerouted DSH compaction summary");
+      }
+      return;
+    }
+    if (event.type === "compaction/end") {
+      if (!this.activeCompaction || event.data.compactionId !== this.activeCompaction.compactionId ||
+        event.data.turn !== this.activeCompaction.turn) {
+        throw new Error("Unowned DSH compaction lifecycle close");
+      }
+      this.activeCompaction = undefined;
+    }
   }
 
   private observePreparation(event: SessionEvent): void {
@@ -692,6 +885,7 @@ export class BridgeWorker {
     await this.ctx.sessionPersistence.ensureMaterialized(this.agent.session);
     await this.flush();
     await Promise.all(this.writes);
+    if (this.activeCompaction) throw new Error("DSH compaction lifecycle did not close");
     this.assertHealthy();
     const result = this.tracker.result(run.sessionId, this.cancelled, this.toolCalls);
     if (run.taskPreparation && result.stopReason !== "aborted" && !this.preparationReady) {
@@ -699,6 +893,84 @@ export class BridgeWorker {
     }
     return run.taskPreparation && this.preparationReady && this.preparation
       ? { ...result, preparation: structuredClone(this.preparation) } : result;
+  }
+
+  private async compact(run: BridgeCompact): Promise<BridgeCompactResult> {
+    this.assertHealthy();
+    this.auditGlobal();
+    const workspace = await realpath(run.workspaceDir);
+    if (!(await stat(workspace)).isDirectory()) throw new Error("workspaceDir is not a directory");
+    const id = SessionId(run.sessionId);
+    const persisted = (await this.ctx.sessionPersistence.list()).find((header) => canonicalPath(header.id) === canonicalPath(id));
+    if (!persisted) throw new Error("Cannot compact a missing DSH session");
+    if (persisted.id !== id) throw new Error("DSH session identity differs in filename case");
+    if (!persisted.cwd || canonicalPath(await realpath(persisted.cwd)) !== canonicalPath(workspace)) {
+      throw new Error("Persisted DSH session belongs to a different workspace");
+    }
+    const agentOptions: AgentOptions = {
+      provider: providerRoute(run.provider), model: run.modelId,
+      ...(run.reasoningEffort === undefined ? {} : { reasoningEffort: ReasoningEffortId(run.reasoningEffort) }),
+      ...(run.maxTokens === undefined ? {} : { maxTokens: run.maxTokens }),
+    };
+    this.handle = await this.ctx.agents.resume({
+      resumeSessionId: id, agentOptions,
+      setup: (agentCtx) => this.setupCompact(agentCtx, run, workspace),
+      signal: this.creation.signal,
+    });
+    this.assertHealthy();
+    if (this.handle.agent !== this.agent) throw new Error("DSH returned an unexpected agent handle");
+    const before = this.ctx.tokenMeter.measure(this.agent.session).totalTokens;
+    const compactionController = new AbortController();
+    this.creation.signal.addEventListener("abort", () => compactionController.abort(this.creation.signal.reason), { once: true });
+    let result: CompactionResult | null;
+    try {
+      const agent = this.handle.agent;
+      result = await this.ctx.agents.withInitiator(agent,
+        () => this.ctx.compaction.compactNow(agent, compactionController.signal, CommandId(run.runId)));
+    } catch (error) {
+      this.assertHealthy();
+      throw error;
+    }
+    await this.agent.whenIdle();
+    await this.ctx.sessionPersistence.ensureMaterialized(this.agent.session);
+    await this.flush();
+    this.assertHealthy();
+    if (!result) return { compacted: false, sessionId: run.sessionId, tokensBefore: before };
+    const after = this.ctx.tokenMeter.measure(this.agent.session).totalTokens;
+    const summary = result.summary.filter((block) => block.type === "text").map((block) => block.text).join("");
+    const summaryUsage = usageFromCompactionSummary(this.agent.session.events[result.summarySeq]);
+    return {
+      compacted: true,
+      sessionId: run.sessionId,
+      summary,
+      tokensBefore: before,
+      tokensAfter: after,
+      ...(summaryUsage ? { summaryUsage } : {}),
+      details: {
+        compactionId: result.compactionId,
+        startSeq: result.startSeq,
+        summarySeq: result.summarySeq,
+        endSeq: result.endSeq,
+        shadowedTokenCount: result.shadowedTokenCount,
+      },
+    };
+  }
+
+  private async inspectCompact(run: BridgeCompact): Promise<BridgeCompactResult> {
+    this.assertHealthy();
+    this.auditGlobal();
+    const workspace = await realpath(run.workspaceDir);
+    if (!(await stat(workspace)).isDirectory()) throw new Error("workspaceDir is not a directory");
+    const inspection = await this.ctx.sessionPersistence.inspect(SessionId(run.sessionId), this.creation.signal);
+    if (!inspection.meta.cwd || canonicalPath(await realpath(inspection.meta.cwd)) !== canonicalPath(workspace)) {
+      throw new Error("Persisted DSH session belongs to a different workspace");
+    }
+    if (run.completedTurns === undefined ||
+        inspection.events.filter((event) => event.type === "turn/start").length !== run.completedTurns ||
+        inspection.events.filter((event) => event.type === "turn/end").length !== run.completedTurns) {
+      throw new Error("Compaction recovery cannot verify the completed foreground history.");
+    }
+    return inspectCompactionEvents(inspection.events, run.sessionId, run.runId);
   }
 
   private async flush(): Promise<void> {
@@ -716,8 +988,8 @@ export class BridgeWorker {
     this.stopping = true;
     this.cancel();
     const failures: Error[] = [];
-    if (this.runPromise) {
-      try { await this.runPromise; } catch (error) {
+    if (this.operationPromise) {
+      try { await this.operationPromise; } catch (error) {
         // The run RPC owns this rejection. Do not poison teardown with an
         // already reported request error or cache a permanently failed cleanup.
         this.ctx.logger(name).debug("Draining failed run", errorOf(error));
@@ -737,8 +1009,7 @@ export class BridgeWorker {
 /** Cordis CLI entry; stdout belongs exclusively to the bridge's JSON-RPC peer. */
 export function apply(ctx: Context, config: unknown): void {
   const options = record(config, "bridge config");
-  keys(options, ["contextWindow"], "bridge config");
-  positiveInteger(options.contextWindow, "contextWindow");
+  keys(options, [], "bridge config");
   const require = createRequire(import.meta.url);
   const installed = record(require("@deepseek-ai/dsh/package.json"), "DSH package");
   if (installed.version !== DSH_VERSION) throw new Error(`Bridge requires DSH ${DSH_VERSION}`);

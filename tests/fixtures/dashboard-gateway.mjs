@@ -11,6 +11,7 @@ import { s as resolveRuntimeServiceBuildId, t as OPENCLAW_VERSION } from "../../
 import { startResponsesServer } from "./responses-server.mjs";
 import { createPatchedHostFixture, createPluginFixture } from "./patched-host.mjs";
 import { createHostSearchFixture, HOST_SEARCH_PLUGIN_ID, HOST_SEARCH_PROVIDER_ID } from "./host-search-plugin.mjs";
+import { createHostMemoryFixture, HOST_MEMORY_PLUGIN_ID } from "./host-memory-plugin.mjs";
 
 const packageRoot = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
 const TOKEN = "dashboard-gateway-fixture-token";
@@ -151,8 +152,16 @@ async function withTimeout(promise, ms, message) {
 export async function startDashboardGateway(responder, {
   agentPinned = true, redactTranscriptIdentity = false, taskPreparation,
   hostTools, searchFixture = false, agentToolPolicy, agentId = AGENT_ID,
+  additionalAgentIds = [], setupWorkspaces, modelContextWindow = 1_000_000,
+  compaction, memoryFixture = false,
 } = {}) {
   assert.equal(OPENCLAW_VERSION, "2026.9.2", "Dashboard fixture must use the inspected genuine SDK");
+  assert.ok(Array.isArray(additionalAgentIds), "additionalAgentIds must be an array");
+  assert.equal(new Set([agentId, ...additionalAgentIds]).size, 1 + additionalAgentIds.length,
+    "Fixture agent ids must be unique");
+  for (const id of [agentId, ...additionalAgentIds]) {
+    assert.match(id, /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/, "Fixture agent ids must be strict local ids");
+  }
   const root = join(packageRoot, "artifacts", `dashboard-gateway-${randomUUID()}`);
   const workspace = join(root, "workspace");
   const home = join(root, "home");
@@ -197,6 +206,17 @@ export async function startDashboardGateway(responder, {
     }
     return bindings;
   };
+  const extraAgents = additionalAgentIds.map((id, index) => ({
+    id,
+    workspace: join(root, `workspace-${index + 2}`),
+    agentDir: join(root, `agent-${index + 2}`),
+  }));
+  const allAgents = [{ id: agentId, workspace, agentDir }, ...extraAgents];
+  const agentWorkspaces = Object.fromEntries(allAgents.map((agent) => [agent.id, agent.workspace]));
+  const agentDirs = Object.fromEntries(allAgents.map((agent) => [agent.id, agent.agentDir]));
+  const runtimeConfigForAgent = () => agentPinned
+    ? { runtime: { type: "embedded", harness: "dsh-native" } }
+    : { models: { [MODEL_REF]: { agentRuntime: { id: "dsh-native" } } } };
   const stopPartial = async () => {
     stopping = true;
     const results = await Promise.allSettled([chat?.stopAndWait?.({ timeoutMs: 5000 })]);
@@ -213,13 +233,17 @@ export async function startDashboardGateway(responder, {
     if (failures.length) throw new AggregateError(failures, "Dashboard client cleanup failed");
   };
   try {
-    await Promise.all([root, workspace, home, state, agentDir, dshState].map((path) => mkdir(path, { recursive: true })));
+    await Promise.all([root, home, state, dshState,
+      ...allAgents.flatMap((agent) => [agent.workspace, agent.agentDir]),
+    ].map((path) => mkdir(path, { recursive: true })));
     const originalHost = join(packageRoot, "node_modules", "openclaw");
     const fixture = agentPinned ? await createPatchedHostFixture(root)
       : { host: originalHost, plugin: await createPluginFixture(root, originalHost) };
     const search = searchFixture ? await createHostSearchFixture(root, fixture.host) : undefined;
+    const memory = memoryFixture ? await createHostMemoryFixture(root, fixture.host) : undefined;
     const networkGuard = await createNetworkGuard(root);
     await writeFile(join(workspace, "fixture.txt"), "DASHBOARD-HOST-READ\n");
+    await setupWorkspaces?.({ root, agents: allAgents, agentWorkspaces, agentDirs });
     responses = await startResponsesServer(async (request) => {
       try { await responder(request); }
       catch (error) { failFixture(error); throw error; }
@@ -233,17 +257,18 @@ export async function startDashboardGateway(responder, {
       update: { checkOnStart: false, auto: { enabled: false } },
       browser: { enabled: false },
       agents: {
+        ...(additionalAgentIds.length > 0 ? { ownership: "explicit" } : {}),
         defaults: {
           model: { primary: MODEL_REF },
           sandbox: { mode: "off" },
+          ...(compaction === undefined ? {} : { compaction }),
         },
         entries: {
-          [agentId]: {
-            workspace, agentDir,
+          ...Object.fromEntries(allAgents.map((agent) => [agent.id, {
+            workspace: agent.workspace, agentDir: agent.agentDir,
             ...(agentToolPolicy === undefined ? {} : { tools: agentToolPolicy }),
-            ...(agentPinned ? { runtime: { type: "embedded", harness: "dsh-native" } }
-              : { models: { [MODEL_REF]: { agentRuntime: { id: "dsh-native" } } } }),
-          },
+            ...runtimeConfigForAgent(),
+          }])),
         },
       },
       models: {
@@ -259,7 +284,7 @@ export async function startDashboardGateway(responder, {
               name: "Dashboard Local Copilot",
               reasoning: true,
               input: ["text"],
-              contextWindow: 1_000_000,
+              contextWindow: modelContextWindow,
               maxTokens: 8192,
               cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
               compat: {
@@ -274,13 +299,14 @@ export async function startDashboardGateway(responder, {
         ...(search ? { web: { search: { enabled: true, provider: HOST_SEARCH_PROVIDER_ID } } } : {}),
       },
       plugins: {
-        slots: { memory: "none" },
+        slots: { memory: memory ? HOST_MEMORY_PLUGIN_ID : "none" },
         enabled: true,
-        allow: ["dsh-native", ...(search ? [HOST_SEARCH_PLUGIN_ID] : [])],
-        load: { paths: [fixture.plugin, ...(search ? [search.plugin] : [])] },
+        allow: ["dsh-native", ...(search ? [HOST_SEARCH_PLUGIN_ID] : []), ...(memory ? [HOST_MEMORY_PLUGIN_ID] : [])],
+        load: { paths: [fixture.plugin, ...(search ? [search.plugin] : []), ...(memory ? [memory.plugin] : [])] },
         entries: {
           "github-copilot": { enabled: false },
           ...(search ? { [HOST_SEARCH_PLUGIN_ID]: { enabled: true, config: search.config } } : {}),
+          ...(memory ? { [HOST_MEMORY_PLUGIN_ID]: { enabled: true } } : {}),
           "dsh-native": {
             enabled: true,
             config: {
@@ -335,8 +361,8 @@ export async function startDashboardGateway(responder, {
         resolve();
       });
     });
-    child.stdout.on("data", (data) => { stdout += data; });
-    child.stderr.on("data", (data) => { stderr += data; });
+    child.stdout.on("error", failFixture).on("data", (data) => { stdout += data; });
+    child.stderr.on("error", failFixture).on("data", (data) => { stderr += data; });
     try {
       await waitForPort(port, assertHealthy);
       await waitForReadiness(port, assertHealthy);
@@ -385,6 +411,7 @@ export async function startDashboardGateway(responder, {
       throw new Error(`Gateway did not become ready.\n${stdout}\n${stderr}\n${log.slice(-12000)}`, { cause: error });
     }
     return {
+      memory,
       root,
       workspace,
       agentDir,
@@ -395,6 +422,9 @@ export async function startDashboardGateway(responder, {
       token: TOKEN,
       modelRef: MODEL_REF,
       agentId,
+      additionalAgentIds,
+      agentWorkspaces,
+      agentDirs,
       searchFixture: search,
       responses,
       chat,

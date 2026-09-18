@@ -21,6 +21,10 @@ type Scope = {
   expectedLifecycleRevision?: string;
   expectedWriterRunId?: string;
 };
+type ScopeParams = Pick<Attempt,
+  "sessionId" | "sessionKey" | "agentId" | "sessionTarget" | "sessionPersistence" | "sessionManager"> & {
+  runId?: string;
+};
 
 /** Local boundary for the public, JS-only OpenClaw 2026.9.2 transcript export. */
 export interface NativeTranscriptTransport {
@@ -103,7 +107,7 @@ function keyOf(message: Message): unknown {
   return Reflect.get(message, "idempotencyKey");
 }
 
-function resolveScope(p: Attempt): Scope {
+function resolveScope(p: ScopeParams): Scope {
   if (p.sessionPersistence === "detached") fail("detached persistence is unsupported");
   if (p.sessionManager !== undefined) fail("in-memory sessions are unsupported");
   const target = p.sessionTarget;
@@ -221,6 +225,7 @@ function validateHistory(
   current: Admission | undefined,
   assistantKey: string,
   assistantPrefix: string,
+  allowPendingTail = false,
 ): void {
   let pending: Entry | undefined;
   const keys = new Set<string>();
@@ -248,7 +253,51 @@ function validateHistory(
       historyError("history originates outside dsh-native");
     }
   }
-  if (pending && pending.entryId !== current?.entryId) historyError("earlier unresolved user turn");
+  if (pending && pending.entryId !== current?.entryId && !allowPendingTail) historyError("earlier unresolved user turn");
+}
+
+export async function readNativeMaintenanceContext(
+  p: ScopeParams,
+  assertActive: () => void,
+  transport?: NativeTranscriptTransport,
+): Promise<{
+  messages: Result["messagesSnapshot"];
+  contextMessages: Result["messagesSnapshot"];
+  nativeStateId: string;
+  assistantKeyPrefix: string;
+  assertCurrent(): Promise<void>;
+}> {
+  assertActive();
+  const scope = resolveScope(p);
+  const sdk = transport === undefined ? await loadTransport() : checkedTransport(transport);
+  const read = async () => {
+    assertActive();
+    const [visible, raw] = await Promise.all([
+      sdk.readVisibleSessionTranscriptMessageEntries({ ...scope }),
+      sdk.readSessionTranscriptEvents({ ...scope }),
+    ]);
+    assertActive();
+    const entries = readEntries(visible);
+    const events = readRawEvents(raw);
+    const boundary = resolveActiveResetBoundary(events, scope.sessionId, entries);
+    const context = filterResetContext(entries, boundary);
+    const prefix = boundary.kind === "clear" ? boundary.assistantKeyPrefix : PREFIX;
+    validateHistory(context, undefined, "", prefix, true);
+    return { entries, events, boundary, context, prefix };
+  };
+  const initial = await read();
+  return {
+    messages: initial.entries.map((entry) => structuredClone(entry.message)),
+    contextMessages: initial.context.map((entry) => structuredClone(entry.message)),
+    nativeStateId: initial.boundary.kind === "clear" ? initial.boundary.stateId : scope.sessionId,
+    assistantKeyPrefix: initial.prefix,
+    async assertCurrent() {
+      const current = await read();
+      if (!isDeepStrictEqual(initial.events, current.events) || !isDeepStrictEqual(initial.entries, current.entries)) {
+        fail("transcript changed during native maintenance");
+      }
+    },
+  };
 }
 
 /**

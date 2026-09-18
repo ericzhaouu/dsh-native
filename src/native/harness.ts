@@ -1,16 +1,23 @@
 import type { AgentHarnessV2 } from "openclaw/plugin-sdk/agent-harness";
-import type { BridgeEvent, BridgeResult, BridgeUsage } from "../protocol.js";
+import { randomUUID } from "node:crypto";
+import type { BridgeContextUsage, BridgeEvent, BridgeResult, BridgeUsage } from "../protocol.js";
 import { RUNTIME_ID } from "../protocol.js";
 import type { DshConfig, DshRuntime } from "../runtime-types.js";
 import { prepareNativeHost, type NativeHost } from "./host.js";
 import { nativeSupports, resolveNativeRoute } from "./route.js";
-import { prepareNativeTranscript } from "./transcript.js";
+import { prepareNativeTranscript, readNativeMaintenanceContext } from "./transcript.js";
 import { prepareNativeContinuity } from "./continuity.js";
 import { resolvePreparationPolicy } from "../preparation.js";
 import { createPreparationGate } from "./preparation.js";
+import {
+  isNativeMemoryAttempt, renderMemoryPrompt, MEMORY_OUTPUT_TOKENS, MEMORY_TIMEOUT_MS, MEMORY_TOOL_LIMIT,
+} from "./memory.js";
+import { createIsolatedCompletion, type IsolatedCompletion } from "./isolated.js";
 
 type Attempt = Parameters<AgentHarnessV2["runAttempt"]>[0];
 type Result = Awaited<ReturnType<AgentHarnessV2["runAttempt"]>>;
+type CompactParams = Parameters<NonNullable<AgentHarnessV2["compact"]>>[0];
+type CompactResult = Awaited<ReturnType<NonNullable<AgentHarnessV2["compact"]>>>;
 type Terminal = Extract<Result, { terminal: unknown }>["terminal"];
 type Assistant = NonNullable<Result["lastAssistant"]>;
 type Sdk = typeof import("openclaw/plugin-sdk/agent-harness-runtime");
@@ -24,6 +31,7 @@ export interface NativeHarnessDependencies {
   prepareHost: typeof prepareNativeHost;
   prepareTranscript: typeof prepareNativeTranscript;
   prepareContinuity?: typeof prepareNativeContinuity;
+  readMaintenanceContext?: typeof readNativeMaintenanceContext;
 }
 
 const defaults: NativeHarnessDependencies = {
@@ -31,6 +39,7 @@ const defaults: NativeHarnessDependencies = {
   prepareHost: prepareNativeHost,
   prepareTranscript: prepareNativeTranscript,
   prepareContinuity: prepareNativeContinuity,
+  readMaintenanceContext: readNativeMaintenanceContext,
 };
 
 function failure(message: string): never {
@@ -38,6 +47,7 @@ function failure(message: string): never {
 }
 
 export function assertNativeAttemptSupported(p: Attempt, hostToolAllowlist?: readonly string[]): void {
+  isNativeMemoryAttempt(p);
   if (p.hostCapabilities?.kind !== "agent-harness-host-capability" || p.hostCapabilities.version !== 1) {
     failure("requires a versioned, host-prepared AgentHarnessV2 capability");
   }
@@ -66,7 +76,7 @@ export function assertNativeAttemptSupported(p: Attempt, hostToolAllowlist?: rea
       p.suppressAssistantErrorPersistence) {
     failure("internal continuations or transcript-suppression modes are unsupported");
   }
-  if (p.conversationRecall || p.internalEvents?.length || p.memoryFlushWritePath ||
+  if (p.conversationRecall || p.internalEvents?.length ||
       p.execApprovalContinuationPromptRange || p.execApprovalContinuationTranscriptPromptRange) {
     failure("out-of-band recall, maintenance, or approval-continuation context is unsupported");
   }
@@ -88,12 +98,15 @@ export function createNativeAssistant(p: Attempt, output: BridgeResult, now = Da
     model: p.model.id,
     usage: {
       ...output.usage, totalTokens,
+      ...(output.contextUsage ? { contextUsage: structuredClone(output.contextUsage) } : {}),
       // DSH reports tokens, not authoritative billing. Zero is explicitly unpriced, not a free request.
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
     },
     stopReason: output.stopReason,
     timestamp: now,
     ...{ dshNative: { billing: "unpriced",
+      ...(output.summaryUsage ? { summaryUsage: { ...output.summaryUsage } } : {}),
+      ...(output.lastCallUsage ? { lastCallUsage: { ...output.lastCallUsage } } : {}),
       ...(output.preparation ? { preparation: {
         mode: output.preparation.decision.mode,
         revision: output.preparation.state.revision,
@@ -124,6 +137,7 @@ export function createNativeHarness(
   const active = new Map<string, { controller: AbortController; done: Promise<void>; sessionKey?: string }>();
   let disposed = false;
   let disposal: Promise<void> | undefined;
+  let isolated: IsolatedCompletion | undefined;
 
   async function runAttempt(p: Attempt): Promise<Result> {
     const startedAt = Date.now();
@@ -140,6 +154,8 @@ export function createNativeHarness(
     let sdk: LifecycleSdk | undefined;
     let host: NativeHost | undefined;
     let transcript: Awaited<ReturnType<typeof prepareNativeTranscript>> | undefined;
+    let maintenance: Awaited<ReturnType<typeof readNativeMaintenanceContext>> | undefined;
+    let memory = false;
     let registered = false;
     let attached = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -157,6 +173,7 @@ export function createNativeHarness(
     let owned = false;
     let idempotencyKey: string | undefined;
     let usage: BridgeUsage | undefined;
+    let finalContextUsage: BridgeContextUsage | undefined;
     let streamedText = "";
     let streamedReasoning = "";
     let startedAssistant = false;
@@ -250,12 +267,13 @@ export function createNativeHarness(
     try {
       try {
         assertNativeAttemptSupported(p, config.toolAllowlist);
+        memory = isNativeMemoryAttempt(p);
         if (disposed) failure("harness is disposed");
         if (active.has(p.sessionId)) failure("another DSH native attempt owns this session");
         active.set(p.sessionId, owner);
         claimed = true;
         assertActive();
-        const deadlineAtMs = startedAt + p.timeoutMs;
+        const deadlineAtMs = startedAt + (memory ? Math.min(p.timeoutMs, MEMORY_TIMEOUT_MS) : p.timeoutMs);
         const expire = () => {
           if (settled || signal.aborted) return;
           timedOut = true;
@@ -274,8 +292,9 @@ export function createNativeHarness(
           p = { ...p, agentId: sessionAgentId };
         }
         const route = resolveNativeRoute(p, config, sdk.getModelProviderRequestTransport);
+        if (memory) route.maxTokens = Math.min(route.maxTokens ?? MEMORY_OUTPUT_TOKENS, MEMORY_OUTPUT_TOKENS);
         executedModel = { provider: p.provider, model: route.modelId };
-        const preparationPolicy = resolvePreparationPolicy(config.taskPreparation, p.agentId ?? "");
+        const preparationPolicy = memory ? undefined : resolvePreparationPolicy(config.taskPreparation, p.agentId ?? "");
         if (preparationPolicy && p.inputProvenance && p.inputProvenance.kind !== "external_user") {
           failure("adaptive task preparation requires an ordinary foreground user turn");
         }
@@ -293,17 +312,34 @@ export function createNativeHarness(
         attached = !!p.replyOperation;
         p.replyOperation?.setPhase("running");
         assertActive();
-        transcript = await dependencies.prepareTranscript(p, assertActive);
+        if (memory) {
+          maintenance = await (dependencies.readMaintenanceContext ?? readNativeMaintenanceContext)(p, assertActive);
+        } else {
+          transcript = await dependencies.prepareTranscript(p, assertActive);
+          await runtime.recoverCompaction?.({
+            ...route, sessionId: p.sessionId, nativeStateId: transcript.nativeStateId,
+            runId: p.runId, workspaceDir: p.cwd ?? p.workspaceDir, signal, assertActive,
+          });
+        }
         assertActive();
-        assertContinuity = dependencies.prepareContinuity?.(
+        assertContinuity = transcript && dependencies.prepareContinuity?.(
           config, p, transcript.contextMessages, transcript.nativeStateId, transcript.assistantKeyPrefix,
         );
         assertContinuity?.();
-        host = await dependencies.prepareHost(p, signal, assertActive, transcript.contextMessages,
+        const history = transcript?.contextMessages ?? maintenance?.contextMessages ?? [];
+        host = await dependencies.prepareHost(p, signal, assertActive, history,
           preparationPolicy && preparationGate ? { policy: preparationPolicy, gate: preparationGate } : undefined,
-          config.toolAllowlist);
+          memory ? (config.toolAllowlist ?? ["read", "write"]).filter((name) => name === "read" || name === "write") : config.toolAllowlist);
         assertActive();
-        await transcript.persistUser();
+        if (memory) {
+          if (host.tools.some((tool) => tool.name !== "read" && tool.name !== "write")) {
+            failure("memory maintenance received a non-memory host tool");
+          }
+          host = { ...host, prompt: renderMemoryPrompt(host, history, route.contextWindow, route.maxTokens ?? MEMORY_OUTPUT_TOKENS) };
+          await maintenance?.assertCurrent();
+        } else {
+          await transcript!.persistUser();
+        }
         assertActive();
         assertContinuity?.();
         sdk.runAgentHarnessLlmInputHook({
@@ -311,11 +347,11 @@ export function createNativeHarness(
           event: {
             runId: p.runId, sessionId: p.sessionId, provider: p.provider, model: route.modelId,
             systemPrompt: host.systemPrompt, prompt: host.prompt,
-            historyMessages: transcript.contextMessages.slice(0, -1), imagesCount: 0, tools: host.tools,
+            historyMessages: memory ? [] : transcript!.contextMessages.slice(0, -1), imagesCount: 0, tools: host.tools,
           },
         });
         assertActive();
-        transcript.markSentToProvider();
+        transcript?.markSentToProvider();
         runtimeEntered = true;
         p.onExecutionStarted?.({ lifecycleGeneration: p.lifecycleGeneration });
         p.onExecutionPhase?.({ phase: "model_call_started", provider: p.provider, model: route.modelId,
@@ -323,7 +359,7 @@ export function createNativeHarness(
         assertActive();
         const output = await runtime.run({
           ...route, sessionId: p.sessionId, runId: p.runId,
-          nativeStateId: transcript.nativeStateId,
+          nativeStateId: memory ? `${maintenance!.nativeStateId}\0memory\0${p.runId}` : transcript!.nativeStateId,
           workspaceDir: p.cwd ?? p.workspaceDir, prompt: host.prompt, systemPrompt: host.systemPrompt,
           tools: host.tools, signal,
           assertActive: () => { assertActive(); assertContinuity?.(); },
@@ -337,6 +373,10 @@ export function createNativeHarness(
           } satisfies Pick<Parameters<DshRuntime["run"]>[0], "taskPreparation" | "onPreparationDecision"> : {}),
           executeTool: async (call, toolSignal) => {
             assertActive();
+            if (memory) {
+              await maintenance!.assertCurrent();
+              if (toolMetas.length >= MEMORY_TOOL_LIMIT) failure("memory maintenance exceeded its bounded host-tool budget");
+            }
             await p.onToolStreamBoundary?.();
             const meta: Result["toolMetas"][number] = { toolName: call.name, toolCallId: call.callId };
             toolMetas.push(meta);
@@ -353,12 +393,14 @@ export function createNativeHarness(
         runtimeSettled = true;
         assertActive();
         assertContinuity?.();
+        await maintenance?.assertCurrent();
         usage = output.usage;
+        finalContextUsage = memory ? { state: "unavailable" } : output.contextUsage;
         if (output.stopReason === "aborted") {
           controller.abort(new Error("DSH runtime aborted its turn"));
           signal.throwIfAborted();
         }
-        assistant = createNativeAssistant(p, output);
+        assistant = createNativeAssistant(p, { ...output, contextUsage: finalContextUsage });
         sdk.runAgentHarnessLlmOutputHook({
           ctx: hookContext, event: {
             runId: p.runId, sessionId: p.sessionId, provider: p.provider, model: route.modelId,
@@ -373,17 +415,23 @@ export function createNativeHarness(
             runId: p.runId, sessionId: p.sessionId, sessionKey: p.sessionKey,
             provider: p.provider, model: route.modelId, cwd: p.cwd ?? p.workspaceDir,
             stopHookActive: false, lastAssistantMessage: output.text,
-            messages: [...transcript.contextMessages, assistant],
+            messages: [...(transcript?.contextMessages ?? []), assistant],
           },
         });
         assertActive();
         if (finalization.action === "revise") failure("before_agent_finalize requested a revision; native revision continuations are unsupported");
-        const persisted = await transcript.persistAssistant(assistant);
-        owned = persisted.owned;
-        idempotencyKey = persisted.idempotencyKey;
-        assistant = persisted.message;
-        assertActive();
-        if (persisted.suppressed) failure("assistant transcript hook suppressed the native mirror; start a fresh session with /new");
+        if (memory) {
+          // The completion is durable only in the isolated maintenance binding.
+          // Do not append an internal user/assistant pair to the foreground mirror.
+          owned = true;
+        } else {
+          const persisted = await transcript!.persistAssistant(assistant);
+          owned = persisted.owned;
+          idempotencyKey = persisted.idempotencyKey;
+          assistant = persisted.message;
+          assertActive();
+          if (persisted.suppressed) failure("assistant transcript hook suppressed the native mirror; start a fresh session with /new");
+        }
         completedAssistant = assistant;
         if (streamedReasoning) await p.onReasoningEnd?.();
         assertActive();
@@ -416,7 +464,7 @@ export function createNativeHarness(
       if (runtimeEntered || emittedVisibleOutput) replay.replaySafe = false;
       const result: Result = {
         terminal, sessionIdUsed: p.sessionId, sessionFileUsed: p.sessionFile, agentHarnessId: RUNTIME_ID,
-        messagesSnapshot: transcript?.messages ?? [], assistantTexts: completedAssistant
+        messagesSnapshot: transcript?.messages ?? maintenance?.messages ?? [], assistantTexts: completedAssistant
           ? completedAssistant.content.filter((block) => block.type === "text").map((block) => block.text) : [],
         lastAssistant: assistant, currentAttemptAssistant: attributeAssistant(assistant, executedModel),
         currentAttemptCompletedAssistant: attributeAssistant(completedAssistant, executedModel),
@@ -425,7 +473,11 @@ export function createNativeHarness(
         cloudCodeAssistFormatError: false, replayMetadata: replay,
         itemLifecycle: host?.getToolCounts() ?? { startedCount: 0, completedCount: 0, activeCount: 0 },
         ...(owned ? { assistantTranscriptOwned: true, assistantTranscriptIdempotencyKey: idempotencyKey } : {}),
-        ...(usage ? { attemptUsage: { ...usage, total: usage.input + usage.output + usage.cacheRead + usage.cacheWrite } } : {}),
+        ...(usage ? { attemptUsage: {
+          ...usage,
+          total: usage.input + usage.output + usage.cacheRead + usage.cacheWrite,
+          ...(finalContextUsage ? { contextUsage: structuredClone(finalContextUsage) } : {}),
+        } } : {}),
       };
       if (sdk && hookContext) {
         try {
@@ -488,6 +540,96 @@ export function createNativeHarness(
     }
   }
 
+  async function compact(p: CompactParams): Promise<CompactResult> {
+    const controller = new AbortController();
+    const signal = AbortSignal.any([
+      controller.signal,
+      ...(p.abortSignal ? [p.abortSignal] : []),
+    ]);
+    let release!: () => void;
+    const done = new Promise<void>((resolve) => { release = resolve; });
+    const owner = { controller, done, sessionKey: p.sessionKey };
+    let claimed = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      signal.throwIfAborted();
+      if (disposed) failure("harness is disposed");
+      if (!p.sessionId || !p.sessionFile || !p.workspaceDir) failure("missing prepared compaction identity");
+      if (active.has(p.sessionId)) failure("another DSH native operation owns this session");
+      if (p.agentHarnessId && p.agentHarnessId !== RUNTIME_ID) failure("prepared harness identity differs from dsh-native");
+      const model = p.runtimeModel ?? failure("native compaction requires the host-resolved runtime model");
+      const provider = p.provider ?? model.provider;
+      if (provider !== "deepseek" && provider !== "github-copilot") failure("unsupported native compaction provider");
+      if (provider !== model.provider) failure("native compaction provider does not match the runtime model");
+      if (p.cliSessionId || p.cliSessionBinding) failure("CLI bindings cannot select native DSH history");
+      const runId = p.runId ?? p.sessionTarget?.expectedWriterRunId ?? `compact-${randomUUID()}`;
+      if (!runId.trim() || runId.trim() !== runId) failure("invalid native compaction run identity");
+      active.set(p.sessionId, owner);
+      claimed = true;
+      timer = setTimeout(() => controller.abort(new Error("DSH native compaction deadline exceeded")), 120_000);
+      const assertActive = () => {
+        signal.throwIfAborted();
+        if (disposed || !claimed || active.get(p.sessionId) !== owner) failure("compaction authority is no longer current");
+      };
+      const sdk = await dependencies.loadSdk();
+      assertActive();
+      const context = await (dependencies.readMaintenanceContext ?? readNativeMaintenanceContext)({ ...p, runId }, assertActive);
+      const route = resolveNativeRoute({
+        ...p,
+        provider,
+        model,
+        modelId: p.model ?? model.id,
+        resolvedApiKey: p.resolvedApiKey,
+        thinkLevel: p.thinkLevel ?? "off",
+        config: p.config,
+      }, config, sdk.getModelProviderRequestTransport);
+      await context.assertCurrent();
+      const output = await runtime.compact({
+        ...route,
+        provider,
+        sessionId: p.sessionId,
+        nativeStateId: context.nativeStateId,
+        runId,
+        workspaceDir: p.cwd ?? p.workspaceDir,
+        signal,
+        assertActive: () => {
+          assertActive();
+          p.compactionTimeoutReset?.();
+        },
+      });
+      await context.assertCurrent();
+      return {
+        ok: true,
+        compacted: output.compacted,
+        compactionKind: "native-harness",
+        reason: output.compacted ? undefined : "no compactable native history range",
+        result: {
+          summary: output.summary,
+          tokensBefore: output.tokensBefore ?? p.currentTokenCount ?? 0,
+          tokensAfter: output.tokensAfter,
+          details: { ...output.details,
+            ...(output.summaryUsage ? { summaryUsage: output.summaryUsage, billing: "unpriced" } : {}),
+          },
+          sessionId: p.sessionId,
+          sessionFile: p.sessionFile,
+        },
+      };
+    } catch (error) {
+      const message = describe(error);
+      return {
+        ok: false,
+        compacted: false,
+        compactionKind: "native-harness",
+        reason: message,
+        failure: { reason: message },
+      };
+    } finally {
+      if (timer) clearTimeout(timer);
+      if (claimed && active.get(p.sessionId) === owner) active.delete(p.sessionId);
+      release();
+    }
+  }
+
   return {
     id: RUNTIME_ID, label: "DeepSeek Harness (native, opt-in)", pluginId: RUNTIME_ID,
     autoSelection: { providerIds: [] }, deliveryDefaults: { visibleReplies: "automatic" },
@@ -498,7 +640,16 @@ export function createNativeHarness(
     conversationToolPolicySafeDenyTools: Object.freeze([
       "sessions_list", "sessions_history", "sessions_send", "session_status",
     ]),
-    supports: nativeSupports, runAttempt,
+    supports: nativeSupports, runAttempt, compact,
+    async runIsolatedCompletionV2(p) {
+      if (disposed) failure("harness is disposed");
+      const sdk = await dependencies.loadSdk();
+      if (disposed) failure("harness is disposed");
+      isolated ??= createIsolatedCompletion(config, (input, settings) => resolveNativeRoute({
+        ...input, thinkLevel: input.thinkLevel ?? "off",
+      }, settings, sdk.getModelProviderRequestTransport));
+      return isolated.run(p);
+    },
     async reset(params) {
       for (const [sessionId, run] of active) {
         if (params.sessionId === sessionId || params.sessionKey && params.sessionKey === run.sessionKey) {
@@ -512,7 +663,11 @@ export function createNativeHarness(
       disposal ??= (async () => {
         disposed = true;
         for (const run of active.values()) run.controller.abort(new Error("DSH harness disposed"));
-        try { await runtime.dispose(); }
+        try {
+          const outcomes = await Promise.allSettled([runtime.dispose(), isolated?.dispose()]);
+          const errors = outcomes.filter((outcome) => outcome.status === "rejected").map((outcome) => outcome.reason);
+          if (errors.length) throw new AggregateError(errors, "DSH harness disposal failed");
+        }
         finally { await Promise.all([...active.values()].map((run) => run.done)); }
       })();
       return disposal;

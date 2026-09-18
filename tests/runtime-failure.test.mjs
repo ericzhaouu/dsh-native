@@ -12,28 +12,44 @@ import { parseDshConfig } from "../dist/config.js";
 import { JsonRpcPeer } from "../dist/rpc.js";
 import { createDshRuntime } from "../dist/runtime.js";
 
-function childFixture({ ignoreKill = false, ready = true, trailingGarbage = false, onRun } = {}) {
+function enotconn(message = "read ENOTCONN") {
+  return Object.assign(new Error(message), { code: "ENOTCONN" });
+}
+
+function childFixture({
+  ignoreKill = false, ready = true, trailingGarbage = false, onRun, missingStdio,
+  onCompact, onInspectCompact, processErrorBeforeReady = false, stderrErrorBeforeReady = false, stderrChunks = [],
+} = {}) {
   const child = new EventEmitter();
   Object.assign(child, {
     pid: 123456, exitCode: null, signalCode: null,
     stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(),
   });
+  if (missingStdio) child[missingStdio] = undefined;
   const kills = [];
   const exit = () => {
     if (child.exitCode !== null) return;
     child.exitCode = 0;
-    child.stdout.end();
+    child.stdout?.end();
     child.emit("close", 0);
   };
   child.kill = (signal = "SIGTERM") => { kills.push(signal); if (!ignoreKill) exit(); return true; };
-  const peer = new JsonRpcPeer(child.stdin, child.stdout, {
+  const peer = child.stdin && child.stdout ? new JsonRpcPeer(child.stdin, child.stdout, {
     onRequest: async (method, params) => {
       if (method === "run") {
-        const result = onRun ? await onRun(params, peer) : {};
+        const result = onRun ? await onRun(params, peer, child) : {};
         return {
           text: "done", sessionId: params.sessionId, usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 },
           stopReason: "stop", toolCalls: 0, ...result,
         };
+      }
+      if (method === "compact") {
+        if (!onCompact) throw new Error("Unexpected compact");
+        return onCompact(params, peer, child);
+      }
+      if (method === "inspectCompact") {
+        if (!onInspectCompact) throw new Error("Unexpected compact inspection");
+        return onInspectCompact(params, peer, child);
       }
       if (method === "shutdown") {
         setImmediate(() => { if (trailingGarbage) child.stdout.write("garbage\n"); exit(); });
@@ -41,11 +57,14 @@ function childFixture({ ignoreKill = false, ready = true, trailingGarbage = fals
       }
       throw new Error("Unexpected method");
     },
-  });
-  if (ready) setImmediate(() => peer.notify("event", { type: "ready", version: 1, dshVersion: "0.1.2-alpha.2" }));
+  }) : undefined;
+  for (const [delay, text] of stderrChunks) setTimeout(() => { child.stderr?.write(text); }, delay);
+  if (processErrorBeforeReady) setImmediate(() => { child.emit("error", enotconn("spawn ENOTCONN")); exit(); });
+  if (stderrErrorBeforeReady) setImmediate(() => { child.stderr?.emit("error", enotconn()); });
+  if (ready && peer) setImmediate(() => peer.notify("event", { type: "ready", version: 1, dshVersion: "0.1.2-alpha.2" }));
   return {
     child, kills,
-    close() { peer.close(); exit(); child.stdin.destroy(); child.stdout.destroy(); child.stderr.destroy(); },
+    close() { peer?.close(); exit(); child.stdin?.destroy(); child.stdout?.destroy(); child.stderr?.destroy(); },
   };
 }
 
@@ -85,6 +104,93 @@ test("all consumed attempt IDs remain replay-protected", async (t) => {
     await runtime.run({ ...input, runId: "second" });
     await assert.rejects(runtime.run(input), /already submitted/);
     assert.equal(children.length, 2);
+  });
+});
+
+test("Windows rejects an overlong child cwd before spawning or creating a binding",
+  { skip: process.platform !== "win32" }, async (t) => {
+    await withMock(t, {}, async ({ root, input, children }) => {
+      const stateDir = join(root, "long-state-" + "x".repeat(150));
+      const runtime = createDshRuntime(parseDshConfig({ stateDir }));
+      try {
+        await assert.rejects(runtime.run(input), /Windows process limit.*shorter stateDir/);
+        assert.equal(children.length, 0);
+        await assert.rejects(readFile(bindingPath(stateDir, input), "utf8"), /ENOENT/);
+      } finally { await runtime.dispose(); }
+    });
+  });
+
+test("child stderr ENOTCONN before ready is reported as a handshake transport failure", async (t) => {
+  await withMock(t, { ready: false, stderrErrorBeforeReady: true }, async ({ runtime, input, children }) => {
+    await assert.rejects(runtime.run(input), /stderr failed during handshake.*code=ENOTCONN/);
+    assert.deepEqual(children[0].kills, ["SIGTERM"]);
+  });
+});
+
+test("child process error followed by close does not poison cleanup waiting", async (t) => {
+  await withMock(t, { ready: false, processErrorBeforeReady: true }, async ({ runtime, input, children }) => {
+    await assert.rejects(runtime.run(input), /process failed during handshake.*code=ENOTCONN/);
+    assert.equal(children[0].child.exitCode, 0);
+  });
+});
+
+test("missing child stdio fails as a spawn lifecycle error without a TypeError", async (t) => {
+  await withMock(t, { missingStdio: "stdout", ready: false }, async ({ runtime, input, children }) => {
+    await assert.rejects(runtime.run(input), (error) => {
+      assert.match(error.message, /stdout failed during spawn/);
+      assert.doesNotMatch(error.message, /TypeError/);
+      return true;
+    });
+    assert.doesNotThrow(() => children[0].child.stderr.emit("error", enotconn()),
+      "Remaining streams must retain error sinks even after partial stdio startup failure");
+  });
+});
+
+test("ready notification callback rejection prevents run submission", async (t) => {
+  let runRequests = 0;
+  await withMock(t, { onRun() { runRequests++; return {}; } }, async ({ root, runtime, input }) => {
+    input.onEvent = async (event) => {
+      if (event.type === "ready") {
+        await new Promise((resolve) => setImmediate(resolve));
+        throw new Error("ready callback rejected");
+      }
+    };
+    await assert.rejects(runtime.run(input), /ready callback rejected/);
+    assert.equal(runRequests, 0);
+    await assert.rejects(readFile(bindingPath(root, input), "utf8"), /ENOENT/);
+  });
+});
+
+test("startup timeout formats the latest bounded redacted stderr when it expires", async (t) => {
+  await withMock(t, {
+    ready: false,
+    stderrChunks: [[50, `late diagnostic includes test-key\n`]],
+  }, async ({ runtime, input }) => {
+    await assert.rejects(runtime.run(input), (error) => {
+      assert.match(error.message, /DSH bridge startup timed out; stage=handshake; pid=123456/);
+      assert.match(error.message, /late diagnostic includes \[redacted\]/);
+      assert.doesNotMatch(error.message, /test-key/);
+      return true;
+    });
+  });
+});
+
+test("stderr ENOTCONN during run does not return a fake successful result", async (t) => {
+  await withMock(t, { async onRun(_params, _peer, child) {
+    setImmediate(() => child.stderr.emit("error", enotconn()));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    return {};
+  } }, async ({ runtime, input }) => {
+    await assert.rejects(runtime.run(input), /stderr failed during run.*code=ENOTCONN/);
+  });
+});
+
+test("stderr ENOTCONN after a run result but before confirmed exit is not success", async (t) => {
+  await withMock(t, { async onRun(_params, _peer, child) {
+    setImmediate(() => child.stderr.emit("error", enotconn()));
+    return {};
+  } }, async ({ runtime, input }) => {
+    await assert.rejects(runtime.run(input), /stderr failed during (run|shutdown).*code=ENOTCONN/);
   });
 });
 
@@ -563,5 +669,47 @@ test("unconfirmed termination retains ownership even when startup never finished
     assert.ok(await readFile(join(root, key, "owner.lock"), "utf8"));
     await assert.rejects(runtime.run({ ...input, runId: "second" }), /already has an owner/);
     assert.equal(children.length, 1);
+  });
+});
+
+test("compaction recovery inspects a committed receipt without redoing model work", async (t) => {
+  let compactCalls = 0;
+  let inspectCalls = 0;
+  await withMock(t, {
+    async onCompact(params, _peer, child) {
+      compactCalls++;
+      assert.equal(params.runId, "compact-1");
+      setImmediate(() => child.stderr.emit("error", enotconn()));
+      return {
+        compacted: true,
+        sessionId: params.sessionId,
+        summary: "durable summary",
+        details: { compactionId: "compact-test" },
+      };
+    },
+    onInspectCompact(params) {
+      inspectCalls++;
+      assert.equal(params.runId, "compact-1");
+      return {
+        compacted: true,
+        sessionId: params.sessionId,
+        summary: "durable summary",
+        details: { recovered: true, compactionId: "compact-test" },
+      };
+    },
+  }, async ({ root, runtime, input, children }) => {
+    await runtime.run(input);
+    await assert.rejects(runtime.compact({ ...input, runId: "compact-1" }), /stderr failed during (run|shutdown).*ENOTCONN/);
+    assert.equal(JSON.parse(await readFile(bindingPath(root, input), "utf8")).status, "running");
+    const recovered = await runtime.compact({ ...input, runId: "compact-1" });
+    assert.equal(recovered.compacted, true);
+    assert.equal(recovered.details.recovered, true);
+    const binding = JSON.parse(await readFile(bindingPath(root, input), "utf8"));
+    assert.equal(binding.status, "ready");
+    assert.deepEqual(binding.compactRunIds, ["compact-1"]);
+    assert.equal(binding.lastRunId, input.runId);
+    assert.equal(compactCalls, 1);
+    assert.equal(inspectCalls, 1);
+    assert.equal(children.length, 3);
   });
 });

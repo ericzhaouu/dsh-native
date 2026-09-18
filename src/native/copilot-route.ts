@@ -3,8 +3,9 @@ import { COPILOT_ENDPOINTS, copilotHeaders } from "../copilot-policy.js";
 import { normalizeBaseUrl } from "../config.js";
 import { isRecord, RUNTIME_ID, type ReasoningEfforts, type ReasoningLevel } from "../protocol.js";
 import type { DshAttempt, DshConfig } from "../runtime-types.js";
+import type { NativeRouteInput } from "./route.js";
 
-type Attempt = Parameters<AgentHarnessV2["runAttempt"]>[0];
+type Attempt = NativeRouteInput;
 type Support = Parameters<AgentHarnessV2["supports"]>[0];
 type ReadTransport = typeof import("openclaw/plugin-sdk/agent-harness-runtime")["getModelProviderRequestTransport"];
 export type CopilotRoute = Pick<DshAttempt, "provider" | "modelId" | "modelName" | "apiKey" |
@@ -180,11 +181,12 @@ export function resolveCopilotRoute(p: Attempt, config: DshConfig, readTransport
   if (plan?.resolvedRef?.transport !== undefined && !["sse", "auto"].includes(plan.resolvedRef.transport)) {
     fail("only SSE Responses transport is supported");
   }
-  if (plan?.auth?.harnessAuthProvider || plan?.auth?.deferredRouteSupport ||
-      plan?.auth?.selectedAuthMode !== undefined && !AUTH_MODES.has(plan.auth.selectedAuthMode)) {
+  const auth = p.runtimeAuthPlan ?? plan?.auth;
+  if (auth?.harnessAuthProvider || auth?.deferredRouteSupport ||
+       auth?.selectedAuthMode !== undefined && !AUTH_MODES.has(auth.selectedAuthMode)) {
     fail("requires already-prepared host token authentication");
   }
-  const route = plan?.auth?.modelRoute;
+  const route = auth?.modelRoute;
   if (route && (route.provider !== p.provider || route.modelId !== p.model.id ||
       route.api !== p.model.api || normalizeBaseUrl(route.baseUrl) !== baseUrl ||
       !compatibleRuntime(route.runtimePolicy?.compatibleIds))) fail("prepared account route differs from the selected model");

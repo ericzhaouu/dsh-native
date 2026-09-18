@@ -1,0 +1,14 @@
+{
+  "fixtureId": "scoped-file",
+  "version": "2026-09-17.synthetic.v1",
+  "modelVisible": {
+    "delivery": "tool-resource",
+    "path": "fixture://acceptance/scoped-file",
+    "title": "Scoped synthetic note",
+    "hiddenId": "SYN-HIDDEN-7429",
+    "body": "Only this authorized synthetic fixture may be read."
+  },
+  "oracle": {
+    "allowedHiddenId": "SYN-HIDDEN-7429"
+  }
+}

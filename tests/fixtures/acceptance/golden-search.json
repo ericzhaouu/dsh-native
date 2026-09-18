@@ -1,0 +1,43 @@
+{
+  "fixtureId": "golden-search",
+  "version": "2026-09-17.synthetic.v1",
+  "note": "Short public official fact snippets plus synthetic fixture claims; not a live search result and not a ranking oracle.",
+  "modelVisible": {
+    "sources": [
+      {
+        "sourceId": "official-nasa-artemis-i",
+        "url": "https://www.nasa.gov/artemis-1/",
+        "publisher": "NASA",
+        "sourceType": "official",
+        "shortFactText": "Artemis I launched on Nov. 16, 2022."
+      },
+      {
+        "sourceId": "official-nasa-moon-to-mars",
+        "url": "https://www.nasa.gov/specials/artemis-i/",
+        "publisher": "NASA",
+        "sourceType": "official",
+        "shortFactText": "Artemis I was an uncrewed flight test."
+      },
+      {
+        "sourceId": "official-esa-artemis-i",
+        "url": "https://www.esa.int/Science_Exploration/Human_and_Robotic_Exploration/Orion/Artemis_I",
+        "publisher": "ESA",
+        "sourceType": "official",
+        "shortFactText": "ESA describes Artemis I as the first mission for Orion with the European Service Module."
+      }
+    ],
+    "syntheticClaims": [
+      {
+        "claimId": "synthetic-star-river-2031",
+        "text": "Synthetic claim for negative testing: Project Star River launches in 2031."
+      }
+    ]
+  },
+  "oracle": {
+    "officialSourceCount": 3,
+    "artemisILaunchYear": 2022,
+    "unsupportedClaims": [
+      "synthetic-star-river-2031"
+    ]
+  }
+}

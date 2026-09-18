@@ -10,10 +10,10 @@ import { COPILOT_ENDPOINTS, copilotHeaders } from "./copilot-policy.js";
 import { createBridgePatch } from "./bridge/profile.js";
 import {
   BRIDGE_VERSION, DSH_VERSION, isRecord,
-  type BridgeEvent, type BridgeResult, type BridgeToolCall, type BridgeUsage,
+  type BridgeCompactResult, type BridgeContextUsage, type BridgeEvent, type BridgeResult, type BridgeToolCall, type BridgeUsage,
 } from "./protocol.js";
 import { asError, JsonRpcPeer } from "./rpc.js";
-import type { DshAttempt, DshConfig, DshRuntime } from "./runtime-types.js";
+import type { DshAttempt, DshCompactAttempt, DshConfig, DshRuntime } from "./runtime-types.js";
 import {
   PREPARATION_TOOL_NAME, parsePreparationPolicy, parsePreparationRequest,
   parsePreparationResolution, parsePreparationState, resolvePreparationDecision,
@@ -34,6 +34,8 @@ interface SessionState {
   status: "running" | "ready" | "blocked";
   lastRunId: string;
   consumedRunIds: string[];
+  compactRunIds?: string[];
+  pendingCompact?: { runId: string };
   modelRoute?: string;
   taskPreparation?: SessionPreparation;
 }
@@ -42,6 +44,21 @@ class ChildTerminationError extends Error {}
 
 function code(error: unknown): string | undefined {
   return isRecord(error) && typeof error.code === "string" ? error.code : undefined;
+}
+
+type ChildLifecycleStage = "spawn" | "handshake" | "run" | "shutdown";
+type ChildStreamName = "process" | "stdin" | "stdout" | "stderr";
+
+function childLifecycleError(stage: ChildLifecycleStage, stream: ChildStreamName, error: unknown, pid?: number): Error {
+  const parts = [`DSH child ${stream} failed during ${stage}`];
+  if (pid !== undefined) parts.push(`pid=${pid}`);
+  const errorCode = code(error);
+  if (errorCode) parts.push(`code=${errorCode}`);
+  return new Error(parts.join(" "), { cause: error });
+}
+
+function redactDiagnostic(value: string, apiKey: string): string {
+  return value.replaceAll(apiKey, "[redacted]");
 }
 
 async function loadState(path: string): Promise<SessionState | undefined> {
@@ -56,6 +73,11 @@ async function loadState(path: string): Promise<SessionState | undefined> {
   if (!isRecord(value) || value.version !== BRIDGE_VERSION || value.dshVersion !== DSH_VERSION ||
       typeof value.sessionId !== "string" || typeof value.workspaceDir !== "string" ||
       !Array.isArray(value.consumedRunIds) || value.consumedRunIds.some((id) => typeof id !== "string") ||
+      value.compactRunIds !== undefined && (!Array.isArray(value.compactRunIds) ||
+        value.compactRunIds.some((id) => typeof id !== "string")) ||
+      value.pendingCompact !== undefined && (!isRecord(value.pendingCompact) ||
+        Object.keys(value.pendingCompact).some((key) => key !== "runId") ||
+        typeof value.pendingCompact.runId !== "string" || !value.pendingCompact.runId) ||
       value.modelRoute !== undefined && (typeof value.modelRoute !== "string" || !/^[a-f0-9]{64}$/.test(value.modelRoute)) ||
       typeof value.lastRunId !== "string" || !["ready", "running", "blocked"].includes(String(value.status))) {
     throw new Error("Invalid or incompatible DSH session state; start a new OpenClaw session.");
@@ -85,6 +107,8 @@ async function loadState(path: string): Promise<SessionState | undefined> {
     version: value.version, dshVersion: value.dshVersion, sessionId: value.sessionId,
     workspaceDir: value.workspaceDir, lastRunId: value.lastRunId,
     consumedRunIds: value.consumedRunIds,
+    ...(value.compactRunIds ? { compactRunIds: value.compactRunIds } : {}),
+    ...(value.pendingCompact ? { pendingCompact: { runId: String(value.pendingCompact.runId) } } : {}),
     modelRoute: value.modelRoute,
     status: value.status === "ready" ? "ready" : value.status === "running" ? "running" : "blocked",
     ...(taskPreparation ? { taskPreparation } : {}),
@@ -141,6 +165,17 @@ function usage(value: unknown): BridgeUsage {
   };
 }
 
+function contextUsage(value: unknown): BridgeContextUsage {
+  if (!isRecord(value)) throw new Error("Invalid DSH context usage.");
+  if (value.state === "unavailable") return { state: "unavailable" };
+  if (value.state !== "available" ||
+      typeof value.promptTokens !== "number" || !Number.isSafeInteger(value.promptTokens) || value.promptTokens < 0 ||
+      typeof value.totalTokens !== "number" || !Number.isSafeInteger(value.totalTokens) || value.totalTokens < value.promptTokens) {
+    throw new Error("Invalid DSH context usage.");
+  }
+  return { state: "available", promptTokens: value.promptTokens, totalTokens: value.totalTokens };
+}
+
 function parseResult(value: unknown, sessionId: string): BridgeResult {
   if (!isRecord(value) || typeof value.text !== "string" || value.sessionId !== sessionId ||
       typeof value.toolCalls !== "number" || !Number.isSafeInteger(value.toolCalls) || value.toolCalls < 0 ||
@@ -154,7 +189,33 @@ function parseResult(value: unknown, sessionId: string): BridgeResult {
   return {
     text: value.text, reasoning: value.reasoning, sessionId, stopReason,
     usage: usage(value.usage), toolCalls: value.toolCalls,
+    ...(Object.hasOwn(value, "summaryUsage") ? { summaryUsage: usage(value.summaryUsage) } : {}),
+    ...(Object.hasOwn(value, "contextUsage") ? { contextUsage: contextUsage(value.contextUsage) } : {}),
+    ...(Object.hasOwn(value, "lastCallUsage") ? { lastCallUsage: usage(value.lastCallUsage) } : {}),
     ...(Object.hasOwn(value, "preparation") ? { preparation: parsePreparationResolution(value.preparation) } : {}),
+  };
+}
+
+function parseCompactResult(value: unknown, sessionId: string): BridgeCompactResult {
+  if (!isRecord(value) || typeof value.compacted !== "boolean" || value.sessionId !== sessionId) {
+    throw new Error("Malformed DSH compaction result.");
+  }
+  for (const key of ["tokensBefore", "tokensAfter"] as const) {
+    if (value[key] !== undefined && (typeof value[key] !== "number" || !Number.isSafeInteger(value[key]) || value[key] < 0)) {
+      throw new Error(`Invalid DSH compaction field: ${key}`);
+    }
+  }
+  if (value.summary !== undefined && typeof value.summary !== "string") throw new Error("Invalid DSH compaction summary.");
+  if (value.summaryUsage !== undefined) usage(value.summaryUsage);
+  if (value.details !== undefined && !isRecord(value.details)) throw new Error("Invalid DSH compaction details.");
+  return {
+    compacted: value.compacted,
+    sessionId,
+    ...(value.summary === undefined ? {} : { summary: value.summary }),
+    ...(value.tokensBefore === undefined ? {} : { tokensBefore: Number(value.tokensBefore) }),
+    ...(value.tokensAfter === undefined ? {} : { tokensAfter: Number(value.tokensAfter) }),
+    ...(value.summaryUsage === undefined ? {} : { summaryUsage: usage(value.summaryUsage) }),
+    ...(value.details === undefined ? {} : { details: JSON.parse(JSON.stringify(value.details)) }),
   };
 }
 
@@ -181,18 +242,30 @@ function parseEvent(value: unknown): BridgeEvent {
   }
 }
 
-function timeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+function timeout<T>(promise: Promise<T>, ms: number, message: string | (() => string)): Promise<T> {
   let timer: NodeJS.Timeout;
   return Promise.race([
     promise,
-    new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(message)), ms); }),
+    new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(typeof message === "function" ? message() : message)), ms);
+    }),
   ]).finally(() => clearTimeout(timer));
 }
 
 export function createDshRuntime(config: DshConfig): DshRuntime {
   const active = new Set<AbortController>();
-  const running = new Set<Promise<BridgeResult>>();
+  const running = new Set<Promise<unknown>>();
   let disposed = false;
+  const compact = (input: DshCompactAttempt) => {
+    if (disposed) return Promise.reject(new Error("dsh-native runtime has been disposed."));
+    const controller = new AbortController();
+    active.add(controller);
+    const result = compactChild(config, {
+      ...input, signal: AbortSignal.any([input.signal, controller.signal]),
+    }).finally(() => { active.delete(controller); running.delete(result); });
+    running.add(result);
+    return result;
+  };
   return {
     run(input) {
       if (disposed) return Promise.reject(new Error("dsh-native runtime has been disposed."));
@@ -204,6 +277,8 @@ export function createDshRuntime(config: DshConfig): DshRuntime {
       running.add(result);
       return result;
     },
+    compact,
+    recoverCompaction: (input) => compact({ ...input, recoverOnly: true }),
     async dispose() {
       disposed = true;
       for (const controller of active) controller.abort();
@@ -261,6 +336,10 @@ async function runChild(config: DshConfig, input: DshAttempt): Promise<BridgeRes
   })).digest("hex");
   const key = createHash("sha256").update(input.nativeStateId ?? input.sessionId).digest("hex");
   const directory = join(config.stateDir, key);
+  // Windows can read longer paths while CreateProcess still rejects a long cwd.
+  if (process.platform === "win32" && directory.length > 258) {
+    throw new Error("DSH child working directory exceeds the Windows process limit; configure a shorter stateDir before retrying.");
+  }
   const home = join(directory, "home");
   await mkdir(home, { recursive: true, mode: 0o700 });
   const lockPath = join(directory, "owner.lock");
@@ -313,6 +392,7 @@ async function runChild(config: DshConfig, input: DshAttempt): Promise<BridgeRes
       version: BRIDGE_VERSION, dshVersion: DSH_VERSION, sessionId: previous?.sessionId ?? randomUUID(),
       workspaceDir: input.workspaceDir, status: "running", lastRunId: input.runId,
       consumedRunIds: [...(previous?.consumedRunIds ?? []), input.runId],
+      ...(previous?.compactRunIds ? { compactRunIds: [...previous.compactRunIds] } : {}),
       modelRoute,
     };
     state = currentState;
@@ -326,9 +406,10 @@ async function runChild(config: DshConfig, input: DshAttempt): Promise<BridgeRes
       } catch (error: unknown) { if (code(error) !== "ENOENT") throw error; }
     }
     const bridgePath = fileURLToPath(new URL("./bridge/index.js", import.meta.url));
+    const compactionPath = fileURLToPath(new URL("./bridge/compaction.js", import.meta.url));
     const patchPath = join(directory, "bridge.patch.json");
     await writeFile(patchPath, JSON.stringify(createBridgePatch({
-      bridgePath, baseUrl, thinking: input.thinking, reasoningEffort: input.reasoningEffort,
+      bridgePath, compactionPath, baseUrl, thinking: input.thinking, reasoningEffort: input.reasoningEffort,
       maxTokens: input.maxTokens, contextWindow: input.contextWindow,
       streamIdleTimeoutMs: config.streamIdleTimeoutMs,
       ...(provider === "github-copilot" ? {
@@ -366,25 +447,190 @@ async function runChild(config: DshConfig, input: DshAttempt): Promise<BridgeRes
   }
 }
 
+async function compactChild(config: DshConfig, input: DshCompactAttempt): Promise<BridgeCompactResult> {
+  input.signal.throwIfAborted();
+  input.assertActive();
+  const baseUrl = normalizeBaseUrl(input.baseUrl);
+  const provider = input.provider ?? "deepseek";
+  if (provider !== "deepseek" && provider !== "github-copilot") throw new Error("Unsupported DSH model provider.");
+  const allowedUrls = provider === "github-copilot"
+    ? config.allowedCopilotBaseUrls ?? COPILOT_ENDPOINTS : config.allowedBaseUrls;
+  if (!allowedUrls.includes(baseUrl)) throw new Error("Prepared DSH endpoint is not explicitly allowed for this provider.");
+  const headers = provider === "github-copilot" ? copilotHeaders(input.headers) : undefined;
+  if (provider === "deepseek" && (input.headers !== undefined || input.reasoningEfforts !== undefined)) {
+    throw new Error("Copilot request settings cannot be applied to a DeepSeek session.");
+  }
+  if (!input.apiKey || !input.sessionId || !input.runId ||
+      input.nativeStateId !== undefined && (!input.nativeStateId || input.nativeStateId.trim() !== input.nativeStateId)) {
+    throw new Error("Missing prepared DSH authentication or identity.");
+  }
+  if (headers && Object.values(headers).some((value) => value.includes(input.apiKey))) {
+    throw new Error("Model credentials cannot be included in persistent request headers.");
+  }
+  const modelRoute = createHash("sha256").update(JSON.stringify({
+    provider, model: input.modelId, baseUrl,
+    credential: createHash("sha256").update(input.apiKey).digest("hex"),
+    headers: Object.entries(headers ?? {}).sort(([a], [b]) => a.localeCompare(b)),
+  })).digest("hex");
+  const key = createHash("sha256").update(input.nativeStateId ?? input.sessionId).digest("hex");
+  const directory = join(config.stateDir, key);
+  if (process.platform === "win32" && directory.length > 258) {
+    throw new Error("DSH child working directory exceeds the Windows process limit; configure a shorter stateDir before retrying.");
+  }
+  const home = join(directory, "home");
+  await mkdir(home, { recursive: true, mode: 0o700 });
+  const lockPath = join(directory, "owner.lock");
+  let lock;
+  try { lock = await open(lockPath, "wx", 0o600); }
+  catch (error: unknown) {
+    if (code(error) === "EEXIST") {
+      throw new Error("This DSH session already has an owner. A stale lock requires operator inspection; start a new session.");
+    }
+    throw error;
+  }
+  const statePath = join(directory, "binding.json");
+  let state: SessionState | undefined;
+  let submitted = false;
+  let releaseLock = true;
+  try {
+    await lock.writeFile(JSON.stringify({ pid: process.pid, runId: input.runId, operation: "compact" }));
+    const previous = await loadState(statePath);
+    if (input.recoverOnly && (!previous || previous.status === "ready" && !previous.pendingCompact)) {
+      return { compacted: false, sessionId: previous?.sessionId ?? input.sessionId, details: { recovered: false } };
+    }
+    if (!previous) throw new Error("No ready DSH native session binding is available for compaction.");
+    if (previous.compactRunIds?.includes(input.runId)) throw new Error("This DSH compaction was already submitted; refusing replay.");
+    if (previous.consumedRunIds.includes(input.runId)) throw new Error("This DSH run id was already submitted; refusing replay.");
+    if (previous.workspaceDir !== input.workspaceDir) throw new Error("DSH session workspace changed; start a new session.");
+    if (previous.modelRoute !== modelRoute) {
+      throw new Error("DSH model route or account changed. Native compaction must use the established model route.");
+    }
+    const bridgePath = fileURLToPath(new URL("./bridge/index.js", import.meta.url));
+    const compactionPath = fileURLToPath(new URL("./bridge/compaction.js", import.meta.url));
+    const patchPath = join(directory, "bridge.patch.json");
+    await writeFile(patchPath, JSON.stringify(createBridgePatch({
+      bridgePath, compactionPath, baseUrl, thinking: input.thinking, reasoningEffort: input.reasoningEffort,
+      maxTokens: input.maxTokens, contextWindow: input.contextWindow,
+      streamIdleTimeoutMs: config.streamIdleTimeoutMs,
+      ...(provider === "github-copilot" ? {
+        provider, modelId: input.modelId, modelName: input.modelName, headers,
+        reasoningEfforts: input.reasoningEfforts,
+      } : {}),
+    })), { mode: 0o600 });
+    const require = createRequire(import.meta.url);
+    const dshPackage = require.resolve("@deepseek-ai/dsh/package.json");
+    const cliPath = join(dirname(dshPackage), "lib", "bin.js");
+    const bridgeInput: DshAttempt = {
+      ...input, prompt: "compact", systemPrompt: "", tools: [],
+      onEvent: () => {},
+      executeTool: async () => { throw new Error("Compaction summaries cannot execute host tools."); },
+    };
+    if (previous.status === "running" && previous.pendingCompact) {
+      state = previous;
+      const recoveredRunId = previous.pendingCompact.runId;
+      const recovered = await executeChild(config, { ...bridgeInput, runId: recoveredRunId },
+        cliPath, directory, home, patchPath, state, true, async () => {}, undefined, "inspectCompact");
+      state.status = "ready";
+      delete state.pendingCompact;
+      state.compactRunIds = [...new Set([...(state.compactRunIds ?? []), recoveredRunId,
+        ...(input.recoverOnly ? [] : [input.runId])])];
+      await saveState(statePath, state);
+      return recovered;
+    }
+    if (previous.status !== "ready") throw new Error("No ready DSH native session binding is available for compaction.");
+    if (input.recoverOnly) throw new Error("No reconcilable native compaction receipt is available.");
+    state = { ...previous, status: "running", pendingCompact: { runId: input.runId } };
+    const result = await executeChild(config, bridgeInput, cliPath, directory, home, patchPath, state,
+      true, async () => {
+        await saveState(statePath, state!);
+        submitted = true;
+      }, undefined, "compact");
+    state.status = "ready";
+    delete state.pendingCompact;
+    state.compactRunIds = [...(state.compactRunIds ?? []), input.runId];
+    await saveState(statePath, state);
+    return result;
+  } catch (error: unknown) {
+    if (error instanceof ChildTerminationError) releaseLock = false;
+    if (submitted && state) {
+      state.status = "running";
+      state.pendingCompact ??= { runId: input.runId };
+      await saveState(statePath, state);
+    }
+    const message = asError(error).message.replaceAll(input.apiKey, "[redacted]");
+    throw new Error(message);
+  } finally {
+    await lock.close();
+    if (releaseLock) await rm(lockPath, { force: true });
+  }
+}
+
+type ChildArguments = [
+  config: DshConfig, input: DshAttempt, cliPath: string, directory: string, home: string,
+  patchPath: string, state: SessionState, resume: boolean, beforeSubmit: () => Promise<void>,
+  taskPreparation: PreparationRequest | undefined,
+];
+function executeChild(...args: [...ChildArguments, operation: "compact" | "inspectCompact"]): Promise<BridgeCompactResult>;
+function executeChild(...args: [...ChildArguments, operation?: "run"]): Promise<BridgeResult>;
 async function executeChild(
   config: DshConfig, input: DshAttempt, cliPath: string, directory: string, home: string,
   patchPath: string, state: SessionState, resume: boolean, beforeSubmit: () => Promise<void>,
   taskPreparation?: PreparationRequest,
-): Promise<BridgeResult> {
+  operation: "run" | "compact" | "inspectCompact" = "run",
+): Promise<BridgeResult | BridgeCompactResult> {
   input.signal.throwIfAborted();
   input.assertActive();
   const child = spawn(process.execPath, [cliPath, "--profile", "sdk-minimal", "--patch", patchPath], {
     cwd: directory, env: childEnvironment(home, input.apiKey),
     stdio: ["pipe", "pipe", "pipe"], windowsHide: true, shell: false,
   });
+  let stage: ChildLifecycleStage = "spawn";
   let stderr = "";
+  const diagnostic = (message: string): string => {
+    const parts = [message, `stage=${stage}`];
+    if (child.pid !== undefined) parts.push(`pid=${child.pid}`);
+    if (childFailure) {
+      const failureCode = code(childFailure.cause);
+      parts.push(`failure=${childFailure.message}${failureCode ? ` code=${failureCode}` : ""}`);
+    }
+    const safeStderr = redactDiagnostic(stderr, input.apiKey);
+    if (safeStderr) parts.push(`stderr=${safeStderr}`);
+    return parts.join("; ");
+  };
+  let resolveClosed!: (code: number | null) => void;
+  const childClosed = new Promise<number | null>((resolve) => { resolveClosed = resolve; });
+  let rejectChildFailed!: (error: Error) => void;
+  const childFailed = new Promise<never>((_, reject) => { rejectChildFailed = reject; });
+  void childFailed.catch(() => {});
+  let childFailure: Error | undefined;
+  let peer: JsonRpcPeer | undefined;
+  const recordChildFailure = (stream: ChildStreamName, error: unknown): Error => {
+    const failure = childLifecycleError(stage, stream, error, child.pid);
+    childFailure ??= failure;
+    rejectChildFailed(childFailure);
+    peer?.close(childFailure, { fatal: true });
+    if (stream === "stderr") child.kill();
+    return childFailure;
+  };
+  child.once("close", resolveClosed);
+  child.once("error", (error) => { recordChildFailure("process", error); });
+  for (const name of ["stdin", "stdout", "stderr"] as const) {
+    child[name]?.on("error", (error) => { recordChildFailure(name, error); });
+  }
+  if (!child.stdin || !child.stdout || !child.stderr) {
+    const missing = !child.stdin ? "stdin" : !child.stdout ? "stdout" : "stderr";
+    const failure = recordChildFailure(missing, new Error("missing stdio"));
+    child.kill();
+    try {
+      await timeout(childClosed, Math.min(config.shutdownTimeoutMs, 1000), "DSH child has not exited.");
+    } catch (error: unknown) {
+      throw new ChildTerminationError("DSH child could not be terminated; retaining its session ownership lock.",
+        { cause: error });
+    }
+    throw failure;
+  }
   child.stderr.on("data", (chunk: Buffer) => { stderr = (stderr + chunk.toString("utf8")).slice(-32_768); });
-  let resolveExit!: (code: number | null) => void;
-  let rejectExit!: (error: Error) => void;
-  const exited = new Promise<number | null>((resolve, reject) => { resolveExit = resolve; rejectExit = reject; });
-  void exited.catch(() => {});
-  child.once("close", resolveExit);
-  child.once("error", rejectExit);
+  stage = "handshake";
   let readyResolve!: () => void;
   const ready = new Promise<void>((resolve) => { readyResolve = resolve; });
   const toolControllers = new Map<string, AbortController>();
@@ -404,17 +650,21 @@ async function executeChild(
     acceptingTools = false;
     resolved = undefined;
     for (const controller of toolControllers.values()) controller.abort();
-    peer.close(preparationFailure);
+    peer?.close(preparationFailure, { fatal: true });
     child.kill();
     return preparationFailure;
   };
-  const peer = new JsonRpcPeer(child.stdout, child.stdin, {
+  peer = new JsonRpcPeer(child.stdout, child.stdin, {
     async onNotification(method, params) {
       if (method !== "event") throw new Error("Unknown worker notification.");
       const event = parseEvent(params);
-      if (event.type === "ready") readyResolve();
       if (event.type === "tool-cancel") toolControllers.get(event.callId)?.abort();
       await input.onEvent(event);
+      if (event.type === "ready") {
+        input.signal.throwIfAborted();
+        input.assertActive();
+        readyResolve();
+      }
     },
     async onRequest(method, params) {
       if (method === "prepare" && taskPreparation) {
@@ -486,7 +736,7 @@ async function executeChild(
   const abort = (): void => {
     acceptingTools = false;
     for (const controller of toolControllers.values()) controller.abort();
-    void peer.notify("cancel", {}).catch(() => { child.kill(); });
+    void peer!.notify("cancel", {}).catch(() => { child.kill(); });
     abortTimer ??= setTimeout(() => { child.kill(); }, config.shutdownTimeoutMs);
   };
   input.signal.addEventListener("abort", abort, { once: true });
@@ -494,42 +744,68 @@ async function executeChild(
     if (input.signal.aborted) abort();
     await timeout(Promise.race([
       ready,
-      peer.closed.then(() => { throw preparationFailure ?? new Error(`DSH stopped before bridge initialization: ${stderr}`); }),
-      exited.then((value) => { throw new Error(`DSH startup exited (${value}): ${stderr}`); }),
-    ]), config.startupTimeoutMs, `DSH bridge startup timed out: ${stderr}`);
+      peer.closed.then(() => { throw preparationFailure ?? peer!.failureReason ?? childFailure ??
+        new Error(diagnostic("DSH stopped before bridge initialization")); }),
+      childFailed,
+      childClosed.then((value) => { throw childFailure ?? new Error(diagnostic(`DSH startup exited (${value})`)); }),
+    ]), config.startupTimeoutMs, () => diagnostic("DSH bridge startup timed out"));
     input.signal.throwIfAborted();
     input.assertActive();
     await beforeSubmit();
     input.signal.throwIfAborted();
     input.assertActive();
-    acceptingTools = true;
-    const result = parseResult(await peer.request("run", {
-      ...(input.provider === "github-copilot" ? { provider: input.provider } : {}),
-      sessionId: state.sessionId, resume, workspaceDir: input.workspaceDir,
-      systemPrompt: input.systemPrompt, prompt: input.prompt, modelId: input.modelId,
-      reasoningEffort: input.reasoningEffort, maxTokens: input.maxTokens, tools: input.tools,
-      ...(taskPreparation ? { taskPreparation } : {}),
-    }), state.sessionId);
+    stage = "run";
+    acceptingTools = operation === "run";
+    const rpcResult = await Promise.race([
+      peer.request(operation, operation === "run" ? {
+        ...(input.provider === "github-copilot" ? { provider: input.provider } : {}),
+        sessionId: state.sessionId, resume, workspaceDir: input.workspaceDir,
+        systemPrompt: input.systemPrompt, prompt: input.prompt, modelId: input.modelId,
+        reasoningEffort: input.reasoningEffort, maxTokens: input.maxTokens, tools: input.tools,
+        ...(taskPreparation ? { taskPreparation } : {}),
+      } : {
+        ...(input.provider === "github-copilot" ? { provider: input.provider } : {}),
+        sessionId: state.sessionId, runId: input.runId, completedTurns: state.consumedRunIds.length,
+        workspaceDir: input.workspaceDir, modelId: input.modelId,
+        reasoningEffort: input.reasoningEffort, maxTokens: input.maxTokens,
+      }),
+      childFailed,
+      childClosed.then((value) => { throw childFailure ?? peer!.failureReason ??
+        new Error(diagnostic(`DSH exited during run (${value})`)); }),
+    ]);
+    const result = operation === "run"
+      ? parseResult(rpcResult, state.sessionId)
+      : parseCompactResult(rpcResult, state.sessionId);
     acceptingTools = false;
     if (preparationFailure) throw preparationFailure;
-    if (!isDeepStrictEqual(result.preparation, resolved)) {
-      throw new Error("DSH result preparation does not match the authoritative parent resolution.");
-    }
-    if (taskPreparation && !resolved && result.stopReason !== "aborted") {
-      throw new Error("DSH completed without the required task preparation decision.");
+    if (operation === "run") {
+      const runResult = result as BridgeResult;
+      if (!isDeepStrictEqual(runResult.preparation, resolved)) {
+        throw new Error("DSH result preparation does not match the authoritative parent resolution.");
+      }
+      if (taskPreparation && !resolved && runResult.stopReason !== "aborted") {
+        throw new Error("DSH completed without the required task preparation decision.");
+      }
     }
     if (preparationRequested && !resolved) {
       throw new Error("DSH aborted before its parent preparation callback completed.");
     }
     await peer.drain();
-    await timeout(peer.request("shutdown", {}), config.shutdownTimeoutMs, "DSH shutdown did not acknowledge.");
+    stage = "shutdown";
+    await timeout(Promise.race([
+      peer.request("shutdown", {}),
+      childFailed,
+      childClosed.then((value) => { throw childFailure ?? peer!.failureReason ??
+        new Error(diagnostic(`DSH exited before shutdown acknowledgement (${value})`)); }),
+    ]), config.shutdownTimeoutMs, "DSH shutdown did not acknowledge.");
     await peer.drain();
     child.stdin.end();
-    const exitCode = await timeout(exited, config.shutdownTimeoutMs, "DSH did not exit after shutdown.");
+    const exitCode = await timeout(childClosed, config.shutdownTimeoutMs, "DSH did not exit after shutdown.");
     await peer.drain();
-    if (exitCode !== 0) throw new Error(`DSH shutdown failed (${exitCode}): ${stderr}`);
+    if (childFailure) throw childFailure;
+    if (exitCode !== 0) throw new Error(diagnostic(`DSH shutdown failed (${exitCode})`));
     if (preparationFailure) throw preparationFailure;
-    if (input.signal.aborted && result.stopReason !== "aborted") {
+    if (operation === "run" && input.signal.aborted && (result as BridgeResult).stopReason !== "aborted") {
       throw new Error("DSH completed after cancellation without confirming an interrupted outcome.");
     }
     return result;
@@ -538,22 +814,27 @@ async function executeChild(
     input.signal.removeEventListener("abort", abort);
     clearTimeout(abortTimer);
     for (const controller of toolControllers.values()) controller.abort();
-    peer.close();
+    peer?.close();
     if (child.pid !== undefined) {
       if (child.exitCode === null && child.signalCode === null) child.kill();
       try {
-        await timeout(exited, Math.min(config.shutdownTimeoutMs, 1000), "DSH child has not exited.");
+        await timeout(childClosed, Math.min(config.shutdownTimeoutMs, 1000), "DSH child has not exited.");
       } catch {
         child.kill("SIGKILL");
-        try { await timeout(exited, config.shutdownTimeoutMs, "DSH child termination is unconfirmed."); }
+        try { await timeout(childClosed, config.shutdownTimeoutMs, "DSH child termination is unconfirmed."); }
         catch (error: unknown) {
           throw new ChildTerminationError("DSH child could not be terminated; retaining its session ownership lock.",
             { cause: error });
         }
       }
     }
-    await timeout(Promise.allSettled([...toolTasks]), config.shutdownTimeoutMs,
-      "Host tool cancellation is unconfirmed; inspect the active tool before retrying.");
+    try {
+      await timeout(Promise.allSettled([...toolTasks]), config.shutdownTimeoutMs,
+        "Host tool cancellation is unconfirmed; inspect the active tool before retrying.");
+    } catch (error: unknown) {
+      throw new ChildTerminationError("Host tool cancellation is unconfirmed; retaining its session ownership lock.",
+        { cause: error });
+    }
     try {
       await timeout(Promise.allSettled([...preparationTasks]), config.shutdownTimeoutMs,
         "DSH preparation callback cancellation is unconfirmed.");

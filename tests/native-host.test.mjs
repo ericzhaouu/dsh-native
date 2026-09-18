@@ -255,7 +255,16 @@ test("host prompt injects workspace bootstrap, skill prompt and extra instructio
   });
   for (const text of ["Workspace: workspace", "Working directory: task", "instruction root: canonical",
     "AGENTS.md", "Run existing tests.", "Available: coding.", "Keep output brief.", "no native filesystem",
-    "policy-controlled host exec", "Never expose credentials."]) assert.ok(prompt.includes(text), text);
+    "policy-controlled host exec", "Never expose credentials.", "Listed skill descriptions are visible guidance",
+    "chat, clarify, and draft still use zero host tools"]) assert.ok(prompt.includes(text), text);
+  const genericExec = renderNativeSystemPrompt({ workspaceDir: "w", cwd: "c", bootstrapWorkspaceDir: "b", contextFiles: [],
+    toolNames: ["exec"], credentialSafety: "", replyGuidance: "", genericTools: true });
+  assert.match(genericExec, /exposed host exec callback may run existing host-authorized CLI/);
+  assert.match(genericExec, /dedicated business tool name alone is not a denial/);
+  assert.match(genericExec, /invent network access/);
+  const genericNoExec = renderNativeSystemPrompt({ workspaceDir: "w", cwd: "c", bootstrapWorkspaceDir: "b", contextFiles: [],
+    toolNames: ["lookup"], credentialSafety: "", replyGuidance: "", genericTools: true });
+  assert.match(genericNoExec, /No exec callback is available/);
   assert.equal(prompt.split("Keep output brief.").length, 2);
 });
 
@@ -487,6 +496,7 @@ test("prepareNativeHost composes public SDK seams without granting tools during 
   assert.match(generic.systemPrompt, /host-tool callbacks/);
   assert.match(generic.systemPrompt, /unknown: unavailable-or-denied/);
   assert.match(generic.systemPrompt, /Do not repeatedly request clarification/);
+  assert.match(generic.systemPrompt, /do not claim CLI or alternate dispatch is authorized/);
   assert.doesNotMatch(generic.systemPrompt, /coding assistant|channel actions, delegation|no native filesystem/);
   assert.equal((await generic.executeTool(call("web_search"), signal())).text, "ok");
   await generic.dispose();

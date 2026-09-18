@@ -1,0 +1,178 @@
+name: test
+
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      openclaw_artifact_url:
+        description: "Approved OpenClaw 2026.9.2 SDK .tgz release URL or GitHub artifact download URL"
+        required: false
+        type: string
+      openclaw_artifact_sha256:
+        description: "Must equal the approved OpenClaw 2026.9.2 SDK artifact SHA-256"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  APPROVED_OPENCLAW_SDK_SHA256: 3431f4cd2d8dbd6b936def2694ac27e19fa0256295cf4ada0f652ecf1c9ee520
+
+jobs:
+  package-acceptance:
+    name: package checker fixture tests (${{ matrix.os }}, node ${{ matrix.node }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node: ["22.23.1", "24.15.0"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Package checker isolated fixture tests
+        run: npm run test:package
+
+  full-sdk-acceptance:
+    name: full SDK acceptance (${{ matrix.os }}, node ${{ matrix.node }})
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node: ["22.23.1", "24.15.0"]
+    env:
+      SDK_URL: ${{ inputs.openclaw_artifact_url || vars.OPENCLAW_SDK_ARTIFACT_URL }}
+      SDK_SHA256: ${{ inputs.openclaw_artifact_sha256 || vars.OPENCLAW_SDK_ARTIFACT_SHA256 }}
+      SDK_TOKEN: ${{ secrets.OPENCLAW_ARTIFACT_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - name: Download approved OpenClaw SDK artifact
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not $env:SDK_URL) {
+            Write-Error "Missing OpenClaw SDK artifact URL. Set repository variable OPENCLAW_SDK_ARTIFACT_URL or workflow_dispatch input openclaw_artifact_url."
+          }
+          if (-not $env:SDK_SHA256) {
+            Write-Error "Missing OpenClaw SDK artifact SHA. Set repository variable OPENCLAW_SDK_ARTIFACT_SHA256 or workflow_dispatch input openclaw_artifact_sha256."
+          }
+          if ($env:SDK_SHA256.ToLowerInvariant() -ne $env:APPROVED_OPENCLAW_SDK_SHA256) {
+            Write-Error "OpenClaw SDK SHA must be the approved 2026.9.2 digest $env:APPROVED_OPENCLAW_SDK_SHA256."
+          }
+          $uri = $null
+          if (-not [System.Uri]::TryCreate($env:SDK_URL, [System.UriKind]::Absolute, [ref]$uri) -or $uri.Scheme -ne 'https' -or $uri.UserInfo) {
+            Write-Error "Refusing unapproved SDK URL. Use an HTTPS OpenClaw GitHub release .tgz or OpenClaw GitHub Actions artifact URL without embedded credentials."
+          }
+          if ($uri.Query -match '(?i)(^|[?&])(token|access_token|authorization)=') {
+            Write-Error "Refusing SDK URL with credential-like query parameters."
+          }
+          $releasePath = '^/openclaw/openclaw/releases/download/[^/?#]+/[^/?#]+\.tgz$'
+          $apiArtifactPath = '^/repos/openclaw/openclaw/actions/(?:runs/[0-9]+/artifacts/[0-9]+|artifacts/[0-9]+(?:/zip)?)$'
+          $webArtifactPath = '^/openclaw/openclaw/actions/runs/[0-9]+/artifacts/[0-9]+$'
+          $isRelease = $uri.Host -eq 'github.com' -and $uri.AbsolutePath -match $releasePath
+          $isApiArtifact = $uri.Host -eq 'api.github.com' -and $uri.AbsolutePath -match $apiArtifactPath
+          $isWebArtifact = $uri.Host -eq 'github.com' -and $uri.AbsolutePath -match $webArtifactPath
+          if (-not ($isRelease -or $isApiArtifact -or $isWebArtifact)) {
+            Write-Error "Refusing unapproved SDK URL. Use an OpenClaw GitHub release .tgz or OpenClaw GitHub Actions artifact download URL."
+          }
+
+          if ($isRelease) {
+            Invoke-WebRequest -Uri $uri.AbsoluteUri -OutFile openclaw-sdk.tgz
+            $sdkPackage = (Resolve-Path openclaw-sdk.tgz).Path
+          } else {
+            $artifactMatch = [regex]::Match($uri.AbsolutePath, '/artifacts/([0-9]+)(?:/zip)?$')
+            if (-not $artifactMatch.Success) {
+              Write-Error "The SDK artifact URL must identify a single artifact."
+            }
+            $uri = [System.Uri]::new("https://api.github.com/repos/openclaw/openclaw/actions/artifacts/$($artifactMatch.Groups[1].Value)/zip")
+            $downloadUri = $uri
+            if ($env:SDK_TOKEN) {
+              $handler = [System.Net.Http.HttpClientHandler]::new()
+              $handler.AllowAutoRedirect = $false
+              $client = [System.Net.Http.HttpClient]::new($handler)
+              try {
+                $client.DefaultRequestHeaders.UserAgent.ParseAdd('dsh-native-sdk-validation')
+                $client.DefaultRequestHeaders.Accept.ParseAdd('application/vnd.github+json')
+                $client.DefaultRequestHeaders.Authorization = [System.Net.Http.Headers.AuthenticationHeaderValue]::new('Bearer', $env:SDK_TOKEN)
+                $response = $client.GetAsync($uri).GetAwaiter().GetResult()
+                if ([int]$response.StatusCode -ge 300 -and [int]$response.StatusCode -lt 400 -and $response.Headers.Location) {
+                  $downloadUri = [System.Uri]::new($uri, $response.Headers.Location)
+                } elseif ($response.IsSuccessStatusCode) {
+                  [System.IO.File]::WriteAllBytes((Join-Path (Get-Location) 'openclaw-sdk-artifact.zip'), $response.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult())
+                  $downloadUri = $null
+                } else {
+                  Write-Error "OpenClaw SDK artifact request failed with HTTP $([int]$response.StatusCode)."
+                }
+              } finally {
+                $client.Dispose()
+                $handler.Dispose()
+              }
+            }
+            if ($downloadUri) {
+              if ($downloadUri.Scheme -ne 'https' -or $downloadUri.UserInfo) { Write-Error "Refusing artifact redirect with embedded credentials or non-HTTPS scheme." }
+              Invoke-WebRequest -Uri $downloadUri.AbsoluteUri -OutFile openclaw-sdk-artifact.zip
+            }
+            New-Item -ItemType Directory -Path openclaw-sdk-artifact -Force | Out-Null
+            Expand-Archive -Path openclaw-sdk-artifact.zip -DestinationPath openclaw-sdk-artifact -Force
+            $matches = @(Get-ChildItem -Path openclaw-sdk-artifact -Filter '*.tgz' -File -Recurse)
+            if ($matches.Count -ne 1) {
+              Write-Error "Expected exactly one .tgz inside the OpenClaw artifact; found $($matches.Count)."
+            }
+            $sdkPackage = (Resolve-Path $matches[0].FullName).Path
+          }
+          $actual = (Get-FileHash -Algorithm SHA256 $sdkPackage).Hash.ToLowerInvariant()
+          if ($actual -ne $env:APPROVED_OPENCLAW_SDK_SHA256) {
+            Write-Error "Downloaded OpenClaw SDK SHA mismatch: expected $env:APPROVED_OPENCLAW_SDK_SHA256, got $actual. Remote CI cannot be verified without the approved artifact URL."
+          }
+          "SDK_PACKAGE=$sdkPackage" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: Install repository dependencies
+        run: npm ci --ignore-scripts
+      - name: Install exact optional OpenClaw peer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sdkRoot = Join-Path $env:RUNNER_TEMP 'dsh-openclaw-sdk'
+          npm install --prefix $sdkRoot --no-save --package-lock=false --ignore-scripts "$env:SDK_PACKAGE"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:DSH_SDK_ROOT = $sdkRoot
+          node --input-type=module -e "import { symlinkSync } from 'node:fs'; import { resolve } from 'node:path'; symlinkSync(resolve(process.env.DSH_SDK_ROOT, 'node_modules', 'openclaw'), resolve('node_modules', 'openclaw'), process.platform === 'win32' ? 'junction' : 'dir');"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify stock host patch state
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $hostRoot = (Resolve-Path node_modules/openclaw).Path
+          node host-patch/apply.mjs --root $hostRoot --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Build
+        run: npm run build
+      - name: Test
+        run: npm test
+      - name: Pack candidate package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          npm pack --json | Out-File -Encoding utf8 npm-pack.json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $pack = Get-Content npm-pack.json -Raw | ConvertFrom-Json
+          if (-not $pack -or -not $pack[0].filename) { Write-Error "npm pack did not report a package filename." }
+          $candidate = (Resolve-Path $pack[0].filename).Path
+          if ([IO.Path]::GetExtension($candidate) -ne '.tgz') { Write-Error "npm pack did not produce a .tgz candidate." }
+          "CANDIDATE_PACKAGE=$candidate" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: Audit candidate package payload
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          node scripts/check-package.mjs --package "$env:CANDIDATE_PACKAGE" --root .
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

@@ -87,6 +87,14 @@ test("official sdk-minimal CLI readies and drains shutdown before natural exit",
   let overflow = false;
   let spawnError;
   let shutdownSeen = false;
+  const transportFailed = Promise.withResolvers();
+  const onTransportError = (error) => {
+    spawnError ??= error;
+    peer?.close(error);
+    transportFailed.resolve(error);
+  };
+  child.on("error", onTransportError);
+  for (const stream of [child.stdin, child.stdout, child.stderr]) stream?.on("error", onTransportError);
   child.stdout.setEncoding("utf8").on("data", (chunk) => {
     overflow ||= stdout.length + chunk.length > 1024 * 1024;
     stdout = (stdout + chunk).slice(0, 1024 * 1024);
@@ -95,7 +103,6 @@ test("official sdk-minimal CLI readies and drains shutdown before natural exit",
     overflow ||= stderr.length + chunk.length > 1024 * 1024;
     stderr = (stderr + chunk).slice(0, 1024 * 1024);
   });
-  child.on("error", (error) => { spawnError = error; });
   child.on("close", (code, signal) => {
     didClose = true;
     closed.resolve({ code, signal, shutdownSeen });
@@ -121,13 +128,15 @@ test("official sdk-minimal CLI readies and drains shutdown before natural exit",
   const prematureEof = peer.closed.then(() => {
     throw new Error("CLI RPC closed before the expected response");
   });
+  const transportFailure = transportFailed.promise.then((error) => { throw error; });
+  void transportFailure.catch(() => {});
   try {
     const event = await deadline(Promise.race([
-      ready.promise, prematureExit, prematureEof,
+      ready.promise, prematureExit, prematureEof, transportFailure,
     ]), 30000, "CLI ready");
     assert.deepEqual(event, { type: "ready", version: 1, dshVersion: installed.version });
     const result = await deadline(Promise.race([
-      peer.request("shutdown", {}), prematureExit, prematureEof,
+      peer.request("shutdown", {}), prematureExit, prematureEof, transportFailure,
     ]), 10000, "CLI shutdown response");
     assert.deepEqual(result, {});
     shutdownSeen = true;

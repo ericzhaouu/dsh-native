@@ -52,11 +52,11 @@ export async function startResponsesServer(responder) {
       emit("response.output_text.delta", { output_index: index, item_id: item.id, content_index: 0, delta: value });
       done(index, { ...item, status: "completed", content: [{ type: "output_text", text: value, annotations: [] }] });
     };
-    const finish = () => {
+    const finish = (usage = { input_tokens: 20, output_tokens: 8, total_tokens: 28,
+      input_tokens_details: { cached_tokens: 2 }, output_tokens_details: { reasoning_tokens: 3 } }) => {
       emit("response.completed", { response: {
         id, object: "response", status: "completed", model: body.model, output,
-        usage: { input_tokens: 20, output_tokens: 8, total_tokens: 28,
-          input_tokens_details: { cached_tokens: 2 }, output_tokens_details: { reasoning_tokens: 3 } },
+        usage,
       } });
       response.end("data: [DONE]\n\n");
     };

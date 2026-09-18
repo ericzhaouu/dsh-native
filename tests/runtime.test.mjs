@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readdir, readFile, rm } from "node:fs/promises";
+import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -129,5 +129,161 @@ test("cancel during host tool waits for its abort before settling", { timeout: 6
     const result = await runtime.run(input);
     assert.equal(observedAbort, true);
     assert.equal(result.stopReason, "aborted");
+  });
+});
+
+test("real DSH native compaction creates a durable checkpoint and continues its session", { timeout: 120000 }, async () => {
+  await fixture(async ({ body, send, finish }) => {
+    const flattened = JSON.stringify(body.messages);
+    if (flattened.includes("compaction engine")) {
+      assert.deepEqual((body.tools ?? []).map((tool) => tool.function?.name).filter(Boolean), []);
+      send({ role: "assistant", content: "## Primary Request and Intent\n- Preserve the long fixture.\n\n## Key Technical Concepts\n- DSH native compaction.\n\n## Files and Code\n- (none)\n\n## Errors and Fixes\n- (none)\n\n## Pending Jobs\n- Continue.\n\n## Current Work\n- Compacting.\n\n## Next Step\n- Continue.\n\n## Critical Context\n- Summary is synthetic test data." });
+      finish();
+      return;
+    }
+    send({ role: "assistant", content: `ack ${body.messages.length} ` });
+    finish();
+  }, async ({ root, runtime, model, input }) => {
+    const long = "alpha ".repeat(5000);
+    const first = await runtime.run({ ...input, prompt: `Remember this fixture exactly: ${long}` });
+    assert.equal(first.stopReason, "stop");
+    await runtime.run({ ...input, runId: "run-2", prompt: `Add more retained context: ${long}` });
+    const compacted = await runtime.compact({
+      provider: input.provider,
+      sessionId: input.sessionId,
+      runId: "compact-1",
+      workspaceDir: root,
+      modelId: input.modelId,
+      apiKey: input.apiKey,
+      baseUrl: input.baseUrl,
+      contextWindow: input.contextWindow,
+      maxTokens: input.maxTokens,
+      thinking: input.thinking,
+      signal: input.signal,
+      assertActive: input.assertActive,
+    });
+    assert.equal(compacted.compacted, true);
+    assert.ok(compacted.details.compactionId);
+    const continued = await runtime.run({ ...input, runId: "run-3", prompt: "Continue with the retained fixture constraint." });
+    assert.equal(continued.sessionId, first.sessionId);
+    assert.equal(model.requests.some((request) => JSON.stringify(request.body.messages).includes("<compacted-summary>")), true);
+    await assert.rejects(runtime.compact({ ...input, runId: "compact-1" }), /already submitted/u);
+  });
+});
+
+test("real native checkpoint survives a lost parent receipt and restart without replay", { timeout: 120000 }, async () => {
+  await fixture(async ({ body, send, finish }) => {
+    send({ role: "assistant", content: JSON.stringify(body.messages).includes("compaction engine")
+      ? "## Primary Request and Intent\n- Retain original constraint.\n\n## Key Technical Concepts\n- Recovery.\n\n## Files and Code\n- No repeats.\n\n## Errors and Fixes\n- None.\n\n## Pending Jobs\n- Continue.\n\n## Current Work\n- Checkpoint.\n\n## Next Step\n- Continue.\n\n## Critical Context\n- Original constraint."
+      : "Ready" });
+    finish();
+  }, async ({ root, runtime, model, input }) => {
+    await runtime.run({ ...input, prompt: `Original constraint. ${"historical ".repeat(5000)}` });
+    await runtime.run({ ...input, runId: "run-2", prompt: "Continue without tools." });
+    const path = join(root, createHash("sha256").update(input.sessionId).digest("hex"), "binding.json");
+    const before = JSON.parse(await readFile(path, "utf8"));
+    await runtime.compact({ ...input, runId: "lost-receipt" });
+    const requests = model.requests.length;
+    await runtime.dispose();
+    await writeFile(path, JSON.stringify({ ...before, status: "running", pendingCompact: { runId: "lost-receipt" } }));
+    const restarted = createDshRuntime(parseDshConfig({
+      stateDir: root, allowedBaseUrls: [model.baseUrl],
+      startupTimeoutMs: 30000, shutdownTimeoutMs: 10000, streamIdleTimeoutMs: 3000,
+    }));
+    try {
+      const receipt = await restarted.recoverCompaction({ ...input, runId: "run-3" });
+      assert.equal(receipt.compacted, true);
+      assert.equal(receipt.details.recovered, true);
+      assert.equal(model.requests.length, requests, "Receipt inspection must not run the model");
+      await restarted.run({ ...input, runId: "run-3", prompt: "Continue with the original constraint." });
+      assert.equal(model.requests.length, requests + 1);
+      const after = JSON.parse(await readFile(path, "utf8"));
+      assert.deepEqual(after.compactRunIds, ["lost-receipt"]);
+      assert.equal(after.sessionId, before.sessionId);
+      assert.deepEqual(after.consumedRunIds, ["run-1", "run-2", "run-3"]);
+      await assert.rejects(restarted.compact({ ...input, runId: "lost-receipt" }), /already submitted/u);
+    } finally { await restarted.dispose(); }
+  });
+});
+
+test("failed native summary can be reconciled before continuation without retrying its model request", { timeout: 120000 }, async () => {
+  await fixture(async ({ body, send, finish }) => {
+    if (!JSON.stringify(body.messages).includes("compaction engine")) send({ role: "assistant", content: "Ready" });
+    finish();
+  }, async ({ runtime, model, input }) => {
+    await runtime.run({ ...input, prompt: `Original constraint. ${"historical ".repeat(5000)}` });
+    await runtime.run({ ...input, runId: "run-2", prompt: "Continue." });
+    await assert.rejects(runtime.compact({ ...input, runId: "failed-summary" }), /compaction|summary/u);
+    const requests = model.requests.length;
+    const receipt = await runtime.recoverCompaction({ ...input, runId: "run-3" });
+    assert.equal(receipt.compacted, false);
+    assert.equal(receipt.details.recovered, true);
+    assert.equal(model.requests.length, requests);
+    const continued = await runtime.run({ ...input, runId: "run-3", prompt: "Continue without repeating actions." });
+    assert.equal(continued.stopReason, "stop");
+    assert.equal(model.requests.length, requests + 1);
+    assert.ok(JSON.stringify(model.requests.at(-1).body.messages).includes("Original constraint."));
+  });
+});
+
+test("cancelled native summary drains and reconciles before a fresh foreground turn", { timeout: 120000 }, async () => {
+  const abort = new AbortController();
+  await fixture(({ body, send, finish, response }) => {
+    if (JSON.stringify(body.messages).includes("compaction engine")) {
+      abort.abort(new Error("fixture compaction cancelled"));
+      response.end();
+      return;
+    }
+    send({ role: "assistant", content: "Ready" });
+    finish();
+  }, async ({ runtime, model, input }) => {
+    await runtime.run({ ...input, prompt: `Keep this constraint. ${"historical ".repeat(5000)}` });
+    await runtime.run({ ...input, runId: "run-2", prompt: "Continue." });
+    await assert.rejects(runtime.compact({ ...input, runId: "cancelled-summary", signal: abort.signal }));
+    const count = model.requests.length;
+    const receipt = await runtime.recoverCompaction({ ...input, runId: "run-3" });
+    assert.equal(receipt.compacted, false);
+    assert.equal(receipt.details.recovered, true);
+    assert.equal(model.requests.length, count);
+    const continued = await runtime.run({ ...input, runId: "run-3", prompt: "Continue without replay." });
+    assert.equal(continued.stopReason, "stop");
+    assert.equal(model.requests.length, count + 1);
+  });
+});
+
+test("automatic pressure compaction uses the native compactor and keeps visible context accounting", { timeout: 120000 }, async () => {
+  await fixture(async ({ body, send, response }) => {
+    const finishWithUsage = (prompt_tokens) => {
+      send({}, "stop", {
+        prompt_tokens, completion_tokens: 5, total_tokens: prompt_tokens + 5,
+        prompt_cache_hit_tokens: 2, prompt_cache_miss_tokens: prompt_tokens - 2,
+      });
+      response.end("data: [DONE]\n\n");
+    };
+    const flattened = JSON.stringify(body.messages);
+    if (flattened.includes("compaction engine")) {
+      assert.deepEqual((body.tools ?? []).map((tool) => tool.function?.name).filter(Boolean), []);
+      send({ role: "assistant", content: "## Primary Request and Intent\n- Preserve pressure fixture.\n\n## Key Technical Concepts\n- Automatic DSH compaction.\n\n## Files and Code\n- (none)\n\n## Errors and Fixes\n- (none)\n\n## Pending Jobs\n- Continue.\n\n## Current Work\n- Auto compacting.\n\n## Next Step\n- Continue.\n\n## Critical Context\n- Pressure summary." });
+      finishWithUsage(200);
+      return;
+    }
+    send({ role: "assistant", content: "visible response" });
+    finishWithUsage(flattened.length > 1000 ? 2000 : 20);
+  }, async ({ runtime, model, input }) => {
+    const pressured = { ...input, contextWindow: 4096, maxTokens: 1024 };
+    await runtime.run({ ...pressured, prompt: `Remember the pressure fixture: ${"alpha ".repeat(2500)}` });
+    await runtime.run({ ...pressured, runId: "run-2", prompt: `Add another pressure fixture: ${"beta ".repeat(2500)}` });
+    const continued = await runtime.run({ ...pressured, runId: "run-3", prompt: "Continue after pressure." });
+    assert.equal(continued.stopReason, "stop");
+    const summaryRequests = model.requests.filter((request) => JSON.stringify(request.body.messages).includes("compaction engine"));
+    assert.ok(summaryRequests.length >= 1);
+    assert.deepEqual(summaryRequests[0].body.tools ?? [], []);
+    assert.equal(model.requests.some((request) => JSON.stringify(request.body.messages).includes("<compacted-summary>")), true);
+    assert.ok(continued.summaryUsage?.input > 0);
+    const finalPrompt = JSON.stringify(model.requests.at(-1).body.messages).length > 1000 ? 2000 : 20;
+    assert.equal(continued.lastCallUsage.input, finalPrompt - 2);
+    assert.equal(continued.contextUsage.promptTokens, finalPrompt);
+    assert.equal(continued.contextUsage.totalTokens, finalPrompt + 5);
+    assert.ok(continued.usage.input > continued.lastCallUsage.input, "Summary billing is separate from final-call occupancy");
   });
 });

@@ -1,7 +1,8 @@
 import type { Context, Events } from "@deepseek-ai/cordis";
+import type {} from "@deepseek-ai/dsh-compaction";
 import type { Agent } from "@deepseek-ai/dsh-agent";
 import type { SessionEvent } from "@deepseek-ai/dsh-session";
-import type { BridgeEvent, BridgeResult, BridgeUsage } from "../protocol.js";
+import type { BridgeContextUsage, BridgeEvent, BridgeResult, BridgeUsage } from "../protocol.js";
 
 type ChunkEvent = SessionEvent<"assistant/chunk">;
 type MessageEvent = SessionEvent<"assistant/message">;
@@ -67,6 +68,9 @@ export class TurnTracker {
   private readonly listeners: (() => void)[];
   private readonly turns: Turn[] = [];
   private readonly usage: BridgeUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+  private readonly summaryUsage: BridgeUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+  private lastCallUsage?: BridgeUsage;
+  private contextUsage: BridgeContextUsage = { state: "unavailable" };
   private lastSeq: number;
   private error?: Error;
   private text = "";
@@ -193,6 +197,26 @@ export class TurnTracker {
         if (event.data.reason.kind === "error") {
           this.fail(event.data.reason.error.message);
         }
+        return;
+      }
+      case "compaction/summary": {
+        const usage = event.data.usage;
+        if (!usage) return;
+        const reported: BridgeUsage = {
+          input: usage.inputTokens ?? 0,
+          output: usage.outputTokens ?? 0,
+          cacheRead: usage.cacheReadTokens ?? 0,
+          cacheWrite: usage.cacheWriteTokens ?? 0,
+        };
+        this.summaryUsage.input += reported.input;
+        this.summaryUsage.output += reported.output;
+        this.summaryUsage.cacheRead += reported.cacheRead;
+        this.summaryUsage.cacheWrite += reported.cacheWrite;
+        this.usage.input += reported.input;
+        this.usage.output += reported.output;
+        this.usage.cacheRead += reported.cacheRead;
+        this.usage.cacheWrite += reported.cacheWrite;
+        this.publish({ type: "usage", usage: reported });
         return;
       }
     }
@@ -324,6 +348,16 @@ export class TurnTracker {
       cacheRead: usage?.cacheReadTokens ?? 0,
       cacheWrite: usage?.cacheWriteTokens ?? 0,
     };
+    if (usage) {
+      this.lastCallUsage = reported;
+      this.contextUsage = {
+        state: "available",
+        promptTokens: reported.input + reported.cacheRead + reported.cacheWrite,
+        totalTokens: reported.input + reported.cacheRead + reported.cacheWrite + reported.output,
+      };
+    } else {
+      this.contextUsage = { state: "unavailable" };
+    }
     this.usage.input += reported.input;
     this.usage.output += reported.output;
     this.usage.cacheRead += reported.cacheRead;
@@ -383,6 +417,10 @@ export class TurnTracker {
       text: this.text,
       ...(this.reasoning ? { reasoning: this.reasoning } : {}),
       usage: { ...this.usage },
+      ...(this.summaryUsage.input || this.summaryUsage.output || this.summaryUsage.cacheRead || this.summaryUsage.cacheWrite
+        ? { summaryUsage: { ...this.summaryUsage } } : {}),
+      contextUsage: structuredClone(this.contextUsage),
+      ...(this.lastCallUsage ? { lastCallUsage: { ...this.lastCallUsage } } : {}),
       stopReason: aborted ? "aborted" : length ? "length" : "stop",
       sessionId,
       toolCalls,

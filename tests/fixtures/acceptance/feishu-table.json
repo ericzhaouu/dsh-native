@@ -1,0 +1,353 @@
+{
+  "fixtureId": "feishu-table",
+  "version": "2026-09-17.synthetic.v1",
+  "timezone": "Asia/Shanghai",
+  "asOfDate": "2026-09-17",
+  "pageSize": 10,
+  "modelVisible": {
+    "fieldDefinitions": [
+      {
+        "name": "id",
+        "type": "string",
+        "description": "synthetic stable record id"
+      },
+      {
+        "name": "title",
+        "type": "string",
+        "description": "task title; duplicates are intentional"
+      },
+      {
+        "name": "state",
+        "type": "enum",
+        "values": [
+          "open",
+          "blocked",
+          "done"
+        ]
+      },
+      {
+        "name": "dueAt",
+        "type": "date",
+        "timezone": "Asia/Shanghai"
+      },
+      {
+        "name": "estimateHours",
+        "type": "number|null",
+        "description": "0 is a known value; null is unknown"
+      }
+    ],
+    "records": [
+      {
+        "id": "WB-001",
+        "title": "供应商确认",
+        "state": "open",
+        "dueAt": "2026-09-01",
+        "estimateHours": 3
+      },
+      {
+        "id": "WB-002",
+        "title": "客户访谈",
+        "state": "open",
+        "dueAt": "2026-09-05",
+        "estimateHours": 2
+      },
+      {
+        "id": "WB-003",
+        "title": "预算复核",
+        "state": "done",
+        "dueAt": "2026-09-08",
+        "estimateHours": 1
+      },
+      {
+        "id": "WB-004",
+        "title": "风险登记",
+        "state": "open",
+        "dueAt": "2026-09-10",
+        "estimateHours": 0
+      },
+      {
+        "id": "WB-005",
+        "title": "设计评审",
+        "state": "blocked",
+        "dueAt": "2026-09-12",
+        "estimateHours": 5
+      },
+      {
+        "id": "WB-006",
+        "title": "客户访谈",
+        "state": "open",
+        "dueAt": "2026-09-15",
+        "estimateHours": null
+      },
+      {
+        "id": "WB-007",
+        "title": "合同归档",
+        "state": "done",
+        "dueAt": "2026-09-18",
+        "estimateHours": 2
+      },
+      {
+        "id": "WB-008",
+        "title": "门店回访",
+        "state": "open",
+        "dueAt": "2026-09-20",
+        "estimateHours": 4
+      },
+      {
+        "id": "WB-009",
+        "title": "数据清洗",
+        "state": "open",
+        "dueAt": "2026-09-22",
+        "estimateHours": 0
+      },
+      {
+        "id": "WB-010",
+        "title": "模型验收",
+        "state": "open",
+        "dueAt": "2026-09-25",
+        "estimateHours": 8
+      },
+      {
+        "id": "WB-011",
+        "title": "财务确认",
+        "state": "open",
+        "dueAt": "2026-09-28",
+        "estimateHours": 1
+      },
+      {
+        "id": "WB-012",
+        "title": "安全审阅",
+        "state": "open",
+        "dueAt": "2026-09-30",
+        "estimateHours": 6
+      },
+      {
+        "id": "WB-013",
+        "title": "发布检查",
+        "state": "open",
+        "dueAt": "2026-09-29",
+        "estimateHours": 2
+      },
+      {
+        "id": "WB-014",
+        "title": "培训材料",
+        "state": "open",
+        "dueAt": "2026-10-03",
+        "estimateHours": 3
+      },
+      {
+        "id": "WB-015",
+        "title": "反馈整理",
+        "state": "blocked",
+        "dueAt": "2026-10-05",
+        "estimateHours": null
+      },
+      {
+        "id": "WB-016",
+        "title": "渠道沟通",
+        "state": "open",
+        "dueAt": "2026-10-07",
+        "estimateHours": 4
+      },
+      {
+        "id": "WB-017",
+        "title": "复盘会议",
+        "state": "done",
+        "dueAt": "2026-10-09",
+        "estimateHours": 2
+      },
+      {
+        "id": "WB-018",
+        "title": "雪花测试",
+        "state": "open",
+        "dueAt": "2026-10-11",
+        "estimateHours": 1
+      },
+      {
+        "id": "WB-019",
+        "title": "空估算检查",
+        "state": "open",
+        "dueAt": "2026-10-13",
+        "estimateHours": null
+      },
+      {
+        "id": "WB-020",
+        "title": "重复标题",
+        "state": "blocked",
+        "dueAt": "2026-10-15",
+        "estimateHours": 7
+      },
+      {
+        "id": "WB-021",
+        "title": "重复标题",
+        "state": "open",
+        "dueAt": "2026-10-17",
+        "estimateHours": 5
+      },
+      {
+        "id": "WB-022",
+        "title": "边界日期",
+        "state": "done",
+        "dueAt": "2026-10-19",
+        "estimateHours": 3
+      },
+      {
+        "id": "WB-023",
+        "title": "零工时复核",
+        "state": "blocked",
+        "dueAt": "2026-10-21",
+        "estimateHours": 0
+      },
+      {
+        "id": "WB-024",
+        "title": "火箭验证",
+        "state": "open",
+        "dueAt": "2026-10-23",
+        "estimateHours": 2
+      },
+      {
+        "id": "WB-025",
+        "title": "收尾清单",
+        "state": "done",
+        "dueAt": "2026-10-25",
+        "estimateHours": 1
+      },
+      {
+        "id": "WB-026",
+        "title": "后续实验",
+        "state": "open",
+        "dueAt": "2026-10-27",
+        "estimateHours": 6
+      },
+      {
+        "id": "WB-027",
+        "title": "归档复核",
+        "state": "done",
+        "dueAt": "2026-10-29",
+        "estimateHours": 2
+      },
+      {
+        "id": "WB-028",
+        "title": "接口冻结",
+        "state": "blocked",
+        "dueAt": "2026-10-31",
+        "estimateHours": 4
+      },
+      {
+        "id": "WB-029",
+        "title": "培训签到",
+        "state": "done",
+        "dueAt": "2026-11-02",
+        "estimateHours": 1
+      },
+      {
+        "id": "WB-030",
+        "title": "延期说明",
+        "state": "blocked",
+        "dueAt": "2026-11-04",
+        "estimateHours": 3
+      }
+    ],
+    "delivery": "tool-resource",
+    "resourceHint": "Records are delivered through the acceptance runner table resource, not pasted into each user prompt."
+  },
+  "oracle": {
+    "filters": {
+      "open_due_before_oct": {
+        "expression": "state == open AND dueAt < 2026-10-01 in Asia/Shanghai",
+        "resultIds": [
+          "WB-001",
+          "WB-002",
+          "WB-004",
+          "WB-006",
+          "WB-008",
+          "WB-009",
+          "WB-010",
+          "WB-011",
+          "WB-012",
+          "WB-013"
+        ]
+      },
+      "all_open": {
+        "expression": "state == open",
+        "resultIds": [
+          "WB-001",
+          "WB-002",
+          "WB-004",
+          "WB-006",
+          "WB-008",
+          "WB-009",
+          "WB-010",
+          "WB-011",
+          "WB-012",
+          "WB-013",
+          "WB-014",
+          "WB-016",
+          "WB-018",
+          "WB-019",
+          "WB-021",
+          "WB-024",
+          "WB-026"
+        ]
+      },
+      "zero_estimate": {
+        "expression": "estimateHours === 0",
+        "resultIds": [
+          "WB-004",
+          "WB-009",
+          "WB-023"
+        ]
+      },
+      "duplicate_customer_interview": {
+        "expression": "title == 客户访谈",
+        "resultIds": [
+          "WB-002",
+          "WB-006"
+        ]
+      },
+      "unicode_titles": {
+        "expression": "title contains non-ASCII",
+        "resultIds": [
+          "WB-001",
+          "WB-002",
+          "WB-003",
+          "WB-004",
+          "WB-005",
+          "WB-006",
+          "WB-007",
+          "WB-008",
+          "WB-009",
+          "WB-010",
+          "WB-011",
+          "WB-012",
+          "WB-013",
+          "WB-014",
+          "WB-015",
+          "WB-016",
+          "WB-017",
+          "WB-018",
+          "WB-019",
+          "WB-020",
+          "WB-021",
+          "WB-022",
+          "WB-023",
+          "WB-024",
+          "WB-025",
+          "WB-026",
+          "WB-027",
+          "WB-028",
+          "WB-029",
+          "WB-030"
+        ]
+      },
+      "null_estimate": {
+        "expression": "estimateHours is null",
+        "resultIds": [
+          "WB-006",
+          "WB-015",
+          "WB-019"
+        ]
+      }
+    }
+  }
+}

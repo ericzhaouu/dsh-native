@@ -67,6 +67,44 @@ test("EOF rejects pending requests", async () => {
   peer.close(); output.destroy();
 });
 
+test("close-only input destroy rejects pending requests and records failure reason", async () => {
+  const input = new PassThrough();
+  const output = new PassThrough();
+  output.resume();
+  const peer = new JsonRpcPeer(input, output);
+  const rejected = assert.rejects(peer.request("run", {}), /input closed/);
+  input.destroy();
+  await rejected;
+  assert.match(peer.failureReason.message, /input closed/);
+  await peer.closed;
+  output.destroy();
+});
+
+test("transport errors reject pending requests with the original code", async () => {
+  const input = new PassThrough();
+  const output = new PassThrough();
+  output.resume();
+  const peer = new JsonRpcPeer(input, output);
+  const failure = Object.assign(new Error("read ENOTCONN"), { code: "ENOTCONN" });
+  const rejected = assert.rejects(peer.request("run", {}), (error) => error.code === "ENOTCONN");
+  input.destroy(failure);
+  await rejected;
+  assert.equal(peer.failureReason.code, "ENOTCONN");
+  await peer.closed;
+  output.destroy();
+});
+
+test("output close-only rejects pending requests without an unhandled write", async () => {
+  const input = new PassThrough();
+  const output = new PassThrough();
+  const peer = new JsonRpcPeer(input, output);
+  const rejected = assert.rejects(peer.request("run", {}), /output closed|premature close|closed/i);
+  output.destroy();
+  await rejected;
+  await peer.closed;
+  input.destroy();
+});
+
 test("UTF-8 split across reads is preserved", async () => {
   const input = new PassThrough();
   const output = new PassThrough();

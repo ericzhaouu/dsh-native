@@ -20,7 +20,7 @@ const sourceHooks = registerHooks({
   },
 });
 const { createNativeToolHost, projectNativeToolResult } = await import("../dist/native/host.js");
-const { resolveHostToolAllowlist, buildHostToolNotices, snapshotHostToolSource } =
+const { resolveHostToolAllowlist, buildHostToolNotices, renderHostToolNotices, snapshotHostToolSource } =
   await import("../dist/native/tool-bridge.js");
 sourceHooks.deregister();
 
@@ -188,6 +188,10 @@ test("unsupported context tools and unavailable names are omitted with bounded n
   const bounded = buildHostToolNotices(["unsafe\nSECRET", ...Array.from({ length: 200 }, (_, i) => `tool_${i}`)], []);
   assert.equal(bounded.length, 64);
   assert.doesNotMatch(JSON.stringify(bounded), /SECRET/);
+  const rendered = renderHostToolNotices([{ name: "feishu", reason: "unavailable-or-denied" }]);
+  assert.match(rendered, /do not claim CLI or alternate dispatch is authorized/);
+  assert.match(rendered, /existing host-authorized CLI/);
+  assert.match(rendered, /explicit denial/);
   await f.host.dispose();
 });
 

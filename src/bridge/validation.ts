@@ -1,6 +1,7 @@
 import { isAbsolute } from "node:path";
 import {
-  isRecord, type BridgeRun, type BridgeTool, type BridgeToolResult, type Json, type JsonObject, type ModelProvider,
+  isRecord, type BridgeCompact, type BridgeRun, type BridgeTool, type BridgeToolResult, type Json, type JsonObject,
+  type ModelProvider,
 } from "../protocol.js";
 import { parsePreparationRequest, PREPARATION_TOOL_NAME } from "../preparation.js";
 
@@ -113,5 +114,38 @@ export function parseRun(value: unknown): BridgeRun {
     ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
     ...(maxTokens === undefined ? {} : { maxTokens }),
     ...(taskPreparation === undefined ? {} : { taskPreparation }),
+  };
+}
+
+export function parseCompact(value: unknown): BridgeCompact {
+  const run = record(value, "compact");
+  keys(run, [
+    "provider", "sessionId", "runId", "completedTurns", "workspaceDir", "modelId", "reasoningEffort", "maxTokens",
+  ], "compact");
+  const selectedProvider = run.provider === undefined ? "deepseek" : provider(run.provider, "provider");
+  const sessionId = string(run.sessionId, "sessionId", true);
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(sessionId) || /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i.test(sessionId)) {
+    throw new TypeError("sessionId must be a safe, non-device filename identifier");
+  }
+  const workspaceDir = string(run.workspaceDir, "workspaceDir", true);
+  if (!isAbsolute(workspaceDir)) throw new TypeError("workspaceDir must be absolute");
+  const modelId = string(run.modelId, "modelId", true);
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(modelId)) throw new TypeError("Invalid modelId");
+  const reasoningEffort = run.reasoningEffort === undefined ? undefined : string(run.reasoningEffort, "reasoningEffort", true);
+  const supportedEfforts = selectedProvider === "github-copilot" ? copilotEfforts : deepSeekEfforts;
+  if (reasoningEffort !== undefined && !(supportedEfforts as readonly string[]).includes(reasoningEffort)) {
+    throw new TypeError(`reasoningEffort must be ${supportedEfforts.join(", ").replace(/, ([^,]+)$/u, ", or $1")}`);
+  }
+  const maxTokens = run.maxTokens === undefined ? undefined : positiveInteger(run.maxTokens, "maxTokens");
+  if (run.completedTurns !== undefined && (!Number.isSafeInteger(run.completedTurns) ||
+      typeof run.completedTurns !== "number" || run.completedTurns < 0)) {
+    throw new TypeError("completedTurns must be a nonnegative safe integer");
+  }
+  return {
+    ...(run.provider === undefined ? {} : { provider: selectedProvider }),
+    sessionId, runId: string(run.runId, "runId", true), workspaceDir, modelId,
+    ...(typeof run.completedTurns === "number" ? { completedTurns: run.completedTurns } : {}),
+    ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
+    ...(maxTokens === undefined ? {} : { maxTokens }),
   };
 }

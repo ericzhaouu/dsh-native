@@ -1,5 +1,5 @@
 import { isAbsolute } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import type { PatchOptions } from "@deepseek-ai/cordis-plugin-include";
 import type { Config as SpineConfig } from "@deepseek-ai/dsh-agent-spine-demo";
 import type { Config as DeepSeekConfig } from "@deepseek-ai/dsh-llm-deepseek";
@@ -71,6 +71,7 @@ function validateReasoningEfforts(
  */
 export function createBridgePatch(options: {
   bridgePath: string;
+  compactionPath?: string;
   baseUrl: string;
   thinking: "enabled" | "disabled";
   reasoningEffort?: string;
@@ -85,6 +86,10 @@ export function createBridgePatch(options: {
 }): object[] {
   if (!isAbsolute(options.bridgePath)) {
     throw new TypeError("bridgePath must be an absolute filesystem path");
+  }
+  const compactionPath = options.compactionPath ?? fileURLToPath(new URL("./compaction.js", import.meta.url));
+  if (!isAbsolute(compactionPath)) {
+    throw new TypeError("compactionPath must be an absolute filesystem path");
   }
   const endpoint = new URL(options.baseUrl);
   if (
@@ -135,6 +140,8 @@ export function createBridgePatch(options: {
     ...(effort !== undefined ? { reasoningEffort: effort as DeepSeekConfig["reasoningEffort"] } : {}),
     ...(options.maxTokens !== undefined ? { maxTokens: options.maxTokens } : {}),
     defaultContextWindow: options.contextWindow,
+    // Host-selected capacity must not be replaced by DSH's advisory model catalog.
+    models: [],
     streamIdleTimeoutMs: options.streamIdleTimeoutMs,
   };
   if (selectedProvider === "deepseek") {
@@ -144,10 +151,18 @@ export function createBridgePatch(options: {
       { id: "llm-deepseek", config: adapter },
       {
         insert: [{
-          id: "openclaw-bridge",
-          // Native Windows paths are not ESM specifiers; encode spaces/#/% as well.
-          name: pathToFileURL(options.bridgePath).href,
-          config: { contextWindow: options.contextWindow },
+          id: "dsh-token-meter",
+          name: "@deepseek-ai/dsh-token-meter",
+          config: {},
+        }, {
+          id: "dsh-compaction-basic",
+          name: pathToFileURL(compactionPath).href,
+          config: { auto: true },
+        }, {
+           id: "openclaw-bridge",
+           // Native Windows paths are not ESM specifiers; encode spaces/#/% as well.
+           name: pathToFileURL(options.bridgePath).href,
+           config: {},
         }],
       },
     ] satisfies PatchOptions[];
@@ -189,10 +204,20 @@ export function createBridgePatch(options: {
       insert: [
         { id: "llm-pi-ai", name: "@deepseek-ai/dsh-llm-pi-ai", config: piAi },
         {
+          id: "dsh-token-meter",
+          name: "@deepseek-ai/dsh-token-meter",
+          config: {},
+        },
+        {
+          id: "dsh-compaction-basic",
+          name: pathToFileURL(compactionPath).href,
+          config: { auto: true },
+        },
+        {
           id: "openclaw-bridge",
           // Native Windows paths are not ESM specifiers; encode spaces/#/% as well.
           name: pathToFileURL(options.bridgePath).href,
-          config: { contextWindow: options.contextWindow },
+          config: {},
         },
       ],
     },

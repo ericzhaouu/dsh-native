@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { AsyncLocalStorage } from "node:async_hooks";
 import test from "node:test";
-import { prepareNativeTranscript } from "../dist/native/transcript.js";
+import { prepareNativeTranscript, readNativeMaintenanceContext } from "../dist/native/transcript.js";
 
 const USER_KEY = "run-1:user";
 const ASSISTANT_KEY = "dsh-native:run-1:assistant";
@@ -232,6 +232,38 @@ function assertScope(actual, expected) {
   for (const [key, value] of Object.entries(expected)) assert.deepEqual(actual[key], value, key);
   assert.equal(Object.hasOwn(actual, "sessionFile"), false, "legacy sessionFile must not route storage");
 }
+
+test("maintenance reads a reset-scoped snapshot without admitting or persisting a user turn", async () => {
+  const f = fixture();
+  const oldUser = f.add(user("old", "old:user"));
+  const oldAssistant = f.add(assistant("foreign", "foreign:assistant"));
+  const reset = { type: "reset", id: "reset-maint", parentId: oldAssistant.entryId, context: "clear" };
+  f.add(user("retained constraint", "retained:user"), { parentId: reset.id });
+  f.add(assistant("retained answer", "dsh-native:reset:reset-maint:retained:assistant"));
+  f.state.rawEvents = () => [oldUser, oldAssistant].map(f.rawOf).concat(reset, f.state.entries.slice(2).map(f.rawOf));
+  const before = clone(f.state.entries);
+  const snapshot = await readNativeMaintenanceContext(f.p, f.assertActive, f.transport);
+  assert.equal(snapshot.nativeStateId, "session-1\0reset\0reset-maint");
+  assert.deepEqual(mirror(snapshot.contextMessages), [["user", "retained constraint"], ["assistant", "retained answer"]]);
+  assert.equal(snapshot.messages.length, 4);
+  await snapshot.assertCurrent();
+  assert.deepEqual(f.state.entries, before);
+  assertNoWrites(f);
+  assert.equal(f.calls.resolve.length, 0);
+  f.add(user("new admission", "new:user"));
+  await assert.rejects(snapshot.assertCurrent(), /transcript changed/u);
+});
+
+test("maintenance rejects foreign compaction and mismatched session scopes", async () => {
+  const f = fixture();
+  const boundary = { type: "compaction", id: "foreign", parentId: null };
+  f.state.rawEvents = [boundary];
+  await assert.rejects(readNativeMaintenanceContext(f.p, f.assertActive, f.transport), /active compaction/u);
+  await assert.rejects(readNativeMaintenanceContext({
+    ...f.p, sessionTarget: { sessionId: "different" },
+  }, f.assertActive, f.transport), /mismatched/u);
+  assertNoWrites(f);
+});
 
 test("active clear reset filters old visible transcript for native context while preserving full snapshot", async () => {
   const f = fixture();

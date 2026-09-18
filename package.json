@@ -1,6 +1,6 @@
 {
   "name": "openclaw-dsh-native",
-  "version": "0.5.2",
+  "version": "0.6.0",
   "description": "Opt-in native DeepSeek Harness runtime for OpenClaw",
   "type": "module",
   "license": "MIT",
@@ -45,6 +45,12 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "node --test --test-concurrency=1 tests/*.test.mjs",
+    "test:package": "node --test tests/package-acceptance.test.mjs",
+    "package:check": "node scripts/check-package.mjs",
+    "acceptance:compile": "node scripts/compile-acceptance.mjs",
+    "acceptance:dry-run": "node scripts/run-acceptance.mjs --dry-run",
+    "acceptance:evaluate": "node scripts/evaluate-acceptance.mjs",
+    "soak:dry-run": "node scripts/run-native-soak.mjs",
     "prepack": "npm run build"
   },
   "peerDependencies": {
@@ -58,10 +64,15 @@
   "dependencies": {
     "@deepseek-ai/dsh": "0.1.2-alpha.2",
     "@deepseek-ai/dsh-agent": "0.1.2-alpha.2",
+    "@deepseek-ai/dsh-commands": "0.1.2-alpha.2",
+    "@deepseek-ai/dsh-compaction": "0.1.2-alpha.2",
+    "@deepseek-ai/dsh-compaction-basic": "0.1.2-alpha.2",
     "@deepseek-ai/dsh-llm": "0.1.2-alpha.2",
     "@deepseek-ai/dsh-llm-pi-ai": "0.1.2-alpha.2",
     "@deepseek-ai/dsh-session": "0.1.2-alpha.2",
+    "@deepseek-ai/dsh-session-persistence": "0.1.2-alpha.2",
     "@deepseek-ai/dsh-tools": "0.1.2-alpha.2",
+    "@deepseek-ai/dsh-token-meter": "0.1.2-alpha.2",
     "@deepseek-ai/dsh-system-prompt": "0.1.2-alpha.2",
     "@deepseek-ai/cordis": "4.0.2",
     "ajv": "^8.17.1"

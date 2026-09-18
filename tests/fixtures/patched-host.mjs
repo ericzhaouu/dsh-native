@@ -1,4 +1,4 @@
-import { cp, mkdir, readFile, symlink } from "node:fs/promises";
+import { cp, mkdir, readFile, realpath, symlink } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { patchHost } from "../../host-patch/apply.mjs";
@@ -12,7 +12,8 @@ export async function createPatchedHostFixture(root) {
   for (const name of ["package.json", "openclaw.mjs", "node-version.mjs", "dist", "docs"]) {
     await cp(join(source, name), join(host, name), { recursive: true });
   }
-  await symlink(join(projectRoot, "node_modules"), join(host, "node_modules"), "junction");
+  // A separately installed optional SDK has its own dependency tree.
+  await symlink(dirname(await realpath(source)), join(host, "node_modules"), "junction");
   await patchHost(host, { action: "apply", offlineConfirmed: true });
   return { host, plugin: await createPluginFixture(root, host) };
 }

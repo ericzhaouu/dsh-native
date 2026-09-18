@@ -24,6 +24,8 @@ export class JsonRpcPeer {
   private protocolFailure?: Error;
   private writes: Promise<void> = Promise.resolve();
   private notifications: Promise<void> = Promise.resolve();
+  private inputEnded = false;
+  private outputFinished = false;
 
   constructor(
     private readonly input: Readable,
@@ -34,8 +36,15 @@ export class JsonRpcPeer {
     this.closed = new Promise((resolve) => { this.resolveClosed = resolve; });
     input.on("data", this.onData);
     input.on("end", this.onEnd);
+    input.on("close", this.onInputClose);
     input.on("error", this.onError);
+    output.on("finish", this.onOutputFinish);
+    output.on("close", this.onOutputClose);
     output.on("error", this.onError);
+  }
+
+  get failureReason(): Error | undefined {
+    return this.failure;
   }
 
   request(method: string, params: unknown): Promise<unknown> {
@@ -60,11 +69,15 @@ export class JsonRpcPeer {
     if (this.protocolFailure) throw this.protocolFailure;
   }
 
-  close(error = new Error("DSH bridge connection closed.")): void {
+  close(error = new Error("DSH bridge connection closed."), options: { fatal?: boolean } = {}): void {
+    if (options.fatal) this.protocolFailure ??= error;
     if (this.failure) return;
     this.failure = error;
     this.input.off("data", this.onData);
     this.input.off("end", this.onEnd);
+    this.input.off("close", this.onInputClose);
+    this.output.off("finish", this.onOutputFinish);
+    this.output.off("close", this.onOutputClose);
     // Streams can report a late write error after EOF; retain their error sink.
     for (const pending of this.pending.values()) pending.reject(error);
     this.pending.clear();
@@ -73,11 +86,22 @@ export class JsonRpcPeer {
   }
 
   private readonly onEnd = (): void => {
+    this.inputEnded = true;
     if (this.buffer.length) this.fail(new Error("Truncated DSH bridge frame."));
     else this.close(new Error("DSH bridge reached EOF."));
   };
 
   private readonly onError = (error: Error): void => { this.fail(error); };
+
+  private readonly onInputClose = (): void => {
+    if (!this.failure && !this.inputEnded) this.fail(new Error("DSH bridge input closed."));
+  };
+
+  private readonly onOutputFinish = (): void => { this.outputFinished = true; };
+
+  private readonly onOutputClose = (): void => {
+    if (!this.failure && !this.outputFinished) this.fail(new Error("DSH bridge output closed."));
+  };
 
   private fail(error: Error): void {
     this.protocolFailure ??= error;

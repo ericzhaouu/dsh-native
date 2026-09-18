@@ -1,5 +1,6 @@
 import type {
   BridgeEvent,
+  BridgeCompactResult,
   BridgeResult,
   BridgeTool,
   BridgeToolCall,
@@ -47,7 +48,30 @@ export interface DshAttempt {
   onPreparationDecision?(resolution: PreparationResolution): void | Promise<void>;
 }
 
+export interface DshCompactAttempt {
+  recoverOnly?: boolean;
+  provider?: ModelProvider;
+  sessionId: string;
+  nativeStateId?: string;
+  runId: string;
+  workspaceDir: string;
+  modelId: string;
+  apiKey: string;
+  baseUrl: string;
+  contextWindow: number;
+  maxTokens?: number;
+  thinking: "enabled" | "disabled";
+  reasoningEffort?: string;
+  reasoningEfforts?: ReasoningEfforts | false;
+  headers?: Record<string, string>;
+  modelName?: string;
+  signal: AbortSignal;
+  assertActive(): void;
+}
+
 export interface DshRuntime {
   run(input: DshAttempt): Promise<BridgeResult>;
+  compact(input: DshCompactAttempt): Promise<BridgeCompactResult>;
+  recoverCompaction?(input: DshCompactAttempt): Promise<BridgeCompactResult>;
   dispose(): Promise<void>;
 }

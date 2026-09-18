@@ -14,7 +14,7 @@ const config = {
   startupTimeoutMs: 1000,
   shutdownTimeoutMs: 1000,
   streamIdleTimeoutMs: 1000,
-  allowedBaseUrls: [],
+  allowedBaseUrls: ["https://api.deepseek.com"],
 };
 const tick = () => new Promise((resolve) => setImmediate(resolve));
 const deferred = () => Promise.withResolvers();
@@ -151,11 +151,29 @@ function fixture(t, overrides = {}) {
     }),
   };
   f.transcript.contextMessages = f.transcript.messages;
+  f.maintenance = {
+    messages: [],
+    contextMessages: [{ role: "user", content: "Remember fixture constraint", timestamp: 1 }],
+    nativeStateId: f.p.sessionId,
+    assistantKeyPrefix: "dsh-native:",
+    assertCurrent: f.spy("maintenanceCurrent", async () => {}),
+  };
   f.runtime = {
     run: f.spy("runtimeRun", async (input) => {
       f.input = input;
       f.entered.resolve(input);
       return f.run ? f.run(input) : f.output;
+    }),
+    compact: f.spy("runtimeCompact", async (input) => {
+      f.compactInput = input;
+      return f.compactOutput ?? {
+        compacted: true,
+        sessionId: input.sessionId,
+        summary: "checkpoint",
+        tokensBefore: 1000,
+        tokensAfter: 100,
+        details: { compactionId: "compact-1" },
+      };
     }),
     dispose: f.spy("runtimeDispose", async () => {}),
   };
@@ -163,6 +181,7 @@ function fixture(t, overrides = {}) {
     loadSdk: f.spy("loadSdk", async () => f.sdk),
     prepareTranscript: f.spy("prepareTranscript", async () => f.transcript),
     prepareHost: f.spy("prepareHost", async () => f.host),
+    readMaintenanceContext: f.spy("readMaintenanceContext", async () => f.maintenance),
   };
   /** @type {AgentHarnessV2} */
   f.harness = createNativeHarness(config, f.runtime, f.dependencies);
@@ -183,6 +202,19 @@ test("only absent session-control tools are declared safe to deny", async (t) =>
   assert.match(result.terminal.error.message, /explicit tool-policy restriction/);
   assert.equal(f.runtime.run.mock.callCount(), 0);
   assert.equal(f.dependencies.prepareHost.mock.callCount(), 0);
+});
+
+test("an empty endpoint grant fails before host construction or native execution", async (t) => {
+  const f = fixture(t);
+  const harness = createNativeHarness({ ...config, allowedBaseUrls: [] }, f.runtime, f.dependencies);
+  t.after(() => harness.dispose());
+  const result = await harness.runAttempt(f.p);
+  assert.equal(result.terminal.kind, "failed");
+  assert.equal(result.terminal.source, "precheck");
+  assert.match(result.terminal.error.message, /exact allowedBaseUrls/);
+  assert.equal(f.runtime.run.mock.callCount(), 0);
+  assert.equal(f.dependencies.prepareHost.mock.callCount(), 0);
+  assert.equal(f.transcript.persistUser.mock.callCount(), 0);
 });
 
 /** @param {Result} result */
@@ -661,6 +693,170 @@ test("rejects unsupported attempts before SDK loading, host setup or runtime ent
       noMirrorOwnership(result);
     });
   }
+});
+
+test("native compaction uses the established host route without a user turn or host tools", async (t) => {
+  const f = fixture(t);
+  const result = await f.harness.compact({
+    sessionId: f.p.sessionId,
+    sessionKey: f.p.sessionKey,
+    sessionFile: f.p.sessionFile,
+    workspaceDir: f.p.workspaceDir,
+    runId: "compact-run-1",
+    agentHarnessId: "dsh-native",
+    provider: f.p.provider,
+    model: f.p.model.id,
+    runtimeModel: f.p.model,
+    resolvedApiKey: f.p.resolvedApiKey,
+    contextTokenBudget: f.p.model.contextWindow,
+    thinkLevel: "off",
+    config: f.p.config,
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.compacted, true);
+  assert.equal(result.compactionKind, "native-harness");
+  assert.equal(result.result.summary, "checkpoint");
+  assert.equal(result.result.tokensBefore, 1000);
+  assert.equal(result.result.tokensAfter, 100);
+  assert.equal(f.runtime.run.mock.callCount(), 0);
+  assert.equal(f.runtime.compact.mock.callCount(), 1);
+  assert.equal(f.compactInput.sessionId, f.p.sessionId);
+  assert.equal(f.compactInput.runId, "compact-run-1");
+  assert.equal(f.compactInput.modelId, f.p.model.id);
+  assert.equal(f.compactInput.apiKey, f.p.resolvedApiKey);
+  assert.equal(f.compactInput.nativeStateId, f.p.sessionId);
+});
+
+test("native compaction follows the authoritative reset epoch rather than a CLI binding", async (t) => {
+  const f = fixture(t);
+  f.maintenance.nativeStateId = `${f.p.sessionId}\0reset\0boundary-2`;
+  const params = {
+    ...f.p, runtimeModel: f.p.model, model: f.p.model.id, runId: undefined,
+  };
+  const result = await f.harness.compact(params);
+  assert.equal(result.ok, true, result.reason);
+  assert.equal(f.compactInput.nativeStateId, f.maintenance.nativeStateId);
+  assert.match(f.compactInput.runId, /^compact-/u);
+  assert.equal(f.transcript.persistUser.mock.callCount(), 0);
+  const invalid = await f.harness.compact({ ...params, cliSessionId: "unrelated-epoch" });
+  assert.equal(invalid.ok, false);
+  assert.match(invalid.reason, /CLI bindings/u);
+  assert.equal(f.runtime.compact.mock.callCount(), 1);
+});
+
+test("host memory maintenance is isolated, silent and never persisted as a foreground user turn", async (t) => {
+  const f = fixture(t, {
+    trigger: "memory", memoryFlushWritePath: "memory/fixture.md", transcriptPrompt: "", silentExpected: true,
+  });
+  f.output.contextUsage = { state: "available", promptTokens: 115, totalTokens: 122 };
+  const before = structuredClone(f.transcript.messages);
+  const result = await f.harness.runAttempt(f.p);
+  assert.equal(result.terminal.kind, "ok", result.terminal.error?.message);
+  assert.equal(f.dependencies.prepareTranscript.mock.callCount(), 0);
+  assert.equal(f.transcript.persistUser.mock.callCount(), 0);
+  assert.equal(f.transcript.persistAssistant.mock.callCount(), 0);
+  assert.deepEqual(f.transcript.messages, before);
+  assert.equal(f.input.nativeStateId, `${f.p.sessionId}\0memory\0${f.p.runId}`);
+  assert.equal(f.input.taskPreparation, undefined);
+  assert.equal(f.input.maxTokens, 4096);
+  assert.match(f.input.prompt, /Remember fixture constraint/u);
+  assert.deepEqual(f.dependencies.prepareHost.mock.calls[0].arguments[5], ["read", "write"]);
+  assert.equal(result.assistantTranscriptOwned, true);
+  assert.equal(result.assistantTranscriptIdempotencyKey, undefined);
+  assert.deepEqual(result.attemptUsage.contextUsage, { state: "unavailable" });
+  assert.equal(result.contextTokens, undefined);
+  assert.equal(f.sdk.emitAgentEvent.mock.callCount(), 0);
+  assert.equal(f.p.onPartialReply.mock.callCount(), 0);
+});
+
+test("memory maintenance enforces its tool budget without replaying the fifth callback", async (t) => {
+  const f = fixture(t, {
+    trigger: "memory", memoryFlushWritePath: "memory/fixture.md", transcriptPrompt: "", silentExpected: true,
+  });
+  f.run = async (input) => {
+    for (let index = 0; index < 5; index++) {
+      await input.executeTool({ callId: `memory-${index}`, name: "read", arguments: { path: "memory/fixture.md" } }, input.signal);
+    }
+    return f.output;
+  };
+  const result = await f.harness.runAttempt(f.p);
+  assert.equal(result.terminal.kind, "failed");
+  assert.match(result.terminal.error.message, /bounded host-tool budget/u);
+  assert.equal(f.host.executeTool.mock.callCount(), 4);
+  assert.equal(result.replayMetadata.replaySafe, false);
+  assert.equal(f.transcript.persistUser.mock.callCount(), 0);
+});
+
+test("invalid or stale memory authority fails before provider or filesystem callbacks", async (t) => {
+  for (const patch of [
+    { trigger: "memory" },
+    { memoryFlushWritePath: "memory/fixture.md" },
+    { trigger: "memory", memoryFlushWritePath: "../escape.md", transcriptPrompt: "", silentExpected: true },
+    { trigger: "memory", memoryFlushWritePath: "memory/fixture.md", transcriptPrompt: "user task", silentExpected: true },
+  ]) {
+    const f = fixture(t, patch);
+    const result = await f.harness.runAttempt(f.p);
+    assert.equal(result.terminal.kind, "failed");
+    assert.match(result.terminal.error.message, /memory/u);
+    assert.equal(f.runtime.run.mock.callCount(), 0);
+    assert.equal(f.host.executeTool.mock.callCount(), 0);
+  }
+  const f = fixture(t, {
+    trigger: "memory", memoryFlushWritePath: "memory/fixture.md", transcriptPrompt: "", silentExpected: true,
+  });
+  f.errors.maintenanceCurrent = new Error("transcript changed");
+  const result = await f.harness.runAttempt(f.p);
+  assert.equal(result.terminal.kind, "failed");
+  assert.match(result.terminal.error.message, /transcript changed/u);
+  assert.equal(f.runtime.run.mock.callCount(), 0);
+});
+
+test("native compaction fails closed for spoofed harness identity or missing host route", async (t) => {
+  const f = fixture(t);
+  for (const [name, overrides, pattern] of [
+    ["spoofed harness", { agentHarnessId: "openclaw" }, /identity/u],
+    ["missing model", { runtimeModel: undefined }, /runtime model/u],
+  ]) {
+    await t.test(name, async () => {
+      const result = await f.harness.compact({
+        sessionId: f.p.sessionId,
+        sessionKey: f.p.sessionKey,
+        sessionFile: f.p.sessionFile,
+        workspaceDir: f.p.workspaceDir,
+        runId: `compact-${name.replace(/\s+/gu, "-")}`,
+        agentHarnessId: "dsh-native",
+        provider: f.p.provider,
+        model: f.p.model.id,
+        runtimeModel: f.p.model,
+        resolvedApiKey: f.p.resolvedApiKey,
+        thinkLevel: "off",
+        config: f.p.config,
+        ...overrides,
+      });
+      assert.equal(result.ok, false);
+      assert.equal(result.compacted, false);
+      assert.match(result.reason, pattern);
+    });
+  }
+  assert.equal(f.runtime.compact.mock.callCount(), 0);
+});
+
+test("attempt billing stays aggregate while context pressure uses latest request usage", async (t) => {
+  const f = fixture(t);
+  f.output.usage = { input: 161149, output: 146, cacheRead: 0, cacheWrite: 0 };
+  f.output.contextUsage = { state: "available", promptTokens: 22401, totalTokens: 22547 };
+  f.output.lastCallUsage = { input: 3, output: 146, cacheRead: 21911, cacheWrite: 487 };
+  const result = await f.harness.runAttempt(f.p);
+  assert.equal(result.terminal.kind, "ok");
+  assert.deepEqual(result.attemptUsage, {
+    input: 161149, output: 146, cacheRead: 0, cacheWrite: 0, total: 161295,
+    contextUsage: { state: "available", promptTokens: 22401, totalTokens: 22547 },
+  });
+  assert.equal(result.contextTokens, undefined, "contextTokens is SDK window capacity, not occupancy");
+  assert.deepEqual(result.currentAttemptCompletedAssistant.usage.contextUsage,
+    { state: "available", promptTokens: 22401, totalTokens: 22547 });
+  assert.deepEqual(result.currentAttemptCompletedAssistant.dshNative.lastCallUsage,
+    { input: 3, output: 146, cacheRead: 21911, cacheWrite: 487 });
 });
 
 test("registers and attaches one live handle before provider execution, then cleans it up", async (t) => {

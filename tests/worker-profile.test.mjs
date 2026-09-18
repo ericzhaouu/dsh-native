@@ -53,6 +53,8 @@ test("uses the installed standalone sdk-minimal profile and real CLI composition
       "session-projection",
       "agent-spine",
       "sessions",
+      "dsh-token-meter",
+      "dsh-compaction-basic",
       "openclaw-bridge",
     ],
   );
@@ -124,15 +126,23 @@ test("replaces complete configs and inserts only the explicit bridge module", ()
   assert.equal(JSON.stringify(spine).includes("__jsExpr"), false);
   assert.deepEqual(patch.filter((entry) => entry.insert), [{
     insert: [{
+      id: "dsh-token-meter",
+      name: "@deepseek-ai/dsh-token-meter",
+      config: {},
+    }, {
+      id: "dsh-compaction-basic",
+      name: pathToFileURL(join(projectDir, "dist", "bridge", "compaction.js")).href,
+      config: { auto: true },
+    }, {
       id: "openclaw-bridge",
       name: pathToFileURL(options.bridgePath).href,
-      config: { contextWindow: options.contextWindow },
+      config: {},
     }],
   }]);
   const specialPath = join(projectDir, "a space # percent % 中文", "dist", "bridge", "index.js");
   const bridge = compose(createBridgePatch({ ...options, bridgePath: specialPath })).get("openclaw-bridge");
   assert.equal(fileURLToPath(bridge.name), specialPath);
-  assert.deepEqual(bridge.config, { contextWindow: options.contextWindow });
+  assert.deepEqual(bridge.config, {});
 });
 
 test("configures the built-in deepseek-official adapter with only an environment key reference", () => {
@@ -145,11 +155,13 @@ test("configures the built-in deepseek-official adapter with only an environment
     reasoningEffort: options.reasoningEffort,
     maxTokens: options.maxTokens,
     defaultContextWindow: options.contextWindow,
+    models: [],
     streamIdleTimeoutMs: options.streamIdleTimeoutMs,
   });
   const resolved = DeepSeek.resolveAdapterOptions(DeepSeek.Config(row.config));
   assert.equal(resolved.apiKeyEnv, "OPENCLAW_DSH_MODEL_KEY");
   assert.equal(resolved.defaultContextWindow, options.contextWindow);
+  assert.deepEqual(resolved.models, [], "The host capacity must not be shadowed by DSH's known-model defaults");
   assert.equal(resolved.maxTokens, options.maxTokens);
   assert.equal(resolved.streamIdleTimeoutMs, options.streamIdleTimeoutMs);
   assert.deepEqual(resolved.defaults, { thinking: "enabled", reasoningEffort: "high" });

@@ -30,6 +30,27 @@ export interface BridgeRun {
   taskPreparation?: PreparationRequest;
 }
 
+export interface BridgeCompact {
+  provider?: ModelProvider;
+  sessionId: string;
+  runId: string;
+  completedTurns?: number;
+  workspaceDir: string;
+  modelId: string;
+  reasoningEffort?: string;
+  maxTokens?: number;
+}
+
+export interface BridgeCompactResult {
+  compacted: boolean;
+  sessionId: string;
+  summary?: string;
+  tokensBefore?: number;
+  tokensAfter?: number;
+  summaryUsage?: BridgeUsage;
+  details?: JsonObject;
+}
+
 export interface BridgeUsage {
   input: number;
   output: number;
@@ -37,10 +58,17 @@ export interface BridgeUsage {
   cacheWrite: number;
 }
 
+export type BridgeContextUsage =
+  | { state: "available"; promptTokens: number; totalTokens: number }
+  | { state: "unavailable" };
+
 export interface BridgeResult {
   text: string;
   reasoning?: string;
   usage: BridgeUsage;
+  summaryUsage?: BridgeUsage;
+  contextUsage?: BridgeContextUsage;
+  lastCallUsage?: BridgeUsage;
   stopReason: "stop" | "length" | "aborted";
   sessionId: string;
   toolCalls: number;

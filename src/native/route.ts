@@ -4,6 +4,13 @@ import type { DshConfig } from "../runtime-types.js";
 import { resolveCopilotRoute, supportsCopilot, type CopilotRoute } from "./copilot-route.js";
 
 type Attempt = Parameters<AgentHarnessV2["runAttempt"]>[0];
+export type NativeRouteInput = Pick<Attempt,
+  "provider" | "model" | "modelId" | "resolvedApiKey" | "thinkLevel" | "config" | "agentId" |
+  "preparedModelRuntime" | "runtimePlan" | "streamParams" | "fastMode" | "fastModeAuto" |
+  "clientTools" | "images" | "imageOrder" | "media" | "sandbox" | "execOverrides" |
+  "swarmOutputSchema" | "contextTokenBudget" | "authoredContextTokenCap"> & {
+    runtimeAuthPlan?: Parameters<NonNullable<AgentHarnessV2["compact"]>>[0]["runtimeAuthPlan"];
+  };
 type SupportContext = Parameters<AgentHarnessV2["supports"]>[0];
 type ReadTransport = typeof import("openclaw/plugin-sdk/agent-harness-runtime")["getModelProviderRequestTransport"];
 type NativeRoute = {
@@ -159,7 +166,7 @@ function validateCompat(value: unknown): void {
   }
 }
 
-function validateConfig(p: Attempt, cfg: Attempt["config"]): void {
+function validateConfig(p: NativeRouteInput, cfg: Attempt["config"]): void {
   if (!cfg) return;
   const provider = cfg.models?.providers?.[p.provider];
   if (provider) {
@@ -194,10 +201,9 @@ function validateConfig(p: Attempt, cfg: Attempt["config"]): void {
   }
 }
 
-function validateRuntimePlan(p: Attempt): void {
+function validateRuntimePlan(p: NativeRouteInput): void {
   const plan = p.runtimePlan;
-  if (!plan) return;
-  const preparedParams = plan.transport?.extraParams;
+  const preparedParams = plan?.transport?.extraParams;
   if (preparedParams !== undefined) {
     if (!isRecord(preparedParams)) fail("unsupported prepared generation parameters");
     for (const [key, value] of Object.entries(preparedParams)) {
@@ -205,9 +211,9 @@ function validateRuntimePlan(p: Attempt): void {
       fail("prepared generation parameters cannot be reproduced by the native bridge");
     }
   }
-  if (plan.resolvedRef?.transport !== undefined && plan.resolvedRef.transport !== "sse" &&
-      plan.resolvedRef.transport !== "auto") fail("non-SSE model transport is unsupported");
-  const auth = plan.auth;
+  if (plan?.resolvedRef?.transport !== undefined && plan.resolvedRef.transport !== "sse" &&
+       plan.resolvedRef.transport !== "auto") fail("non-SSE model transport is unsupported");
+  const auth = p.runtimeAuthPlan ?? plan?.auth;
   if (auth?.deferredRouteSupport || auth?.harnessAuthProvider ||
       (auth?.selectedAuthMode !== undefined && auth.selectedAuthMode !== "api_key" &&
         auth.selectedAuthMode !== "api-key")) {
@@ -234,7 +240,7 @@ function positiveInteger(value: unknown, label: string): number {
   return value;
 }
 
-export function resolveNativeRoute(p: Attempt, config: DshConfig, getModelProviderRequestTransport: ReadTransport): NativeRoute | CopilotRoute {
+export function resolveNativeRoute(p: NativeRouteInput, config: DshConfig, getModelProviderRequestTransport: ReadTransport): NativeRoute | CopilotRoute {
   if (p.provider === "github-copilot") return resolveCopilotRoute(p, config, getModelProviderRequestTransport);
   if (p.provider !== "deepseek" || p.model.provider !== "deepseek" ||
       p.model.api !== "openai-completions" || !concreteId(p.model.id)) {
@@ -247,14 +253,13 @@ export function resolveNativeRoute(p: Attempt, config: DshConfig, getModelProvid
   const url = parseBaseUrl(p.model.baseUrl);
   // Compare whole endpoints, not prefixes or host suffixes; a path grant is not an origin grant.
   const endpoint = (candidate: URL) => candidate.href.replace(/\/+$/u, "");
-  if (url.origin !== "https://api.deepseek.com" &&
-      !config.allowedBaseUrls.some((allowed) => {
-        try {
-          return endpoint(parseBaseUrl(allowed)) === endpoint(url);
-        } catch {
-          return false;
-        }
-      })) fail("baseUrl is not allowed; custom endpoints require an explicit allowedBaseUrls entry");
+  if (!config.allowedBaseUrls.some((allowed) => {
+    try {
+      return endpoint(parseBaseUrl(allowed)) === endpoint(url);
+    } catch {
+      return false;
+    }
+  })) fail("baseUrl is not allowed; endpoints require an exact allowedBaseUrls entry");
 
   rejectValues(p.model.headers, "model headers");
   if (p.model.authHeader === false) fail("model authentication overrides are unsupported");

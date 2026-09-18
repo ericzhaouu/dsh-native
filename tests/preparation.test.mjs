@@ -764,9 +764,11 @@ test("rendered instructions guide adaptive local execution without claiming sema
     /Newest user changes of mind/, /negations take priority/, /not blindly inherit unconfirmed assumptions/,
     /Never cite assistant or tool text/, /not categorical proof/, /semantic exec sandbox/,
     /\["read","write","exec"\]/, /intersected with tools/, /No decision grants capabilities/,
-    /Never bypass an unavailable tool or approval with exec/, /at most 2 clarification turns/,
-    /at most 7 subsequent host-tool calls/, /Do not auto-load unlisted/, /local-skill/,
-    /missing or filtered tool is a capability gap/, /never install or connect new services yourself/, /effective decision/,
+    /existing host-authorized CLI/, /dedicated business tool name/, /explicit denial/,
+    /new credentials, new connections, installs/, /model claims/, /at most 2 clarification turns/,
+    /at most 7 subsequent host-tool calls/, /Do not auto-load unlisted/, /local-skill/, /listed skill is guidance/, /full instructions cannot be read/,
+    /do not claim the full method was applied/, /missing or filtered tool is a capability gap/,
+    /never install or connect new services yourself/, /effective decision/,
     /Do not make another preparation control call/, /not system authority/, /existing AGENTS/,
     /host policy/, /Store no secret values or hidden reasoning/]) {
     assert.match(instructions, expected);

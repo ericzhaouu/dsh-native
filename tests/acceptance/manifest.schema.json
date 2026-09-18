@@ -1,0 +1,665 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://openclaw.local/dsh-native/acceptance-manifest.schema.json",
+  "title": "DSH native acceptance manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "suiteId",
+    "cases"
+  ],
+  "properties": {
+    "version": {
+      "const": 1
+    },
+    "suiteId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{2,80}$"
+    },
+    "stage": {
+      "$ref": "#/$defs/stage"
+    },
+    "description": {
+      "type": "string",
+      "maxLength": 1000
+    },
+    "limits": {
+      "$ref": "#/$defs/suiteLimits"
+    },
+    "cases": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 500,
+      "items": {
+        "$ref": "#/$defs/case"
+      }
+    }
+  },
+  "$defs": {
+    "stage": {
+      "enum": [
+        "offline",
+        "live",
+        "artifact"
+      ]
+    },
+    "identifier": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{1,120}$"
+    },
+    "positiveInteger": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "nonNegativeInteger": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "suiteLimits": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "concurrency": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2
+        },
+        "perAgentConcurrency": {
+          "const": 1
+        },
+        "userTurns": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "modelRequests": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "inputTokens": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "cacheReadTokens": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "cacheWriteTokens": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "outputTokens": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "toolCalls": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "priced": {
+          "type": "boolean"
+        },
+        "currencyMicros": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        }
+      },
+      "required": [
+        "modelRequests",
+        "inputTokens",
+        "cacheReadTokens",
+        "cacheWriteTokens",
+        "outputTokens",
+        "toolCalls",
+        "userTurns",
+        "priced"
+      ],
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "priced": {
+                "const": true
+              }
+            },
+            "required": [
+              "priced"
+            ]
+          },
+          "then": {
+            "properties": {
+              "currencyMicros": {
+                "$ref": "#/$defs/nonNegativeInteger"
+              }
+            },
+            "required": [
+              "currencyMicros"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "priced": {
+                "const": false
+              }
+            },
+            "required": [
+              "priced"
+            ]
+          },
+          "then": {
+            "properties": {
+              "currencyMicros": {
+                "$ref": "#/$defs/nonNegativeInteger"
+              }
+            },
+            "not": {
+              "required": [
+                "currencyMicros"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "case": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "agentProfile",
+        "category",
+        "kind",
+        "prompt",
+        "expected",
+        "limits"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "stage": {
+          "$ref": "#/$defs/stage"
+        },
+        "agentProfile": {
+          "$ref": "#/$defs/identifier"
+        },
+        "category": {
+          "enum": [
+            "execution",
+            "business",
+            "safety",
+            "skill",
+            "delivery",
+            "performance"
+          ]
+        },
+        "kind": {
+          "enum": [
+            "prompt",
+            "multiTurn",
+            "artifactProbe",
+            "externalReview"
+          ]
+        },
+        "mandatory": {
+          "type": "boolean"
+        },
+        "critical": {
+          "type": "boolean"
+        },
+        "prompt": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 8000
+        },
+        "mode": {
+          "enum": [
+            "chat",
+            "clarify",
+            "draft",
+            "execute"
+          ]
+        },
+        "turns": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 8,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 8000
+          }
+        },
+        "prerequisites": {
+          "type": "array",
+          "maxItems": 20,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          }
+        },
+        "fixtures": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "names": {
+              "type": "array",
+              "maxItems": 20,
+              "items": {
+                "$ref": "#/$defs/identifier"
+              }
+            },
+            "evidence": {
+              "$ref": "#/$defs/evidence"
+            }
+          }
+        },
+        "expected": {
+          "$ref": "#/$defs/expected"
+        },
+        "assertions": {
+          "$ref": "#/$defs/assertions"
+        },
+        "limits": {
+          "$ref": "#/$defs/caseLimits"
+        },
+        "cleanup": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "required": {
+              "type": "boolean"
+            },
+            "receipt": {
+              "type": "string",
+              "maxLength": 200
+            }
+          }
+        }
+      }
+    },
+    "expected": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "executionStatus"
+      ],
+      "properties": {
+        "executionStatus": {
+          "enum": [
+            "completed",
+            "correctly_blocked",
+            "failed",
+            "infrastructure_blocked"
+          ]
+        },
+        "businessResult": {
+          "enum": [
+            "passed",
+            "partial",
+            "failed",
+            "not_applicable"
+          ]
+        },
+        "authorityAndSafety": {
+          "enum": [
+            "passed",
+            "failed"
+          ]
+        },
+        "skillBehavior": {
+          "$ref": "#/$defs/skillBehavior"
+        },
+        "delivery": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "delivered": {
+              "type": "boolean"
+            },
+            "terminalOutputs": {
+              "$ref": "#/$defs/nonNegativeInteger"
+            }
+          }
+        },
+        "outputText": {
+          "type": "string",
+          "maxLength": 4000
+        }
+      }
+    },
+    "assertions": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "output": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "contains": {
+              "type": "array",
+              "maxItems": 20,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 500
+              }
+            },
+            "notContains": {
+              "type": "array",
+              "maxItems": 20,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 500
+              }
+            }
+          }
+        },
+        "sideEffects": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "allowed": {
+              "type": "array",
+              "maxItems": 20,
+              "items": {
+                "$ref": "#/$defs/sideEffect"
+              }
+            },
+            "denied": {
+              "type": "array",
+              "maxItems": 20,
+              "items": {
+                "$ref": "#/$defs/sideEffect"
+              }
+            }
+          }
+        },
+        "policyFacts": {
+          "type": "array",
+          "maxItems": 50,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "name",
+              "value"
+            ],
+            "properties": {
+              "name": {
+                "$ref": "#/$defs/identifier"
+              },
+              "value": {
+                "type": [
+                  "string",
+                  "number",
+                  "integer",
+                  "boolean",
+                  "null"
+                ]
+              }
+            }
+          }
+        },
+        "groundedUrls": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "approvedHosts"
+          ],
+          "properties": {
+            "approvedHosts": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 20,
+              "items": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9.-]+$"
+              }
+            },
+            "canonicalUrls": {
+              "type": "array",
+              "maxItems": 50,
+              "items": {
+                "type": "string",
+                "format": "uri"
+              }
+            },
+            "minCount": {
+              "$ref": "#/$defs/nonNegativeInteger"
+            },
+            "approvedPorts": {
+              "type": "array",
+              "maxItems": 20,
+              "items": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 65535
+              }
+            }
+          }
+        }
+      }
+    },
+    "caseLimits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "timeoutMs",
+        "usage"
+      ],
+      "properties": {
+        "timeoutMs": {
+          "type": "integer",
+          "minimum": 100,
+          "maximum": 3600000
+        },
+        "usage": {
+          "$ref": "#/$defs/suiteLimits"
+        }
+      }
+    },
+    "skillBehavior": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "advertised": {
+          "type": "boolean"
+        },
+        "selected": {
+          "type": "boolean"
+        },
+        "loaded": {
+          "type": "boolean"
+        },
+        "adhered": {
+          "type": "boolean"
+        },
+        "outputPassed": {
+          "type": "boolean"
+        }
+      }
+    },
+    "sideEffect": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind"
+      ],
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/identifier"
+        },
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "action": {
+          "$ref": "#/$defs/identifier"
+        },
+        "count": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "executionStatus",
+        "businessResult"
+      ],
+      "properties": {
+        "executionStatus": {
+          "enum": [
+            "completed",
+            "correctly_blocked",
+            "failed",
+            "infrastructure_blocked"
+          ]
+        },
+        "businessResult": {
+          "enum": [
+            "passed",
+            "partial",
+            "failed",
+            "not_applicable"
+          ]
+        },
+        "outputText": {
+          "type": "string",
+          "maxLength": 20000
+        },
+        "policyFacts": {
+          "type": "object",
+          "additionalProperties": {
+            "type": [
+              "string",
+              "number",
+              "integer",
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "prerequisites": {
+          "type": "object",
+          "additionalProperties": {
+            "enum": [
+              true,
+              false,
+              "met",
+              "missing",
+              "blocked"
+            ]
+          }
+        },
+        "sideEffects": {
+          "type": "array",
+          "maxItems": 100,
+          "items": {
+            "$ref": "#/$defs/sideEffect"
+          }
+        },
+        "skill": {
+          "$ref": "#/$defs/skillBehavior"
+        },
+        "delivery": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "delivered": {
+              "type": "boolean"
+            },
+            "terminalOutputs": {
+              "$ref": "#/$defs/nonNegativeInteger"
+            },
+            "recipient": {
+              "type": "string",
+              "maxLength": 200
+            }
+          }
+        },
+        "usage": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "modelRequests",
+            "inputTokens",
+            "cacheReadTokens",
+            "cacheWriteTokens",
+            "outputTokens",
+            "toolCalls",
+            "userTurns",
+            "priced"
+          ],
+          "properties": {
+            "modelRequests": {
+              "$ref": "#/$defs/nonNegativeInteger"
+            },
+            "inputTokens": {
+              "$ref": "#/$defs/nonNegativeInteger"
+            },
+            "cacheReadTokens": {
+              "$ref": "#/$defs/nonNegativeInteger"
+            },
+            "cacheWriteTokens": {
+              "$ref": "#/$defs/nonNegativeInteger"
+            },
+            "outputTokens": {
+              "$ref": "#/$defs/nonNegativeInteger"
+            },
+            "toolCalls": {
+              "$ref": "#/$defs/nonNegativeInteger"
+            },
+            "userTurns": {
+              "$ref": "#/$defs/nonNegativeInteger"
+            },
+            "priced": {
+              "type": "boolean"
+            },
+            "currencyMicros": {
+              "$ref": "#/$defs/nonNegativeInteger"
+            }
+          }
+        },
+        "latencyMs": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "urls": {
+          "type": "array",
+          "maxItems": 50,
+          "items": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "uri"
+              },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "source",
+                  "claimedUrl"
+                ],
+                "properties": {
+                  "source": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200
+                  },
+                  "claimedUrl": {
+                    "type": "string",
+                    "format": "uri"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "trustedAdapterEvidence": {
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}
