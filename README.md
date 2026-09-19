@@ -1,6 +1,6 @@
 # DSH Native for OpenClaw
 
-**实验性版本 0.6.3**：把官方 DeepSeek Harness（DSH）的模型／工具循环接入 OpenClaw 的原生 `AgentHarnessV2`，并保留 OpenClaw 对模型、认证、工具授权与会话入口的控制。
+**实验性版本 0.7.0**：把官方 DeepSeek Harness（DSH）的模型／工具循环接入 OpenClaw 的原生 `AgentHarnessV2`，并保留 OpenClaw 对模型、认证、工具授权与会话入口的控制。
 
 - 源码仓库：[ericzhaouu/dsh-native](https://github.com/ericzhaouu/dsh-native)
 - 作者：[ericzhaouu](https://github.com/ericzhaouu)
@@ -16,6 +16,7 @@
 
 ## 目录
 
+- [0.7.0 当前会话私有回复](#070-当前会话私有回复)
 - [0.6.1 Copilot 压缩认证交接补丁](#061-copilot-压缩认证交接补丁)
 - [0.6.0 原生压缩与独立维护](#060-原生压缩与独立维护)
 - [0.5.2 Agent 级 SKILL 可见性覆盖](#052-agent-级-skill-可见性覆盖)
@@ -39,6 +40,18 @@
 - [仓库结构](#仓库结构)
 - [排错](#排错)
 - [致谢与许可证](#致谢与许可证)
+
+## 0.7.0 当前会话私有回复
+
+当宿主要求 `message_tool_only` 投递时，DSH 使用宿主构造并授权的私有 `message` 工具，把**已持久化、经改写／脱敏的最终文本**发送到当前来源会话。模型仍只生成文本：`message` 不出现在模型工具清单，也不能由模型指定收件人、账号、频道或转发目标。
+
+发送沿用宿主策略、审批、当前来源能力和 transport，参数仅为 `{action:"send", message:最终文本, final:true}`；不会独立调用飞书 API 或持有另一套渠道凭据。`toolAllowlist: []` 和准备阶段的零业务工具模式不禁止这项私有回复，但显式宿主工具禁用、执行 deny、失效能力仍会阻止发送，不能为可用性移除限制。
+
+仅 SDK 确认的当前来源回执算送达；缺失回执或失败不能宣布成功，也不自动重跑模型／重复发送。发送后取消或 hook 失败保留已确认的送达事实。静默正文和 memory 维护不发送；message-only 轮次不推送未经提交的 partial／reasoning 文本。
+
+这不是主动消息、跨群投递、多媒体或所有渠道的兼容承诺。Linux 隔离 Gateway 的合成通道测试不等于真实飞书验收；1.0 仍需真实渠道、完整行为语料、稳定性及同制品回退门禁。已部署旧版需在维护窗口显式升级；本次不增加或修改宿主补丁。
+
+飞书适配器 `@openclaw/feishu@2026.8.2` 可在对应 account 下设置 `renderMode:"raw"` 与 `streaming:{mode:"off",block:{enabled:false}}`，使用非卡片文本路径。该设置影响该 account 的展示方式，不扩大群／发送人权限，也不代表查明了旧 CardKit HTTP 400 的根因。
 
 ## 0.6.1 Copilot 压缩认证交接补丁
 
@@ -146,7 +159,7 @@ SKILL 是方法说明，不是可执行工具。`skillAllowlist` 控制共享可
 
 MCP 连接和认证应由 OpenClaw 管理。本版只接纳宿主能安全提供的兼容工具实例；不会自行读取 MCP 配置并建立新连接，也不会把缓存的 advertised catalog 当成当前请求者已连接的证明。需要单独物化请求者连接、特殊审批续接或其他未支持上下文的工具，应明确报告不兼容，而不是宣称所有 MCP／插件都已完整接通。
 
-浏览器／媒体结果、消息投递、cron、委派、权限变更和 Tool Search／Code Mode 的二次派发控制器不属于通用文本工具的自动兼容承诺。它们需要各自的宿主契约；不能用一个控制器名字绕过对底层工具的收窄。
+浏览器／媒体结果、主动消息投递、cron、委派、权限变更和 Tool Search／Code Mode 的二次派发控制器不属于通用文本工具的自动兼容承诺。0.7.0 的当前会话私有最终回复是独立、受限的宿主契约；不能用一个控制器名字绕过对底层工具的收窄。
 
 ## 自适应任务准备
 
@@ -516,7 +529,7 @@ sessions_list  sessions_history  sessions_send  session_status
 
 不支持／不授予：
 
-- browser／多媒体、消息投递、cron、subagent／delegation、需要额外 authority 的插件工具 grants；
+- browser／多媒体、主动或跨目标消息投递、cron、subagent／delegation、需要额外 authority 的插件工具 grants；
 - 尚未由宿主安全物化的 requester MCP 工具，以及需要不受支持会话／审批上下文的工具；
 - skill-library authoring／Skill Workshop；读取宿主提供的 skill 指令不等于获得额外工具；
 - 自定义 context engine／外部 compaction、会话迁移／fork；受控 DSH 原生压缩见 0.6.0 说明；

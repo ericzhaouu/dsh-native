@@ -1,6 +1,6 @@
 {
   "name": "openclaw-dsh-native",
-  "version": "0.6.3",
+  "version": "0.7.0",
   "description": "Opt-in native DeepSeek Harness runtime for OpenClaw",
   "type": "module",
   "license": "MIT",

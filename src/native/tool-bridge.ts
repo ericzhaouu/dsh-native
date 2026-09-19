@@ -102,7 +102,7 @@ export function renderHostToolNotices(notices: readonly HostToolNotice[]): strin
   ].join("\n");
 }
 
-function schemaFor(tool: AnyAgentTool): JsonObject {
+export function schemaFor(tool: AnyAgentTool): JsonObject {
   // TypeBox symbols are harmless, but silently dropping functions or cyclic/non-JSON values is not.
   const json = JSON.stringify(tool.parameters, (_key, value: unknown) => {
     if (typeof value === "function" || typeof value === "symbol" || typeof value === "bigint" ||

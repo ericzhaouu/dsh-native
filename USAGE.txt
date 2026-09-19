@@ -1,4 +1,4 @@
-DSH NATIVE FOR OPENCLAW -- EXPERIMENTAL 0.6.3
+DSH NATIVE FOR OPENCLAW -- EXPERIMENTAL 0.7.0
 
 Source: https://github.com/ericzhaouu/dsh-native
 Author: https://github.com/ericzhaouu
@@ -7,6 +7,28 @@ Plugin / harness ID: dsh-native
 Example Agent: dsh-experiment
 License: MIT; Copyright (c) 2026 ericzhaouu.
 The Chinese README.md contains the complete guide.
+
+PRIVATE CURRENT-SOURCE REPLIES (0.7.0)
+
+For host-required message_tool_only delivery, a private host-bound core message
+tool sends the committed, rewritten/redacted final text once. The model cannot
+see/call message or supply a recipient, account or route. The synthesized call
+uses only {action:"send", message:finalText, final:true}. Host credentials,
+current-source capability, policy, approvals and channel transport remain owners.
+
+Zero business tools (including preparation chat/draft) do not block this private
+delivery. Explicit host disables/denies still apply. Only SDK-confirmed current-
+source receipts count as delivered. Failures never trigger model replay or an
+automatic duplicate; late cancellation/hook failure retains a confirmed receipt.
+Silent replies and memory maintenance do not send. Raw partial/reasoning output
+is suppressed in message-only mode.
+
+This is not proactive/cross-target messaging or media support. Synthetic-channel
+Gateway tests are not live Feishu evidence or 1.0 certification. Upgrade explicitly
+in a maintenance window; no additional host patch is required for this feature.
+Feishu 2026.8.2 supports account renderMode:"raw" and
+streaming:{mode:"off",block:{enabled:false}} for a non-card text path.
+This presentation change does not widen permissions or diagnose CardKit HTTP 400.
 
 PER-AGENT SKILL VISIBILITY OVERRIDE (0.5.2)
 

@@ -1,9 +1,32 @@
 import assert from "node:assert/strict";
 import { resolve } from "node:path";
 import test from "node:test";
-import { createNativeHarness } from "../dist/native/harness.js";
-import { createNativeToolHost } from "../dist/native/host.js";
+import { registerHooks } from "node:module";
+import { readFileSync } from "node:fs";
+import ts from "typescript";
 import { parseTaskPreparationConfig, resolvePreparationDecision } from "../dist/preparation.js";
+
+const sourceModules = new Map([
+  "native/harness", "native/host", "native/source-reply", "native/tool-bridge", "preparation",
+].map((name) => [
+  new URL(`../dist/${name}.js`, import.meta.url).href,
+  new URL(`../src/${name}.ts`, import.meta.url),
+]));
+const sourceHooks = registerHooks({
+  resolve(specifier, context, next) {
+    const url = context.parentURL && new URL(specifier, context.parentURL).href;
+    return sourceModules.has(url) ? { url, shortCircuit: true } : next(specifier, context);
+  },
+  load(url, context, next) {
+    return sourceModules.has(url) ? { format: "module", shortCircuit: true,
+      source: ts.transpileModule(readFileSync(sourceModules.get(url), "utf8"),
+        { compilerOptions: { target: ts.ScriptTarget.ES2023, module: ts.ModuleKind.ESNext } }).outputText } : next(url, context);
+  },
+});
+const { createNativeHarness } = await import("../dist/native/harness.js");
+const { createNativeToolHost } = await import("../dist/native/host.js");
+const { SourceReplyDeliveryError } = await import("../dist/native/source-reply.js");
+sourceHooks.deregister();
 
 /** @typedef {import("openclaw/plugin-sdk/agent-harness").AgentHarnessV2} AgentHarnessV2 */
 /** @typedef {Parameters<AgentHarnessV2["runAttempt"]>[0]} Attempt */
@@ -574,6 +597,122 @@ test("silent, hidden and commentary messages never publish a visible final", asy
       assert.equal(f.p.onReasoningStream.mock.callCount(), 0);
     });
   }
+});
+
+function sourceDelivery(text) {
+  return {
+    didSendViaMessagingTool: true,
+    didDeliverSourceReplyViaMessageTool: true,
+    sourceReplyDelivered: true,
+    messagingToolSentTexts: [text],
+    messagingToolSentMediaUrls: [],
+    messagingToolSentTargets: [{ tool: "message", provider: "feishu", text, sourceReplyFinal: true }],
+  };
+}
+
+test("message-tool-only delivers exactly one committed current-source reply without streaming provisional text", async (t) => {
+  const f = fixture(t, { sourceReplyDeliveryMode: "message_tool_only" });
+  const sent = [];
+  f.host.deliverSourceReply = f.spy("sourceReply", async (text) => {
+    sent.push(text);
+    return sourceDelivery(text);
+  });
+  f.run = async (input) => {
+    await input.onEvent({ type: "text", text: "Raw partial" });
+    await input.onEvent({ type: "reasoning", text: "Raw reasoning" });
+    return f.output;
+  };
+  const persist = f.transcript.persistAssistant;
+  f.transcript.persistAssistant = async (message) => persist({
+    ...message, content: [{ type: "text", text: "Host-approved Feishu final" }],
+  });
+  const result = await f.harness.runAttempt(f.p);
+  assert.equal(result.terminal.kind, "ok");
+  assert.deepEqual(sent, ["Host-approved Feishu final"]);
+  assert.equal(f.host.deliverSourceReply.mock.callCount(), 1);
+  assert.equal(f.p.onPartialReply.mock.callCount(), 0);
+  assert.equal(f.p.onReasoningStream.mock.callCount(), 0);
+  assert.equal(result.didSendViaMessagingTool, true);
+  assert.equal(result.didDeliverSourceReplyViaMessageTool, true);
+  assert.equal(result.sourceReplyDelivered, true);
+  assert.deepEqual(result.messagingToolSentTexts, ["Host-approved Feishu final"]);
+  before(f, "persistAssistant", "sourceReply");
+});
+
+test("message-tool-only fails before provider when no private current-source route exists", async (t) => {
+  const f = fixture(t, { sourceReplyDeliveryMode: "message_tool_only" });
+  const result = await f.harness.runAttempt(f.p);
+  assert.equal(result.terminal.kind, "failed");
+  assert.equal(result.terminal.source, "precheck");
+  assert.match(result.terminal.error.message, /private current-source message route|message-tool-only source reply/);
+  assert.equal(f.runtime.run.mock.callCount(), 0);
+});
+
+test("message-tool-only missing receipt fails closed without automatic final publication", async (t) => {
+  const f = fixture(t, { sourceReplyDeliveryMode: "message_tool_only" });
+  f.host.deliverSourceReply = f.spy("sourceReply", async () => {
+    throw new Error("no verified receipt");
+  });
+  const result = await f.harness.runAttempt(f.p);
+  assert.equal(result.terminal.kind, "failed");
+  assert.match(result.terminal.error.message, /verified receipt/);
+  assert.equal(result.didSendViaMessagingTool, false);
+  assert.equal(f.sdk.emitAgentEvent.mock.callCount(), 0);
+  noCompletedAssistant(result);
+});
+
+test("message-tool-only preserves a real receipt when later delivery accounting fails", async (t) => {
+  const f = fixture(t, { sourceReplyDeliveryMode: "message_tool_only" });
+  const delivery = sourceDelivery("Native answer");
+  f.host.deliverSourceReply = f.spy("sourceReply", async () => {
+    throw new SourceReplyDeliveryError(new Error("after hook failed"), delivery);
+  });
+  const result = await f.harness.runAttempt(f.p);
+  assert.equal(result.terminal.kind, "failed");
+  assert.equal(result.didSendViaMessagingTool, true);
+  assert.equal(result.didDeliverSourceReplyViaMessageTool, true);
+  assert.equal(result.sourceReplyDelivered, true);
+  assert.deepEqual(result.messagingToolSentTargets, delivery.messagingToolSentTargets);
+  assert.equal(f.host.deliverSourceReply.mock.callCount(), 1);
+  assert.equal(f.sdk.emitAgentEvent.mock.callCount(), 0);
+});
+
+test("silent channel memory maintenance does not require or invoke a private reply sender", async (t) => {
+  const f = fixture(t, {
+    trigger: "memory", sourceReplyDeliveryMode: "message_tool_only", forceMessageTool: true,
+    memoryFlushWritePath: "memory/fixture.md", transcriptPrompt: "", silentExpected: true,
+  });
+  assert.equal(f.host.deliverSourceReply, undefined);
+  const result = await f.harness.runAttempt(f.p);
+  assert.equal(result.terminal.kind, "ok", result.terminal.error?.message);
+  assert.equal(result.didSendViaMessagingTool, false);
+  assert.equal(f.sdk.emitAgentEvent.mock.callCount(), 0);
+});
+
+test("host-declared silent payload is not sent as a literal channel reply", async (t) => {
+  const f = fixture(t, {
+    sourceReplyDeliveryMode: "message_tool_only",
+    runtimePlan: { resolvedRef: { harnessId: "dsh-native" }, delivery: { isSilentPayload: ({ text }) => text === "NO_REPLY" } },
+  });
+  f.output.text = "NO_REPLY";
+  f.host.deliverSourceReply = f.spy("sourceReply", async () => assert.fail("Silent payload cannot be sent"));
+  const result = await f.harness.runAttempt(f.p);
+  assert.equal(result.terminal.kind, "ok", result.terminal.error?.message);
+  assert.equal(f.host.deliverSourceReply.mock.callCount(), 0);
+  assert.equal(result.didSendViaMessagingTool, false);
+  assert.equal(f.sdk.emitAgentEvent.mock.callCount(), 0);
+});
+
+test("token-only silence remains silent without a prepared runtime plan", async (t) => {
+  const f = fixture(t, { sourceReplyDeliveryMode: "message_tool_only" });
+  f.output.text = "NO_REPLY";
+  f.host.deliverSourceReply = f.spy("sourceReply", async () => assert.fail("Silent token cannot be sent"));
+  assert.equal(f.p.runtimePlan, undefined);
+  const result = await f.harness.runAttempt(f.p);
+  assert.equal(result.terminal.kind, "ok", result.terminal.error?.message);
+  assert.equal(f.host.deliverSourceReply.mock.callCount(), 0);
+  assert.equal(result.didSendViaMessagingTool, false);
+  assert.equal(f.sdk.emitAgentEvent.mock.callCount(), 0);
 });
 
 test("final event callback failure or cancellation cannot publish a completed reply", async (t) => {

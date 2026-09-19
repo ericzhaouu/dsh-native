@@ -7,8 +7,12 @@ import { renderPreparationInstructions, type PreparationPolicy } from "../prepar
 import { filterPreparationSkills, type PreparationGate } from "./preparation.js";
 import {
   LEGACY_CODING_TOOLS, buildHostToolNotices, renderHostToolNotices, resolveHostToolAllowlist, selectHostTools,
-  type HostToolNotice, type HostToolSourceSnapshot,
+  schemaFor, snapshotHostToolSource, type HostToolEntry, type HostToolNotice, type HostToolSourceSnapshot,
 } from "./tool-bridge.js";
+import {
+  assertPrivateSourceReplyArgs, buildSourceReplyDeliveryEvidence, createPrivateSourceReplyArgs,
+  type NativeSourceReplyDelivery, SourceReplyDeliveryError,
+} from "./source-reply.js";
 
 type Attempt = Parameters<AgentHarnessV2["runAttempt"]>[0];
 type Runtime = typeof import("openclaw/plugin-sdk/agent-harness-runtime");
@@ -20,6 +24,7 @@ export interface NativeHost {
   tools: BridgeTool[];
   toolNotices?: readonly HostToolNotice[];
   executeTool(call: BridgeToolCall, signal: AbortSignal): Promise<BridgeToolResult>;
+  deliverSourceReply?: (text: string, signal: AbortSignal) => Promise<NativeSourceReplyDelivery>;
   getReplayState(): { hadPotentialSideEffects: boolean; replaySafe: boolean };
   getToolCounts(): { startedCount: number; completedCount: number; activeCount: number };
   dispose(): Promise<void>;
@@ -59,7 +64,7 @@ export function assertNativeHostSupported(p: Attempt): void {
   }
   if (p.toolOverrides && Object.keys(p.toolOverrides).length) unsupported("session tool/MCP overrides");
   if (p.runtimePluginToolGrant || p.toolBindings && Object.keys(p.toolBindings).length) unsupported("plugin tool grants/bindings");
-  if (p.forceMessageTool || p.sourceReplyDeliveryMode === "message_tool_only") unsupported("message-tool-only delivery");
+  if (p.forceMessageTool && p.sourceReplyDeliveryMode !== "message_tool_only") unsupported("message-tool-only delivery");
   if (p.forceHeartbeatTool || p.enableHeartbeatTool) unsupported("structured heartbeat tools");
   if (p.taskSuggestionDeliveryMode !== undefined && p.taskSuggestionDeliveryMode !== "gateway") {
     unsupported("task suggestion delivery");
@@ -143,7 +148,8 @@ type ToolHostRuntime = Pick<Runtime,
   "isAgentToolReplaySafe" | "getPluginToolMeta" | "getChannelAgentToolMeta" |
   "isToolWrappedWithBeforeToolCallHook" | "consumeAdjustedParamsForToolCall" |
   "consumePreExecutionBlockedToolCall" | "runAgentHarnessAfterToolCallHook" |
-  "isToolResultError" | "formatToolExecutionErrorMessage" | "getBeforeToolCallFailureDisposition"> &
+  "isToolResultError" | "formatToolExecutionErrorMessage" | "getBeforeToolCallFailureDisposition" |
+  "extractMessagingToolSend" | "extractMessagingToolSendResult" | "isDeliveredMessageToolOnlySourceReplyResult"> &
   Partial<Pick<Runtime, "isHostScopedAgentToolActive">>;
 
 export interface NativeToolHostOptions {
@@ -167,6 +173,8 @@ export interface NativeToolHostOptions {
   onAgentToolResult?: Attempt["onAgentToolResult"];
   cleanups?: Array<(reason: string) => Promise<void>>;
   preparationGate?: PreparationGate;
+  privateSourceReplyTool?: AnyAgentTool;
+  privateSourceReplyAttempt?: Attempt;
 }
 
 /** Installs the final dispatch gate before the host adds its before-tool policy wrapper. */
@@ -176,7 +184,12 @@ export function createNativeToolHost(options: NativeToolHostOptions): Omit<Nativ
   const lifetime = AbortSignal.any([options.signal, controller.signal]);
   const pending = new Set<Promise<BridgeToolResult>>();
   const seen = new Set<string>();
-  const invocations = new Map<string, { name: string; started: boolean; args?: Record<string, unknown> }>();
+  const invocations = new Map<string, {
+    name: string;
+    started: boolean;
+    args?: Record<string, unknown>;
+    privateSourceReplyText?: string;
+  }>();
   const definitions: BridgeTool[] = [];
   const validators = new Map<string, ValidateFunction>();
   const replaySafeTools = new Map<string, boolean>();
@@ -204,6 +217,11 @@ export function createNativeToolHost(options: NativeToolHostOptions): Omit<Nativ
       throw new Error("DSH host exec supports local gateway placement only");
     }
   };
+  const installEntry = (entry: HostToolEntry) => {
+    validators.set(entry.source.name, entry.validator);
+    replaySafeTools.set(entry.source.name, entry.replaySafe);
+    sources.set(entry.source.name, entry.source);
+  };
 
   const selection = selectHostTools({
     tools: options.tools, runtime: sdk, toolAllowlist: options.toolAllowlist,
@@ -211,12 +229,30 @@ export function createNativeToolHost(options: NativeToolHostOptions): Omit<Nativ
   });
   const sources = new Map<string, HostToolSourceSnapshot>();
   for (const entry of selection.entries) {
-    validators.set(entry.source.name, entry.validator);
+    installEntry(entry);
     definitions.push(entry.definition);
-    replaySafeTools.set(entry.source.name, entry.replaySafe);
-    sources.set(entry.source.name, entry.source);
   }
-  for (const { tool, source } of selection.entries) {
+  let privateSourceReplyEntry: HostToolEntry | undefined;
+  if (options.privateSourceReplyTool) {
+    if (!options.privateSourceReplyAttempt || options.privateSourceReplyTool.name !== "message") {
+      throw new Error("Invalid private source-reply message tool");
+    }
+    const source = snapshotHostToolSource(options.privateSourceReplyTool, sdk);
+    if (source.name !== "message" || source.kind !== "core") throw new Error("Private source reply requires the host's core message tool");
+    const parameters = schemaFor(options.privateSourceReplyTool);
+    const entry: HostToolEntry = {
+      tool: options.privateSourceReplyTool,
+      source,
+      validator: ajv.compile(parameters),
+      replaySafe: sdk.isAgentToolReplaySafe(options.privateSourceReplyTool),
+      definition: { name: source.name, description: options.privateSourceReplyTool.description, parameters },
+    };
+    if (typeof options.privateSourceReplyTool.execute !== "function") throw new Error("Invalid private source-reply message tool");
+    privateSourceReplyEntry = entry;
+    installEntry(entry);
+  }
+  const executableEntries = privateSourceReplyEntry ? [...selection.entries, privateSourceReplyEntry] : selection.entries;
+  for (const { tool, source } of executableEntries) {
     const name = source.name;
     const execute = tool.execute;
     // Mutate this attempt-local instance, rather than cloning away SDK ownership metadata.
@@ -228,7 +264,10 @@ export function createNativeToolHost(options: NativeToolHostOptions): Omit<Nativ
       source.assertUnchanged();
       if (executionAllow && !executionAllow.has(name)) throw new Error(`Execution denied for ${name}`);
       validate(name, args);
-      options.preparationGate?.start(name);
+      if (invocation.privateSourceReplyText !== undefined) {
+        assertPrivateSourceReplyArgs(args, invocation.privateSourceReplyText);
+      }
+      if (invocation.privateSourceReplyText === undefined) options.preparationGate?.start(name);
       invocation.args = args as Record<string, unknown>;
       invocation.started = true;
       startedCount++;
@@ -245,16 +284,19 @@ export function createNativeToolHost(options: NativeToolHostOptions): Omit<Nativ
       }
     };
   }
-  const bound = options.bindToolSurface(selection.entries.map(({ tool }) => tool), { cwd: options.cwd });
-  if (bound.length !== definitions.length || bound.some((tool, i) =>
-    tool.name !== definitions[i]?.name || !sdk.isToolWrappedWithBeforeToolCallHook(tool))) {
+  const bound = options.bindToolSurface(executableEntries.map(({ tool }) => tool), { cwd: options.cwd });
+  if (bound.length !== executableEntries.length || bound.some((tool, i) =>
+    tool.name !== executableEntries[i]?.source.name || !sdk.isToolWrappedWithBeforeToolCallHook(tool))) {
     throw new Error("Host binding did not preserve the policy-wrapped tool surface");
   }
-  for (const { source } of selection.entries) source.assertUnchanged();
+  for (const { source } of executableEntries) source.assertUnchanged();
   const byName = new Map(bound.map((tool) => [tool.name, tool]));
+  const advertised = new Set(selection.entries.map(({ source }) => source.name));
 
-  const executeOne = async (call: BridgeToolCall, signal: AbortSignal): Promise<BridgeToolResult> => {
-    const invocation = { name: call.name, started: false, args: undefined as Record<string, unknown> | undefined };
+  const executeOne = async (call: BridgeToolCall, signal: AbortSignal, privateSourceReplyText?: string):
+      Promise<{ bridge: BridgeToolResult; result?: ToolResult; isError: boolean; args: Record<string, unknown> }> => {
+    const invocation = { name: call.name, started: false, args: undefined as Record<string, unknown> | undefined,
+      privateSourceReplyText };
     const startedAt = Date.now();
     const tool = byName.get(call.name)!;
     const executionSignal = AbortSignal.any([lifetime, signal]);
@@ -263,11 +305,19 @@ export function createNativeToolHost(options: NativeToolHostOptions): Omit<Nativ
     let failure: unknown;
     let failed = false;
     let isError = false;
+    let sourceReplyDelivery: NativeSourceReplyDelivery | undefined;
     try {
       check(executionSignal);
+      if (privateSourceReplyText !== undefined) assertPrivateSourceReplyArgs(call.arguments, privateSourceReplyText);
       result = await tool.execute(call.callId, call.arguments, executionSignal);
-      check(executionSignal);
       isError = sdk.isToolResultError(result);
+      if (privateSourceReplyText !== undefined && options.privateSourceReplyAttempt) {
+        sourceReplyDelivery = buildSourceReplyDeliveryEvidence({
+          sdk, attempt: options.privateSourceReplyAttempt,
+          args: invocation.args ?? call.arguments, result, isError,
+        });
+      }
+      check(executionSignal);
     } catch (error) {
       failure = error;
       failed = true;
@@ -277,8 +327,14 @@ export function createNativeToolHost(options: NativeToolHostOptions): Omit<Nativ
       const adjusted = sdk.consumeAdjustedParamsForToolCall(call.callId, options.runId);
       const blocked = sdk.consumePreExecutionBlockedToolCall(call.callId, options.runId);
       const args = invocation.args ?? (record(adjusted) ? adjusted : call.arguments);
+      if (privateSourceReplyText !== undefined) assertPrivateSourceReplyArgs(args, privateSourceReplyText);
       if (invocation.started && (blocked || executionSignal.aborted)) uncertain = true;
       const error = failed ? sdk.formatToolExecutionErrorMessage(failure, "Host tool execution failed") : undefined;
+      if (privateSourceReplyText !== undefined && result && options.privateSourceReplyAttempt) {
+        sourceReplyDelivery ??= buildSourceReplyDeliveryEvidence({
+          sdk, attempt: options.privateSourceReplyAttempt, args, result, isError,
+        });
+      }
       options.observeToolTerminal?.({
         toolCallId: call.callId, toolName: call.name, arguments: args,
         executionStarted: invocation.started,
@@ -294,11 +350,17 @@ export function createNativeToolHost(options: NativeToolHostOptions): Omit<Nativ
       if (result) options.onAgentToolResult?.({ toolName: call.name, result, isError });
       check(executionSignal);
       if (failed && sdk.getBeforeToolCallFailureDisposition(failure)) throw failure;
-      return failed
-        ? { text: error ?? "Host tool execution failed", isError: true }
-        : projectNativeToolResult(result, isError);
+      return {
+        bridge: failed
+          ? { text: error ?? "Host tool execution failed", isError: true }
+          : projectNativeToolResult(result, isError),
+        result,
+        isError,
+        args,
+      };
     } catch (error) {
       if (invocation.started) uncertain = true;
+      if (sourceReplyDelivery) throw new SourceReplyDeliveryError(error, sourceReplyDelivery);
       throw error;
     } finally {
       invocations.delete(call.callId);
@@ -314,7 +376,7 @@ export function createNativeToolHost(options: NativeToolHostOptions): Omit<Nativ
         if (!call || typeof call.callId !== "string" || !call.callId.trim() || seen.has(call.callId)) {
           throw new Error("Invalid or duplicate host tool call id");
         }
-        if (!byName.has(call.name)) throw new Error(`Unknown or unavailable host tool: ${call.name}`);
+        if (!advertised.has(call.name)) throw new Error(`Unknown or unavailable host tool: ${call.name}`);
         sources.get(call.name)!.assertUnchanged();
         if (executionAllow && !executionAllow.has(call.name)) throw new Error(`Execution denied for ${call.name}`);
         options.preparationGate?.assertAllowed(call.name);
@@ -324,11 +386,39 @@ export function createNativeToolHost(options: NativeToolHostOptions): Omit<Nativ
       }
       seen.add(call.callId);
       // Reserve the id and pending slot before executing any host-supplied callback.
-      const work = Promise.resolve().then(() => executeOne(call, signal));
+      const work = Promise.resolve().then(() => executeOne(call, signal).then((outcome) => outcome.bridge));
       pending.add(work);
       void work.then(() => pending.delete(work), () => pending.delete(work));
       return work;
     },
+    deliverSourceReply: privateSourceReplyEntry ? (text, signal) => {
+      const args = createPrivateSourceReplyArgs(text);
+      const call: BridgeToolCall = { name: "message", callId: `dsh-source-reply:${options.runId}`, arguments: args };
+      try {
+        check(signal);
+        if (seen.has(call.callId)) throw new Error("Private source reply was already attempted");
+        sources.get("message")!.assertUnchanged();
+        validate("message", args);
+        assertPrivateSourceReplyArgs(args, text);
+      } catch (error) {
+        return Promise.reject(error);
+      }
+      seen.add(call.callId);
+      const work = Promise.resolve().then(async () => {
+        const outcome = await executeOne(call, signal, text);
+        const delivery = outcome.result && options.privateSourceReplyAttempt
+          ? buildSourceReplyDeliveryEvidence({
+            sdk, attempt: options.privateSourceReplyAttempt, args: outcome.args, result: outcome.result, isError: outcome.isError,
+          })
+          : undefined;
+        if (!delivery) throw new Error("Private source reply did not return a verified current-source delivery receipt");
+        return delivery;
+      });
+      const pendingWork = work.then((delivery) => ({ text: delivery.messagingToolSentTexts.join("\n"), isError: false }));
+      pending.add(pendingWork);
+      void pendingWork.then(() => pending.delete(pendingWork), () => pending.delete(pendingWork));
+      return work;
+    } : undefined,
     getReplayState: () => ({
       hadPotentialSideEffects,
       replaySafe: !hadPotentialSideEffects && !uncertain && pending.size === 0,
@@ -377,17 +467,30 @@ export async function prepareNativeHost(p: Parameters<AgentHarnessV2["runAttempt
   const cleanups: Array<(reason: string) => Promise<void>> = [];
   const requested = resolveHostToolAllowlist(toolAllowlist, preparation?.policy.executionTools);
   const genericTools = requested !== undefined;
+  const requiresPrivateSourceReply = p.sourceReplyDeliveryMode === "message_tool_only" &&
+    !p.silentExpected && p.trigger !== "memory";
   const toolSources = new Map<AnyAgentTool, HostToolSourceSnapshot>();
   let toolNotices: HostToolNotice[] = [];
   const restrict = (tools: AnyAgentTool[], allow: string[] | undefined) =>
     sdk.applyEmbeddedAttemptToolsAllow(tools, allow, { toolMeta: sdk.getPluginToolMeta });
+  const applyRunToolCeilings = (toolList: AnyAgentTool[]) => {
+    let filtered = restrict(toolList, p.toolsAllow);
+    if (p.pluginHarnessToolPolicySafeDeniedTools?.length) {
+      const denied = new Set(restrict(filtered, [...p.pluginHarnessToolPolicySafeDeniedTools]));
+      filtered = filtered.filter((tool) => !denied.has(tool));
+    }
+    if (p.forceRestartSafeTools) filtered = filtered.filter((tool) => sdk.isAgentToolReplaySafe(tool));
+    return filtered;
+  };
   let host: ReturnType<typeof createNativeToolHost> | undefined;
   try {
     const plan = sdk.resolveEmbeddedAttemptToolConstructionPlan({
       disableTools: p.disableTools, toolsEnabled: sdk.supportsModelTools(p.model),
       toolsAllow: requested === undefined ? p.toolsAllow : [...requested],
+      forceMessageTool: requiresPrivateSourceReply,
     });
     let tools: AnyAgentTool[] = [];
+    let constructedTools: AnyAgentTool[] = [];
     if (plan.constructTools) {
       // createToolSurface binds too early to insert a post-hook validation/dispatch gate.
       // The public construction + bind seam preserves the core policy pipeline and exact metadata.
@@ -407,13 +510,13 @@ export async function prepareNativeHost(p: Parameters<AgentHarnessV2["runAttempt
         channelContext: p.channelContext, currentMessagingTarget: p.currentMessagingTarget,
         currentThreadTs: p.currentThreadTs, currentMessageId: p.currentMessageId,
         groupId: p.groupId, groupChannel: p.groupChannel, groupSpace: p.groupSpace,
-        memberRoleIds: p.memberRoleIds, spawnedBy: p.spawnedBy,
+        memberRoleIds: p.memberRoleIds, messageActionTurnCapability: p.messageActionTurnCapability, spawnedBy: p.spawnedBy,
         senderId: p.senderId, senderName: p.senderName, senderUsername: p.senderUsername,
         senderE164: p.senderE164, senderIsOwner: p.senderIsOwner,
         approvalReviewerDeviceId: p.approvalReviewerDeviceId,
         replyToMode: p.replyToMode, requireExplicitMessageTarget: p.requireExplicitMessageTarget,
         sourceReplyDeliveryMode: p.sourceReplyDeliveryMode, inboundEventKind: p.currentInboundEventKind,
-        disableMessageTool: true, forceMessageTool: false, enableHeartbeatTool: false,
+        disableMessageTool: !requiresPrivateSourceReply, forceMessageTool: requiresPrivateSourceReply, enableHeartbeatTool: false,
         allowGatewaySubagentBinding: false, delegationCapability: "report_only",
         modelProvider: p.provider, modelId: p.modelId, modelApi: p.model.api,
         modelContextWindowTokens: p.model.contextWindow, modelCompat: p.model.compat,
@@ -427,10 +530,12 @@ export async function prepareNativeHost(p: Parameters<AgentHarnessV2["runAttempt
         abortSignal: lifetime, wrapBeforeToolCallHook: false,
         includeCoreTools: plan.includeCoreTools, includeToolSearchControls: false,
         runtimeToolAllowlist: plan.runtimeToolAllowlist,
-        toolConstructionPlan: genericTools ? plan.codingToolConstructionPlan : { ...plan.codingToolConstructionPlan,
-          includeChannelTools: false, includePluginTools: false, includeOpenClawTools: false },
+        toolConstructionPlan: genericTools || requiresPrivateSourceReply ? plan.codingToolConstructionPlan :
+          { ...plan.codingToolConstructionPlan,
+            includeChannelTools: false, includePluginTools: false, includeOpenClawTools: false },
         registerRunCleanup: (cleanup) => cleanups.push(cleanup),
       });
+      constructedTools = tools;
       if (genericTools) {
         // runtimeToolAllowlist guides construction, but does not filter every factory.
         const selection = selectHostTools({ tools, runtime: sdk, toolAllowlist: requested, toolExecutionAllow: p.toolExecutionAllow });
@@ -443,15 +548,20 @@ export async function prepareNativeHost(p: Parameters<AgentHarnessV2["runAttempt
         tools = tools.filter((tool) => LEGACY_CODING_TOOLS.has(tool.name) &&
           !sdk.getPluginToolMeta(tool) && !sdk.getChannelAgentToolMeta(tool));
       }
-      tools = restrict(tools, p.toolsAllow);
-      if (p.pluginHarnessToolPolicySafeDeniedTools?.length) {
-        const denied = new Set(restrict(tools, [...p.pluginHarnessToolPolicySafeDeniedTools]));
-        tools = tools.filter((tool) => !denied.has(tool));
-      }
-      if (p.forceRestartSafeTools) tools = tools.filter((tool) => sdk.isAgentToolReplaySafe(tool));
+      tools = applyRunToolCeilings(tools);
       if (preparation && !genericTools) {
         const allowed = new Set(preparation.policy.executionTools);
         tools = tools.filter((tool) => allowed.has(tool.name));
+      }
+    }
+    const privateSourceReplyTools = requiresPrivateSourceReply
+      ? applyRunToolCeilings(constructedTools).filter((tool) => tool.name === "message") : [];
+    if (privateSourceReplyTools.length > 1) throw new Error("Ambiguous private current-source message tool");
+    const privateSourceReplyTool = privateSourceReplyTools[0];
+    if (requiresPrivateSourceReply) {
+      if (!privateSourceReplyTool) throw new Error("DSH native host requires an authorized private message tool current-source route");
+      if (p.toolExecutionAllow && !p.toolExecutionAllow.includes("message")) {
+        throw new Error("DSH native host private message tool execution is denied");
       }
     }
     const updateNotices = () => {
@@ -510,6 +620,7 @@ export async function prepareNativeHost(p: Parameters<AgentHarnessV2["runAttempt
       onAgentToolResult: p.onAgentToolResult, cleanups,
       preparationGate: preparation?.gate,
       toolAllowlist: requested, toolSources, toolNotices,
+      privateSourceReplyTool, privateSourceReplyAttempt: requiresPrivateSourceReply ? p : undefined,
     });
     const preparedHost = host;
     return {

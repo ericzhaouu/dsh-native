@@ -6,7 +6,7 @@ import { readFileSync } from "node:fs";
 import ts from "typescript";
 
 // Load source in memory, including the main-owned preparation contract; never write shared dist output.
-const sourceModules = new Map(["native/host", "native/tool-bridge", "preparation"].map((name) => [
+const sourceModules = new Map(["native/host", "native/source-reply", "native/tool-bridge", "preparation"].map((name) => [
   new URL(`../dist/${name}.js`, import.meta.url).href,
   new URL(`../src/${name}.ts`, import.meta.url),
 ]));
@@ -48,6 +48,19 @@ function fixture(tools = [tool()], overrides = {}) {
     isToolResultError: (result) => result?.isError === true || result?.details?.status === "error",
     formatToolExecutionErrorMessage: (e) => e.message,
     getBeforeToolCallFailureDisposition: (e) => e?.disposition,
+    extractMessagingToolSend: (toolName, args) => toolName === "message" && ["reply", "send"].includes(args.action)
+      ? { tool: "message", provider: "feishu", text: args.message, sourceReplyFinal: args.final === true }
+      : undefined,
+    extractMessagingToolSendResult: (pending, result) => ({
+      ...pending,
+      ...(result?.details?.deliveredText ? { text: result.details.deliveredText } : {}),
+    }),
+    isDeliveredMessageToolOnlySourceReplyResult: (params) =>
+      params.sourceReplyDeliveryMode === "message_tool_only" &&
+      params.toolName === "message" &&
+      params.result?.details?.messageDelivery?.sourceReplyDelivered === true &&
+      params.result?.details?.messageDelivery?.status === "settled" &&
+      !params.isError,
   };
   const host = createNativeToolHost({
     tools, runtime, signal: signal(), assertActive() {}, runId: "run", sessionId: "session", cwd: process.cwd(),
@@ -148,6 +161,125 @@ test("valid calls are single-use even concurrently; unknown and disabled tools f
   assert.equal(restricted.tools.length, 1);
   await assert.rejects(restricted.executeTool(call(), signal()), /denied/);
   assert.equal(restricted.getToolCounts().startedCount, 0);
+});
+
+function messageTool(execute = async (_id, args) => ({
+  content: [{ type: "text", text: "sent" }],
+  details: {
+    deliveredText: args.message,
+    messageDelivery: { sourceReplyDelivered: true, status: "settled" },
+    sourceReplyRoute: "current-source",
+  },
+})) {
+  return {
+    name: "message",
+    label: "message",
+    description: "Fixture private message tool",
+    parameters: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: ["send", "reply"] },
+        message: { type: "string" },
+        final: { type: "boolean" },
+        target: { type: "string" },
+      },
+      required: ["action", "message", "final"],
+      additionalProperties: false,
+    },
+    execute,
+  };
+}
+
+test("private source reply is not advertised and only the synthesized current-source args can execute", async () => {
+  let received;
+  const { host, hooks } = fixture([tool("read")], {
+    options: {
+      privateSourceReplyTool: messageTool(async (_id, args) => {
+        received = args;
+        return {
+          content: [{ type: "text", text: "sent" }],
+          details: {
+            deliveredText: args.message,
+            messageDelivery: { sourceReplyDelivered: true, status: "settled" },
+            sourceReplyRoute: "current-source",
+          },
+        };
+      }),
+      privateSourceReplyAttempt: { sourceReplyDeliveryMode: "message_tool_only", config: {}, currentChannelId: "chan" },
+    },
+  });
+  assert.deepEqual(host.tools.map((t) => t.name), ["read"]);
+  await assert.rejects(host.executeTool(call("message", "model-message", { action: "reply", message: "x", final: true }), signal()), /unavailable/);
+  const delivery = await host.deliverSourceReply("Committed final", signal());
+  assert.deepEqual(received, { action: "send", message: "Committed final", final: true });
+  assert.equal(delivery.didSendViaMessagingTool, true);
+  assert.equal(delivery.sourceReplyDelivered, true);
+  assert.deepEqual(delivery.messagingToolSentTexts, ["Committed final"]);
+  assert.equal(hooks[0].toolName, "message");
+  assert.deepEqual(host.getToolCounts(), { startedCount: 1, completedCount: 1, activeCount: 0 });
+  assert.equal(host.getReplayState().replaySafe, false);
+});
+
+test("private source reply fails closed when hooks rewrite to an explicit foreign route or receipt is missing", async () => {
+  const redirected = fixture([], {
+    rewrite: (args) => ({ ...args, target: "foreign-channel" }),
+    options: {
+      privateSourceReplyTool: messageTool(),
+      privateSourceReplyAttempt: { sourceReplyDeliveryMode: "message_tool_only", config: {} },
+    },
+  }).host;
+  await assert.rejects(redirected.deliverSourceReply("Final", signal()), /explicit message route|unsupported fields/);
+  const missingReceipt = fixture([], {
+    options: {
+      privateSourceReplyTool: messageTool(async () => ({ content: [{ type: "text", text: "queued" }] })),
+      privateSourceReplyAttempt: { sourceReplyDeliveryMode: "message_tool_only", config: {} },
+    },
+  }).host;
+  await assert.rejects(missingReceipt.deliverSourceReply("Final", signal()), /verified current-source delivery receipt/);
+});
+
+test("private delivery does not consume or bypass the model's business-tool preparation gate", async () => {
+  let businessStarts = 0;
+  const { host } = fixture([tool("read")], {
+    options: {
+      preparationGate: {
+        assertAllowed() { throw new Error("No business tool authorized in chat"); },
+        start() { businessStarts++; throw new Error("No business tool authorized in chat"); },
+      },
+      privateSourceReplyTool: messageTool(async (_id, args) => ({
+        content: [{ type: "text", text: "sent" }],
+        details: { deliveredText: args.message, messageDelivery: { sourceReplyDelivered: true, status: "settled" } },
+      })),
+      privateSourceReplyAttempt: { sourceReplyDeliveryMode: "message_tool_only", config: {} },
+    },
+  });
+  await assert.rejects(host.executeTool(call("read", "not-authorized"), signal()), /No business tool authorized/u);
+  const delivered = await host.deliverSourceReply("Chat final", signal());
+  assert.equal(delivered.sourceReplyDelivered, true);
+  assert.equal(businessStarts, 0);
+  await assert.rejects(host.deliverSourceReply("Chat final", signal()), /already attempted/u);
+  await host.dispose();
+});
+
+test("delivery evidence survives cancellation immediately after confirmed platform acceptance", async () => {
+  const controller = new AbortController();
+  const { host } = fixture([], {
+    options: {
+      privateSourceReplyTool: messageTool(async (_id, args) => {
+        controller.abort(new Error("cancel after send"));
+        return { content: [{ type: "text", text: "sent" }],
+          details: { deliveredText: args.message, messageDelivery: { sourceReplyDelivered: true, status: "settled" } } };
+      }),
+      privateSourceReplyAttempt: { sourceReplyDeliveryMode: "message_tool_only", config: {} },
+    },
+  });
+  await assert.rejects(host.deliverSourceReply("Final", controller.signal), (error) => {
+    assert.equal(error.name, "SourceReplyDeliveryError");
+    assert.equal(error.delivery.sourceReplyDelivered, true);
+    return true;
+  });
+  assert.equal(host.getReplayState().replaySafe, false);
+  await host.dispose();
 });
 
 test("tracks concurrent dispatch and does not announce replay safety during a pending read", async () => {
@@ -272,13 +404,14 @@ test("unsupported capabilities fail closed before constructing tools", () => {
   const base = { hostCapabilities: { bindToolSurface() {} } };
   assert.doesNotThrow(() => assertNativeHostSupported(base));
   assert.doesNotThrow(() => assertNativeHostSupported({ ...base, taskSuggestionDeliveryMode: "gateway" }));
+  assert.doesNotThrow(() => assertNativeHostSupported({ ...base, sourceReplyDeliveryMode: "message_tool_only" }));
   assert.doesNotThrow(() => assertNativeHostSupported({ ...base, skillLibraryAuthoring: {
     invoke() { throw new Error("Optional authoring must not be invoked"); },
   } }));
   for (const fields of [
     { clientTools: [{}] }, { images: [{}] }, { media: [{}] }, { sandbox: { enabled: true } },
     { execOverrides: { host: "node" } }, { toolOverrides: { mcpServers: [] } }, { permissionMode: "full" },
-    { sourceReplyDeliveryMode: "message_tool_only" }, { forceMessageTool: true }, { enableHeartbeatTool: true },
+    { forceMessageTool: true }, { enableHeartbeatTool: true },
     { runtimePluginToolGrant: {} }, { modelRun: true }, { codeModeOverride: true },
     { taskSuggestionDeliveryMode: "message_tool" },
     { skillWorkshopProposalOnly: true }, { skillWorkshopAutonomousCapture: true },

@@ -16,6 +16,7 @@ import {
 } from "./host-copilot-auth-plugin.mjs";
 import { createHostSearchFixture, HOST_SEARCH_PLUGIN_ID, HOST_SEARCH_PROVIDER_ID } from "./host-search-plugin.mjs";
 import { createHostMemoryFixture, HOST_MEMORY_PLUGIN_ID } from "./host-memory-plugin.mjs";
+import { createSourceReplyChannelFixture, SOURCE_REPLY_PLUGIN_ID, SOURCE_REPLY_CHANNEL_ID } from "./source-reply-channel.mjs";
 
 const packageRoot = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
 const TOKEN = "dashboard-gateway-fixture-token";
@@ -154,11 +155,11 @@ async function withTimeout(promise, ms, message) {
 }
 
 export async function startDashboardGateway(responder, {
-  agentPinned = true, redactTranscriptIdentity = false, taskPreparation,
+  agentPinned = true, redactTranscriptIdentity = false, redactTranscriptPatterns = [], taskPreparation,
   hostTools, searchFixture = false, agentToolPolicy, agentId = AGENT_ID,
   additionalAgentIds = [], setupWorkspaces, modelContextWindow = 1_000_000,
   compaction, memoryFixture = false, copilotAuthFixture = false,
-  compactionAuthPatch = copilotAuthFixture, copilotAuthProfile = false,
+  compactionAuthPatch = copilotAuthFixture, copilotAuthProfile = false, sourceReplyFixture,
 } = {}) {
   assert.equal(OPENCLAW_VERSION, "2026.9.2", "Dashboard fixture must use the inspected genuine SDK");
   assert.ok(!copilotAuthFixture || agentPinned, "Synthetic provider replacement requires a private copied host");
@@ -263,6 +264,8 @@ export async function startDashboardGateway(responder, {
       : undefined;
     const search = searchFixture ? await createHostSearchFixture(root, fixture.host) : undefined;
     const memory = memoryFixture ? await createHostMemoryFixture(root, fixture.host) : undefined;
+    const sourceReply = sourceReplyFixture ? await createSourceReplyChannelFixture(root, fixture.host) : undefined;
+    await sourceReply?.observeHarness(fixture.plugin);
     const port = await reserveLoopbackPort();
     const configPath = join(root, "openclaw.json");
     const logPath = join(root, "openclaw.log");
@@ -271,6 +274,10 @@ export async function startDashboardGateway(responder, {
       discovery: { mdns: { mode: "off" } },
       update: { checkOnStart: false, auto: { enabled: false } },
       browser: { enabled: false },
+      ...(sourceReply ? {
+        messages: { groupChat: { visibleReplies: "message_tool" } },
+        channels: { [SOURCE_REPLY_CHANNEL_ID]: { enabled: true } },
+      } : {}),
       ...(copilotAuthProfile ? { auth: { profiles: {
         [HOST_COPILOT_AUTH_PROFILE_ID]: { provider: "github-copilot", mode: "token" },
       } } } : {}),
@@ -320,12 +327,13 @@ export async function startDashboardGateway(responder, {
       plugins: {
         slots: { memory: memory ? HOST_MEMORY_PLUGIN_ID : "none" },
         enabled: true,
-        allow: ["dsh-native", ...(copilotAuth ? [HOST_COPILOT_AUTH_PLUGIN_ID] : []),
+        allow: ["dsh-native", ...(sourceReply ? [SOURCE_REPLY_PLUGIN_ID] : []), ...(copilotAuth ? [HOST_COPILOT_AUTH_PLUGIN_ID] : []),
           ...(search ? [HOST_SEARCH_PLUGIN_ID] : []), ...(memory ? [HOST_MEMORY_PLUGIN_ID] : [])],
-        load: { paths: [fixture.plugin, ...(copilotAuth ? [copilotAuth.plugin] : []),
+        load: { paths: [fixture.plugin, ...(sourceReply ? [sourceReply.plugin] : []), ...(copilotAuth ? [copilotAuth.plugin] : []),
           ...(search ? [search.plugin] : []), ...(memory ? [memory.plugin] : [])] },
         entries: {
           "github-copilot": { enabled: false },
+          ...(sourceReply ? { [SOURCE_REPLY_PLUGIN_ID]: { enabled: true, config: sourceReplyFixture } } : {}),
           ...(copilotAuth ? { [HOST_COPILOT_AUTH_PLUGIN_ID]: { enabled: true, config: copilotAuth.config } } : {}),
           ...(search ? { [HOST_SEARCH_PLUGIN_ID]: { enabled: true, config: search.config } } : {}),
           ...(memory ? { [HOST_MEMORY_PLUGIN_ID]: { enabled: true } } : {}),
@@ -343,7 +351,10 @@ export async function startDashboardGateway(responder, {
         },
       },
       logging: { level: "debug", consoleLevel: "debug", file: logPath,
-        ...(redactTranscriptIdentity ? { redactPatterns: ["^github-copilot$", "^gpt-6-astra$"] } : {}) },
+        ...(redactTranscriptIdentity || redactTranscriptPatterns.length ? {
+          redactPatterns: [...(redactTranscriptIdentity ? ["^github-copilot$", "^gpt-6-astra$"] : []),
+            ...redactTranscriptPatterns],
+        } : {}) },
       diagnostics: { enabled: false },
     }));
     if (copilotAuthProfile) {
@@ -442,6 +453,7 @@ export async function startDashboardGateway(responder, {
     }
     return {
       memory,
+      sourceReply,
       root,
       workspace,
       agentDir,

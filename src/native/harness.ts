@@ -13,6 +13,7 @@ import {
   isNativeMemoryAttempt, renderMemoryPrompt, MEMORY_OUTPUT_TOKENS, MEMORY_TIMEOUT_MS, MEMORY_TOOL_LIMIT,
 } from "./memory.js";
 import { createIsolatedCompletion, type IsolatedCompletion } from "./isolated.js";
+import { isSilentSourceReply, SourceReplyDeliveryError, type NativeSourceReplyDelivery } from "./source-reply.js";
 
 type Attempt = Parameters<AgentHarnessV2["runAttempt"]>[0];
 type Result = Awaited<ReturnType<AgentHarnessV2["runAttempt"]>>;
@@ -177,6 +178,7 @@ export function createNativeHarness(
     let streamedText = "";
     let streamedReasoning = "";
     let startedAssistant = false;
+    let sourceReplyDelivery: NativeSourceReplyDelivery | undefined;
     const toolMetas: Result["toolMetas"] = [];
     let hookContext: Parameters<LifecycleSdk["awaitAgentHarnessAgentEndHook"]>[0]["ctx"] | undefined;
     let assertContinuity: (() => void) | undefined;
@@ -239,13 +241,14 @@ export function createNativeHarness(
       }
       if (event.type === "text") {
         streamedText += event.text;
-        if (!p.suppressLiveStreamOutput && !p.silentExpected && event.text) {
+        if (p.sourceReplyDeliveryMode !== "message_tool_only" && !p.suppressLiveStreamOutput && !p.silentExpected && event.text) {
           emittedVisibleOutput = true;
           await p.onPartialReply?.({ text: streamedText, delta: event.text });
         }
       } else if (event.type === "reasoning") {
         streamedReasoning += event.text;
-        if (!p.suppressLiveStreamOutput && !p.silentExpected && (p.reasoningLevel === "on" || p.reasoningLevel === "stream")) {
+        if (p.sourceReplyDeliveryMode !== "message_tool_only" &&
+            !p.suppressLiveStreamOutput && !p.silentExpected && (p.reasoningLevel === "on" || p.reasoningLevel === "stream")) {
           await p.onReasoningStream?.({
             text: streamedReasoning, isReasoning: true, isReasoningSnapshot: true,
           });
@@ -331,6 +334,9 @@ export function createNativeHarness(
           preparationPolicy && preparationGate ? { policy: preparationPolicy, gate: preparationGate } : undefined,
           memory ? (config.toolAllowlist ?? ["read", "write"]).filter((name) => name === "read" || name === "write") : config.toolAllowlist);
         assertActive();
+        if (p.sourceReplyDeliveryMode === "message_tool_only" && !p.silentExpected && !memory && !host.deliverSourceReply) {
+          failure("message-tool-only source reply requires a private current-source message route");
+        }
         if (memory) {
           if (host.tools.some((tool) => tool.name !== "read" && tool.name !== "write")) {
             failure("memory maintenance received a non-memory host tool");
@@ -433,6 +439,20 @@ export function createNativeHarness(
           if (persisted.suppressed) failure("assistant transcript hook suppressed the native mirror; start a fresh session with /new");
         }
         completedAssistant = assistant;
+        if (p.sourceReplyDeliveryMode === "message_tool_only" && !memory && completedAssistant &&
+            !p.silentExpected && Reflect.get(completedAssistant, "display") !== false &&
+            [undefined, "final_answer"].includes(Reflect.get(completedAssistant, "phase"))) {
+          const text = completedAssistant.content.filter((block) => block.type === "text").map((block) => block.text).join("\n");
+          if (text.trim() && !isSilentSourceReply(p, text)) {
+            try {
+              sourceReplyDelivery = await host.deliverSourceReply!(text, signal);
+            } catch (error) {
+              if (error instanceof SourceReplyDeliveryError) sourceReplyDelivery = error.delivery;
+              throw error;
+            }
+            assertActive();
+          }
+        }
         if (streamedReasoning) await p.onReasoningEnd?.();
         assertActive();
       } catch (error) {
@@ -468,8 +488,14 @@ export function createNativeHarness(
           ? completedAssistant.content.filter((block) => block.type === "text").map((block) => block.text) : [],
         lastAssistant: assistant, currentAttemptAssistant: attributeAssistant(assistant, executedModel),
         currentAttemptCompletedAssistant: attributeAssistant(completedAssistant, executedModel),
-        toolMetas, didSendViaMessagingTool: false,
-        messagingToolSentTexts: [], messagingToolSentMediaUrls: [], messagingToolSentTargets: [],
+        toolMetas, didSendViaMessagingTool: sourceReplyDelivery?.didSendViaMessagingTool ?? false,
+        didDeliverSourceReplyViaMessageTool: sourceReplyDelivery?.didDeliverSourceReplyViaMessageTool,
+        sourceReplyDelivered: sourceReplyDelivery?.sourceReplyDelivered,
+        messagingToolSentTexts: sourceReplyDelivery?.messagingToolSentTexts ?? [],
+        messagingToolSentMediaUrls: sourceReplyDelivery?.messagingToolSentMediaUrls ?? [],
+        messagingToolSentTargets: sourceReplyDelivery?.messagingToolSentTargets ?? [],
+        ...(sourceReplyDelivery?.messagingToolSourceReplyPayloads?.length
+          ? { messagingToolSourceReplyPayloads: sourceReplyDelivery.messagingToolSourceReplyPayloads } : {}),
         cloudCodeAssistFormatError: false, replayMetadata: replay,
         itemLifecycle: host?.getToolCounts() ?? { startedCount: 0, completedCount: 0, activeCount: 0 },
         ...(owned ? { assistantTranscriptOwned: true, assistantTranscriptIdempotencyKey: idempotencyKey } : {}),
@@ -506,7 +532,7 @@ export function createNativeHarness(
           Reflect.get(completedAssistant, "display") !== false &&
           [undefined, "final_answer"].includes(Reflect.get(completedAssistant, "phase"))) {
         const text = result.assistantTexts.join("\n");
-        if (text.trim()) {
+        if (text.trim() && !isSilentSourceReply(p, text)) {
           try {
             assertPublishable();
             const event = {
