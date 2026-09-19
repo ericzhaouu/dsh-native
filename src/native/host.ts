@@ -194,7 +194,9 @@ export function createNativeToolHost(options: NativeToolHostOptions): Omit<Nativ
   const validators = new Map<string, ValidateFunction>();
   const replaySafeTools = new Map<string, boolean>();
   const executionAllow = options.toolExecutionAllow === undefined ? undefined : new Set(options.toolExecutionAllow);
-  const ajv = new Ajv({ allErrors: true, strict: true, strictSchema: false, validateFormats: true,
+  // Channel message schemas include legal union types in optional presentation fields.
+  // This validator is private; the separate exact-argument gate still permits text only.
+  const ajv = new Ajv({ allErrors: true, strict: true, strictSchema: false, allowUnionTypes: true, validateFormats: true,
     coerceTypes: false, useDefaults: false, removeAdditional: false, addUsedSchema: false });
   let startedCount = 0;
   let completedCount = 0;

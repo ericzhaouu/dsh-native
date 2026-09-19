@@ -74,6 +74,7 @@ export function registerSourceReplyFixture(api) {
     },
     messaging: { normalizeTarget: (target) => target.trim(),
       targetResolver: { looksLikeId: (target) => target.startsWith("chat:"), hint: "chat:source-reply-chat" } },
+    actions: { describeMessageTool: () => ({ actions: ["send"], capabilities: ["presentation"] }) },
     outbound,
     message: createChannelMessageAdapterFromOutbound({ id: SOURCE_REPLY_CHANNEL_ID, outbound }),
   } });

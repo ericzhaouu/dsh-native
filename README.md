@@ -1,6 +1,6 @@
 # DSH Native for OpenClaw
 
-**实验性版本 0.7.0**：把官方 DeepSeek Harness（DSH）的模型／工具循环接入 OpenClaw 的原生 `AgentHarnessV2`，并保留 OpenClaw 对模型、认证、工具授权与会话入口的控制。
+**实验性版本 0.7.1**：把官方 DeepSeek Harness（DSH）的模型／工具循环接入 OpenClaw 的原生 `AgentHarnessV2`，并保留 OpenClaw 对模型、认证、工具授权与会话入口的控制。
 
 - 源码仓库：[ericzhaouu/dsh-native](https://github.com/ericzhaouu/dsh-native)
 - 作者：[ericzhaouu](https://github.com/ericzhaouu)
@@ -42,6 +42,8 @@
 - [致谢与许可证](#致谢与许可证)
 
 ## 0.7.0 当前会话私有回复
+
+**0.7.1 修复**：真实飞书消息工具的可选 presentation schema 包含合法的联合类型。0.7.0 的私有校验器错误拒绝此 schema，导致普通文本轮次在推理前失败；0.7.1 接受这种 schema 表达，但仍严格限制发送参数为下述三个字段，不开放 presentation、多媒体或模型消息工具。业务工具校验策略不变。
 
 当宿主要求 `message_tool_only` 投递时，DSH 使用宿主构造并授权的私有 `message` 工具，把**已持久化、经改写／脱敏的最终文本**发送到当前来源会话。模型仍只生成文本：`message` 不出现在模型工具清单，也不能由模型指定收件人、账号、频道或转发目标。
 

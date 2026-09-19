@@ -220,6 +220,33 @@ test("private source reply is not advertised and only the synthesized current-so
   assert.equal(host.getReplayState().replaySafe, false);
 });
 
+test("private text replies accept the host's legal rich-presentation union schema without granting rich payloads", async () => {
+  const makeMessage = () => {
+    const message = messageTool();
+    message.parameters.properties.presentation = {
+      type: "object", properties: { blocks: { type: "array", items: {
+        type: "object", properties: { rows: { type: "array", items: {
+          type: "array", items: { type: ["string", "number"] },
+        } } },
+      } } },
+    };
+    return message;
+  };
+  const options = () => ({ privateSourceReplyTool: makeMessage(),
+    privateSourceReplyAttempt: { sourceReplyDeliveryMode: "message_tool_only", config: {} } });
+  const allowed = fixture([], { options: options() }).host;
+  assert.equal((await allowed.deliverSourceReply("Text only", signal())).sourceReplyDelivered, true);
+  assert.deepEqual(allowed.tools, []);
+  await allowed.dispose();
+  const rewritten = fixture([], {
+    options: options(),
+    rewrite: (args) => ({ ...args, presentation: { blocks: [{ rows: [["cell", 1]] }] } }),
+  }).host;
+  await assert.rejects(rewritten.deliverSourceReply("Text only", signal()), /unsupported fields/u);
+  assert.equal(rewritten.getToolCounts().startedCount, 0);
+  await rewritten.dispose();
+});
+
 test("private source reply fails closed when hooks rewrite to an explicit foreign route or receipt is missing", async () => {
   const redirected = fixture([], {
     rewrite: (args) => ({ ...args, target: "foreign-channel" }),

@@ -1,4 +1,4 @@
-DSH NATIVE FOR OPENCLAW -- EXPERIMENTAL 0.7.0
+DSH NATIVE FOR OPENCLAW -- EXPERIMENTAL 0.7.1
 
 Source: https://github.com/ericzhaouu/dsh-native
 Author: https://github.com/ericzhaouu
@@ -9,6 +9,11 @@ License: MIT; Copyright (c) 2026 ericzhaouu.
 The Chinese README.md contains the complete guide.
 
 PRIVATE CURRENT-SOURCE REPLIES (0.7.0)
+
+0.7.1 fixes private message-schema compilation for legal union types in optional
+rich-presentation fields, as exposed by the actual Feishu tool. Exact text-only
+arguments and all policy guards remain enforced; no presentation or model
+messaging capability is added, and business-tool schema policy is unchanged.
 
 For host-required message_tool_only delivery, a private host-bound core message
 tool sends the committed, rewritten/redacted final text once. The model cannot
