@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { createHash } from "node:crypto";
 import { compileCorpus } from "../scripts/compile-acceptance.mjs";
 
 test("complete corpus compiles to gated runner cases with a separate oracle sidecar", async () => {
@@ -9,6 +10,11 @@ test("complete corpus compiles to gated runner cases with a separate oracle side
   assert.equal(manifest.stage, "live");
   assert.equal(Object.keys(oracles.cases).length, 188);
   assert.equal(Object.keys(oracles.corpusHashes).length, 3);
+  assert.equal(oracles.fixtures["feishu-table"].oracle.filters.all_open.resultIds.length, 17);
+  assert.equal(JSON.stringify(manifest).includes('"WB-001"'), false);
+  assert.equal(manifest.corpusOracle.caseCount, 188);
+  assert.equal(manifest.corpusOracle.sha256,
+    createHash("sha256").update(`${JSON.stringify(oracles, null, 2)}\n`).digest("hex"));
   for (const item of manifest.cases) {
     assert.equal(item.stage, "live");
     assert.ok(item.prerequisites.includes("model-budget-approved"));
@@ -31,5 +37,6 @@ test("single cases expand into three variants while multi-turn scripts preserve 
   const canary = await compileCorpus({ subset: "canary" });
   assert.equal(canary.manifest.cases.length, 12);
   assert.ok(canary.manifest.cases.every((item) => item.prerequisites.includes("live-feishu-canary-approved")));
+  assert.ok(canary.manifest.cases.every((item) => item.adapterControls?.[0]?.visibleToModel === false));
   await assert.rejects(compileCorpus({ subset: "unknown" }), /Unknown corpus/);
 });

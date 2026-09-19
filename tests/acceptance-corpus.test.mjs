@@ -129,6 +129,60 @@ test("model-visible wording is diverse and tied to per-case semantic anchors", a
   }
 });
 
+test("single-turn table variants ask the same read-only fixture task as their oracle", async () => {
+  const single = (await corpusFiles()).find(([, doc]) => doc.corpusKind === "single_turn")[1].cases;
+  const tableCases = single.filter((item) => item.fixtures.includes("feishu-table"));
+  for (const item of tableCases) {
+    const filterIds = new Set((item.oracle.fixtureExpectations ?? []).map((expectation) => expectation.filterId));
+    for (const variant of item.modelVisible.variants) {
+      assert.doesNotMatch(variant, /hidden\s*oracle|隐藏oracle|resultIds|WB-\d{3}/i, item.caseId);
+      if (filterIds.has("open_due_before_oct")) {
+        assert.match(variant, /open|state=open/i, item.caseId);
+        assert.match(variant, /2026-10-01|10-01|9月/, item.caseId);
+        assert.match(variant, /分页|读完|读取|遍历/, item.caseId);
+      }
+      if (filterIds.has("all_open")) {
+        assert.match(variant, /open|state=open/i, item.caseId);
+        assert.match(variant, /分页|读完|全部|所有|遍历|不只看第一页/, item.caseId);
+      }
+    }
+  }
+});
+
+test("prompt anchors remain separate from deterministic answer checks", async () => {
+  const corpora = await corpusFiles();
+  const canary = corpora.find(([, doc]) => doc.corpusKind === "feishu_canary")[1].cases;
+  const anchorExamples = [
+    ["canary-dsh-assistant-03", "120字"],
+    ["canary-dsh-assistant-05", "一次"],
+    ["canary-dsh-assistant-06", "文本"]
+  ];
+  for (const [caseId, token] of anchorExamples) {
+    const item = canary.find((entry) => entry.caseId === caseId);
+    assert.ok(item.oracle.modelVisibleRequiredTokens.includes(token), caseId);
+    assert.ok(item.modelVisible.text.includes(token), caseId);
+    assert.deepEqual(item.oracle.answerChecks, [], `${caseId} keeps prompt anchors out of answer checks`);
+  }
+});
+
+test("Feishu canary control proof is hidden and receipt based", async () => {
+  const canary = (await corpusFiles()).find(([, doc]) => doc.corpusKind === "feishu_canary")[1].cases;
+  for (const item of canary) {
+    assert.ok((item.adapterControls ?? []).every((control) => control.visibleToModel === false), item.caseId);
+    assert.doesNotMatch(item.modelVisible.text, /适配器|控制器|已完成\/new|重复投递|卡片失败/, item.caseId);
+    assert.equal(item.oracle.delivery?.requireReadbackReceipt, true, item.caseId);
+    const assertions = item.oracle.businessAssertions.join("\n");
+    if (item.taskClass.endsWith("new-reset-prompt")) {
+      assert.match(assertions, /hidden adapter receipt/, item.caseId);
+      assert.match(assertions, /not by model self-claim/, item.caseId);
+    }
+    if (item.taskClass.endsWith("duplicate-replay") || item.taskClass.endsWith("reconnect-card")) {
+      assert.match(assertions, /hidden adapter receipt/, item.caseId);
+      assert.match(assertions, /not prompt self-claim/, item.caseId);
+    }
+  }
+});
+
 test("Feishu table fixture forces pagination and exact timezone-aware oracle results", async () => {
   const table = await readJson(new URL("feishu-table.json", fixtureBase));
   const rows = table.modelVisible.records;

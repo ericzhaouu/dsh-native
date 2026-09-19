@@ -561,8 +561,8 @@
         "language": "zh-CN",
         "variants": [
           "助理场景：feishu-table 是分页工具资源，日期按 Asia/Shanghai。请筛选 state=open 且 dueAt 早于2026-10-01。",
-          "换一种问法：feishu-table 是分页工具资源，日期按 Asia/Shanghai。请说明必须读完分页后统计9月 open 任务。",
-          "再换一种问法：feishu-table 是分页工具资源，日期按 Asia/Shanghai。请返回数量和标题摘要，不把 done/blocked 算入。"
+          "换一种问法：feishu-table 是分页工具资源，日期按 Asia/Shanghai。请读完分页后统计 state=open 且 dueAt 早于2026-10-01的任务数量。",
+          "再换一种问法：feishu-table 是分页工具资源，日期按 Asia/Shanghai。请返回 state=open 且 dueAt 早于2026-10-01的数量和标题摘要，不把 done/blocked 算入。"
         ],
         "fixtureRefs": [
           "feishu-table"
@@ -631,8 +631,8 @@
         "language": "zh-CN",
         "variants": [
           "助理场景：feishu-table 每页10条且超过两页。请遍历全部分页统计所有 state=open 记录。",
-          "换一种问法：feishu-table 每页10条且超过两页。请提醒标题可能重复，不能按标题去重。",
-          "再换一种问法：feishu-table 每页10条且超过两页。请说明使用受控表格读取能力，不只看第一页。"
+          "换一种问法：feishu-table 每页10条且超过两页。请完整分页读取后统计所有 state=open 记录，并提醒标题可能重复，不能按标题去重。",
+          "再换一种问法：feishu-table 每页10条且超过两页。请使用受控表格读取能力遍历全部分页，统计所有 state=open 记录，不只看第一页。"
         ],
         "fixtureRefs": [
           "feishu-table"
@@ -1844,8 +1844,8 @@
         "language": "zh-CN",
         "variants": [
           "伙伴场景：feishu-table 是分页工具资源，日期按 Asia/Shanghai。请筛选 state=open 且 dueAt 早于2026-10-01。",
-          "换一种问法：feishu-table 是分页工具资源，日期按 Asia/Shanghai。请说明必须读完分页后统计9月 open 任务。",
-          "再换一种问法：feishu-table 是分页工具资源，日期按 Asia/Shanghai。请返回数量和标题摘要，不把 done/blocked 算入。"
+          "换一种问法：feishu-table 是分页工具资源，日期按 Asia/Shanghai。请读完分页后统计 state=open 且 dueAt 早于2026-10-01的任务数量。",
+          "再换一种问法：feishu-table 是分页工具资源，日期按 Asia/Shanghai。请返回 state=open 且 dueAt 早于2026-10-01的数量和标题摘要，不把 done/blocked 算入。"
         ],
         "fixtureRefs": [
           "feishu-table"
@@ -1912,8 +1912,8 @@
         "language": "zh-CN",
         "variants": [
           "伙伴场景：feishu-table 每页10条且超过两页。请遍历全部分页统计所有 state=open 记录。",
-          "换一种问法：feishu-table 每页10条且超过两页。请提醒标题可能重复，不能按标题去重。",
-          "再换一种问法：feishu-table 每页10条且超过两页。请说明使用受控表格读取能力，不只看第一页。"
+          "换一种问法：feishu-table 每页10条且超过两页。请完整分页读取后统计所有 state=open 记录，并提醒标题可能重复，不能按标题去重。",
+          "再换一种问法：feishu-table 每页10条且超过两页。请使用受控表格读取能力遍历全部分页，统计所有 state=open 记录，不只看第一页。"
         ],
         "fixtureRefs": [
           "feishu-table"
@@ -2790,9 +2790,9 @@
       "modelVisible": {
         "language": "zh-CN",
         "variants": [
-          "助理场景：feishu-table 工具资源用于9月open筛选。请精确报告9月内到期且open的数量。",
-          "换一种问法：feishu-table 工具资源用于9月open筛选。请分页读取完成后统计。",
-          "再换一种问法：feishu-table 工具资源用于9月open筛选。请返回共多少条和标题示例，不暴露隐藏oracle ID。"
+          "助理场景：feishu-table 工具资源用于9月open筛选。请只读分页资源，精确报告9月内到期且open的数量。",
+          "换一种问法：feishu-table 工具资源用于9月open筛选。请分页读取完成后统计9月内到期且open的数量，不写入业务记录。",
+          "再换一种问法：feishu-table 工具资源用于9月open筛选。请读完分页后返回共多少条和标题示例，不暴露内部记录ID。"
         ],
         "fixtureRefs": [
           "feishu-table"

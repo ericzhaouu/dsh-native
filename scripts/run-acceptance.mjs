@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 import { mkdir, open, writeFile } from "node:fs/promises";
-import { basename, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { createHash } from "node:crypto";
+import { basename, dirname, join, resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   assertAbsoluteAdapter,
   budgetFields,
@@ -18,9 +19,11 @@ import {
   zeroUsage,
 } from "./lib/acceptance-contract.mjs";
 import { buildReport, evaluateRun } from "./lib/acceptance-evaluator.mjs";
+import { loadAcceptanceResources } from "./lib/acceptance-resources.mjs";
+import { evaluateCorpusEvidence, loadCorpusOracles } from "./lib/acceptance-oracles.mjs";
 
 function usage() {
-  return "Usage: node scripts\\run-acceptance.mjs --manifest <file> --run-root <absolute-dir> [--dry-run] [--execute --adapter <absolute-module>] [--live --scope <private-scope.json> --trusted-capable-adapter]";
+  return "Usage: node scripts\\run-acceptance.mjs --manifest <file> --run-root <absolute-dir> [--dry-run] [--execute --adapter <absolute-module>] [--live --scope <private-scope.json> --trusted-capable-adapter] [--oracles <file> --reviewer <absolute-module>]";
 }
 
 function parseArgs(argv) {
@@ -31,6 +34,8 @@ function parseArgs(argv) {
     else if (arg === "--run-root") args.runRoot = argv[++index];
     else if (arg === "--adapter") args.adapter = argv[++index];
     else if (arg === "--scope") args.scope = argv[++index];
+    else if (arg === "--oracles") args.oracles = argv[++index];
+    else if (arg === "--reviewer") args.reviewer = argv[++index];
     else if (arg === "--execute") { args.execute = true; args.dryRun = false; }
     else if (arg === "--dry-run") { args.dryRun = true; args.execute = false; }
     else if (arg === "--live") args.live = true;
@@ -42,6 +47,10 @@ function parseArgs(argv) {
   if (!args.manifest) throw new TypeError(`--manifest is required\n${usage()}`);
   args.runRoot = ensureAbsoluteRunRoot(args.runRoot);
   if (args.execute) args.adapter = assertAbsoluteAdapter(args.adapter);
+  if (args.reviewer) {
+    args.reviewer = assertAbsoluteAdapter(args.reviewer);
+    if (args.reviewer === args.adapter) throw new TypeError("Independent reviewer must not be the execution adapter");
+  }
   return args;
 }
 
@@ -55,6 +64,10 @@ function summarizeEvidence(evidence) {
   if (!evidence) return evidence;
   const clone = structuredClone(evidence);
   if (clone.outputText) clone.outputText = `[omitted ${clone.outputText.length} chars]`;
+  if (clone.turns) clone.turns = clone.turns.map(({ outputText, tools, prompt, ...turn }) => ({
+    ...turn, outputCharacters: outputText?.length ?? 0,
+    tools: tools?.map(({ name, isError }) => ({ name, isError })),
+  }));
   return clone;
 }
 
@@ -137,6 +150,24 @@ function validateScope(scope, manifest) {
   if (!finiteUsageCaps(scope.budgets)) errors.push("live scope must contain hard finite budgets for all usage dimensions");
   if (scope.budgets?.priced === true && (!Number.isSafeInteger(scope.budgets.currencyMicros) || scope.budgets.currencyMicros < 0)) errors.push("priced live scope requires non-negative currencyMicros");
   if (scope.budgets?.priced !== true && scope.budgets?.priced !== false) errors.push("live scope budgets must explicitly declare priced");
+  if (scope.reviewResources !== undefined) {
+    for (const [name, profiles] of Object.entries(scope.reviewResources ?? {})) {
+      if (name !== "private-feishu-canary-map" || !profiles || typeof profiles !== "object" || Array.isArray(profiles)) {
+        errors.push("unsupported private review resource");
+        continue;
+      }
+      for (const [profile, resource] of Object.entries(profiles)) {
+        const allowed = ["scope", "chatId", "botAppId", "botMemberId", "creatorMemberId"];
+        if (!scope.permittedAgentProfiles?.includes(profile) || !resource || typeof resource !== "object" ||
+            Object.keys(resource).some((key) => !allowed.includes(key)) ||
+            resource.scope !== "dedicated-synthetic-feishu-chat" ||
+            allowed.filter((key) => key !== "scope").some((key) =>
+              typeof resource[key] !== "string" || !/^[A-Za-z0-9_-]{1,200}$/.test(resource[key]))) {
+          errors.push("invalid or excessive private review resource fields");
+        }
+      }
+    }
+  }
   return { errors, scope };
 }
 
@@ -223,6 +254,15 @@ async function executeCase(adapter, testCase, context, tracker) {
     uncertain: uncertain || !!budgetError || !!cleanupError || cleanup?.cleaned !== true };
 }
 
+async function importReviewer(path) {
+  const module = await import(pathToFileURL(path).href);
+  const factory = module.createReviewer ?? module.default;
+  if (typeof factory !== "function") throw new TypeError("Reviewer must export createReviewer()");
+  const reviewer = await factory();
+  if (typeof reviewer?.reviewCase !== "function") throw new TypeError("Reviewer must implement reviewCase()");
+  return reviewer;
+}
+
 export async function runAcceptance(argv = process.argv.slice(2)) {
   const args = parseArgs(argv);
   const { manifest, manifestPath, manifestSha256 } = await loadManifest(args.manifest);
@@ -241,6 +281,18 @@ export async function runAcceptance(argv = process.argv.slice(2)) {
   const evidenceById = new Map();
   const cleanupReceipts = [];
   let stopReason;
+  let adapter;
+  let reviewer;
+  const closed = new Set();
+  const closeClients = async () => {
+    const failures = [];
+    for (const instance of [reviewer, adapter]) {
+      if (!instance?.close || closed.has(instance)) continue;
+      closed.add(instance);
+      try { await instance.close(); } catch (error) { failures.push(error); }
+    }
+    return failures;
+  };
   const manifestInfo = { suiteId: manifest.suiteId, stage: manifest.stage, manifestSha256 };
   try {
     await appendTrace(trace, { event: "run_started", runId, manifestPath: basename(manifestPath), manifestSha256, dryRun: args.dryRun, executionKind: args.dryRun ? "dry-run" : manifest.stage ?? "offline" });
@@ -263,13 +315,27 @@ export async function runAcceptance(argv = process.argv.slice(2)) {
       if (scopeCheck.errors.length) stopReason = scopeCheck.errors.join("; ");
       else scope = rawScope;
     }
-    let adapter;
+    let corpusOracles;
+    if (manifest.corpusOracle) {
+      try {
+        corpusOracles = await loadCorpusOracles(args.oracles ?? join(dirname(manifestPath), "oracles.json"), manifest);
+        if (!args.reviewer || scope?.trustedIndependentReviewer !== true) {
+          throw new Error("Compiled corpus requires a separately authorized independent reviewer");
+        }
+        if (!finiteUsageCaps(scope.reviewBudgets) || validateUsageShape(scope.reviewBudgets).length) {
+          throw new Error("Independent review requires finite, explicitly priced/unpriced reviewBudgets");
+        }
+      } catch (error) { stopReason ??= `oracle preflight failed: ${error.message}`; }
+    } else if (args.oracles || args.reviewer) {
+      stopReason ??= "Oracle review requires a manifest-bound corpusOracle sidecar";
+    }
     const globalCaps = Object.fromEntries(budgetFields.map((field) => [field,
       Math.min(manifest.limits?.[field] ?? Number.MAX_SAFE_INTEGER,
         scope?.budgets?.[field] ?? Number.MAX_SAFE_INTEGER)]));
     const costCaps = [manifest.limits?.currencyMicros, scope?.budgets?.currencyMicros].filter(Number.isSafeInteger);
     if (costCaps.length) { globalCaps.priced = true; globalCaps.currencyMicros = Math.min(...costCaps); }
     let globalUsed = { ...zeroUsage(), priced: false };
+    let reviewUsed = { ...zeroUsage(), priced: false };
     for (const testCase of manifest.cases) {
       if (stopReason) {
         evidenceById.set(testCase.id, blockEvidence(`not executed after stop: ${stopReason}`, { liveUnknown: stageOf(manifest, testCase) === "live", unknownEffects: true }));
@@ -279,6 +345,17 @@ export async function runAcceptance(argv = process.argv.slice(2)) {
       if (preflight) {
         evidenceById.set(testCase.id, preflight);
         await appendTrace(trace, { event: "case_preflight_blocked", caseId: testCase.id, reason: preflight.policyFacts.blockedReason });
+        continue;
+      }
+      let resources;
+      try {
+        if (testCase.fixtures?.names?.length) resources = await loadAcceptanceResources(scope, {
+          agentProfile: testCase.agentProfile, fixtureNames: testCase.fixtures.names, runId,
+        });
+      } catch (error) {
+        evidenceById.set(testCase.id, blockEvidence(`resource binding failed: ${error.message}`,
+          { liveUnknown: stageOf(manifest, testCase) === "live", prerequisites: scope?.prerequisites }));
+        await appendTrace(trace, { event: "case_resource_blocked", caseId: testCase.id, reason: error.message });
         continue;
       }
       const tracker = makeBudgetTracker(testCase, globalCaps, globalUsed);
@@ -299,7 +376,11 @@ export async function runAcceptance(argv = process.argv.slice(2)) {
         }
       }
       await appendTrace(trace, { event: "case_started", caseId: testCase.id, agentProfile: testCase.agentProfile });
-      const result = await executeCase(adapter, testCase, { runId, runDir, manifestInfo, fixtureEvidence: testCase.fixtures?.evidence }, tracker);
+      const result = await executeCase(adapter, testCase, {
+        runId, runDir, manifestInfo, resources, fixtureEvidence: testCase.fixtures?.evidence,
+      }, tracker);
+      result.evidence.prerequisites = Object.fromEntries((testCase.prerequisites ?? [])
+        .map((name) => [name, scope?.prerequisites?.[name] === true]));
       const reconcileErrors = result.evidence?.usage ? tracker.reconcile(result.evidence.usage) : (stageOf(manifest, testCase) === "live" ? ["missing live usage"] : []);
       if (reconcileErrors.length) {
         result.evidence = { ...result.evidence, executionStatus: "infrastructure_blocked", businessResult: "failed", policyFacts: { ...(result.evidence.policyFacts ?? {}), budgetError: reconcileErrors.join("; ") }, unknownEffects: true };
@@ -308,19 +389,97 @@ export async function runAcceptance(argv = process.argv.slice(2)) {
         globalUsed = addUsage(globalUsed, result.evidence.usage);
       }
       if (result.uncertain) stopReason ??= result.error?.message ?? result.evidence?.cleanup?.error ?? "uncertain execution or cleanup state";
+      if (corpusOracles && !result.uncertain && !reconcileErrors.length &&
+          result.evidence.executionStatus !== "infrastructure_blocked") {
+        let measured = { ...zeroUsage(), priced: false };
+        let reviewAccounted = false;
+        try {
+          if (scope.reviewBudgets.modelRequests - reviewUsed.modelRequests < 1) {
+            throw new Error("No independent review model request budget remains");
+          }
+          reviewer ??= await importReviewer(args.reviewer);
+          const controller = new AbortController();
+          const reviewBudget = scope.reviewBudgets;
+          const review = await withTimeout(Promise.resolve().then(() => reviewer.reviewCase({
+            testCase: structuredClone(testCase),
+            oracleCase: structuredClone(corpusOracles.cases[testCase.id]),
+            fixtureGroundTruth: Object.fromEntries((corpusOracles.cases[testCase.id].fixtureRefs ?? [])
+              .filter((name) => Object.hasOwn(corpusOracles.fixtures ?? {}, name))
+              .map((name) => [name, structuredClone(corpusOracles.fixtures[name])])),
+            authorizationGroundTruth: {
+              prerequisites: structuredClone(result.evidence.prerequisites),
+              resources: Object.fromEntries((corpusOracles.cases[testCase.id].fixtureRefs ?? [])
+                .filter((name) => scope.reviewResources?.[name]?.[testCase.agentProfile])
+                .map((name) => [name, structuredClone(scope.reviewResources[name][testCase.agentProfile])])),
+            },
+            evidence: structuredClone(result.evidence),
+            resources: structuredClone(resources),
+          }, {
+            runId, runDir, signal: controller.signal,
+            async recordReviewCompletion(receipt) {
+              const filename = `review-${createHash("sha256").update(testCase.id).digest("hex")}.private.json`;
+              await writeFile(join(runDir, filename), `${JSON.stringify(redact(receipt), null, 2)}\n`,
+                { flag: "wx", mode: 0o600 });
+            },
+            reportUsage(delta) {
+              const errors = validateUsageShape(delta, { requirePricing: false });
+              const next = addUsage(measured, delta);
+              errors.push(...usageExceeds(addUsage(reviewUsed, next), reviewBudget));
+              if (errors.length) { controller.abort(new Error(errors.join("; "))); throw controller.signal.reason; }
+              measured = next;
+            },
+          })), Math.min(120000, testCase.limits.timeoutMs), controller, `${testCase.id}:independent-review`);
+          controller.signal.throwIfAborted();
+          const reviewErrors = validateUsageShape(review?.usage);
+          for (const field of budgetFields) {
+            if ((review?.usage?.[field] ?? -1) < measured[field]) reviewErrors.push(`review usage.${field} underreported`);
+          }
+          reviewErrors.push(...usageExceeds(addUsage(reviewUsed, review?.usage ?? zeroUsage()), reviewBudget));
+          if (reviewErrors.length) throw new Error(reviewErrors.join("; "));
+          reviewUsed = addUsage(reviewUsed, review.usage);
+          reviewAccounted = true;
+          const grading = evaluateCorpusEvidence({
+            testCase, oracleCase: corpusOracles.cases[testCase.id],
+            evidence: result.evidence, semanticReview: review,
+          });
+          result.evidence = {
+            ...result.evidence, corpusGrading: grading,
+            policyFacts: { ...result.evidence.policyFacts, ...grading.policyFacts },
+            businessResult: grading.status === "passed" ? testCase.expected.businessResult : "failed",
+            ...(grading.status === "blocked" ? { executionStatus: "infrastructure_blocked" } : {}),
+          };
+          await appendTrace(trace, { event: "independent_review", caseId: testCase.id, grading, usage: review.usage });
+        } catch (error) {
+          if (!reviewAccounted) reviewUsed = addUsage(reviewUsed, measured);
+          stopReason ??= `independent review failed: ${error.message}`;
+          result.evidence = { ...result.evidence, executionStatus: "infrastructure_blocked", businessResult: "failed",
+            policyFacts: { ...result.evidence.policyFacts, independentOracleEvaluated: false, blockedReason: stopReason } };
+        }
+      }
       evidenceById.set(testCase.id, result.evidence);
       cleanupReceipts.push({ caseId: testCase.id, receipt: result.evidence.cleanup });
       await appendTrace(trace, { event: "case_evidence", caseId: testCase.id, evidence: summarizeEvidence(result.evidence) });
     }
+    const closeFailures = await closeClients();
     const report = evaluateRun(manifest, evidenceById, { runId, dryRun: false, manifestSha256, executionKind: manifest.stage ?? "offline" });
+    if (closeFailures.length) {
+      report.connectionCleanupErrors = closeFailures.map((error) => error.message);
+      report.gates.connectionCleanup = "failed";
+      report.passed = false;
+    }
     report.cleanupReceipts = cleanupReceipts;
+    if (corpusOracles) report.independentReviewUsage = reviewUsed;
     report.limitations = ["trusted JavaScript adapters can ignore AbortSignal; non-cooperative adapters are marked unknown and stop the campaign, but CPU-bound isolation requires a separate process adapter."];
     if (stopReason) report.stopReason = stopReason;
     await writeFile(reportPath, `${JSON.stringify(redact(report), null, 2)}\n`, { flag: "wx" });
     await hardenPrivatePath(reportPath, false);
     await appendTrace(trace, { event: "run_completed", passed: report.passed, stopReason });
     return { code: report.passed ? 0 : 1, reportPath, tracePath, report };
-  } finally { await trace.close(); }
+  } finally {
+    const failures = await closeClients();
+    await trace.close();
+    if (failures.length) throw new AggregateError(failures, "Acceptance connection cleanup failed");
+  }
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])) {

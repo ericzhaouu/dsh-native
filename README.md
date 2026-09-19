@@ -638,7 +638,15 @@ npm.cmd run acceptance:dry-run -- --manifest "$PlanRoot\manifest.json" --run-roo
 
 预演只验证格式并输出 `planned`、`passed: false`，不调用模型、不连接飞书。`acceptance:evaluate -- --report <report.json>` 会拒绝把预演当验收证据。`local-fixture-adapter.mjs` 只用于评分器自测，不能作为真实 Agent 成功证明。
 
-真实执行没有内置生产适配器，必须显式使用 `--execute --live --trusted-capable-adapter --adapter <绝对模块路径> --scope <私有授权文件>`，并提供测试账号／资源映射、所有预算字段和前置条件。适配器须独立验证 oracle、持续报告实际用量、支持取消并返回清理回执；未满足条件即阻断。预算同时受用例、整批和私有授权上限约束；未计价必须标记为 `unpriced`。适配器是受信任本机代码，JavaScript 信号不是操作系统沙箱。
+真实执行必须显式使用 `--execute --live --trusted-capable-adapter --adapter <绝对模块路径> --scope <私有授权文件>`。源码中的 `gateway-acceptance-adapter.mjs` 验证真实 Gateway 最终帧、规范转录、当前原生 epoch、工具回执与用量，不能用历史正文伪造实时送达，也不能代替飞书平台回执。生产配置、SDK 路径、逻辑 Agent 映射通过私有 `DSH_ACCEPTANCE_GATEWAY_CONFIG` 指定，不自动发现或复制账号凭据。
+
+全量负向语料应使用 `isolation:"agent-policy-read-only"` 的专用 `dsh-acceptance-*` 测试 Agent：宿主级工具清单仅允许 `read/grep/glob/find/ls`，文件工具限制为工作区内。0.7.1 仍拒绝会话级权限覆盖；不能删除这条限制或在现有业务 Agent 上仅靠“不要写入”的提示词运行负向语料。隔离角色的结果须明确标注，不能冒充原有 Agent 的个性化／业务集成验收。
+
+编译结果以 SHA-256 绑定独立 `oracles.json`；隐藏评分标准、夹具真值不传给被测模型。编译语料还要求 `--reviewer <绝对模块路径>`、私有授权中的 `trustedIndependentReviewer:true` 与独立 `reviewBudgets`。`gateway-corpus-reviewer.mjs` 经宿主公开的模型／认证准备与 **零工具独立补全**评分，配置由 `DSH_ACCEPTANCE_REVIEW_GATEWAY_CONFIG` 指定；评审进程必须显式设置相同的 `OPENCLAW_STATE_DIR`／`OPENCLAW_CONFIG_PATH`。评分逐条覆盖断言并绑定观察证据哈希；被测执行器自行返回的“全部通过”布尔值不能替代评分。评审模型本身不是事实正确性的保证，应保留原始回执供人工复核。
+
+私有资源映射只提供当前 Agent、当前用例选择的地址或明确可见数据；不得把 oracle／标准答案放入被测输入。`modelVisibleRequiredTokens` 是语料的**提示词覆盖锚点**，不是要求答案照抄的词。缺失真实重复投递／重连控制回执必须记为阻塞，不能用平台发送幂等键替代适配器重复事件验收。
+
+执行与评分预算分别受私有授权约束；未计价必须标记为 `unpriced`。取消、未确认副作用、清理失败或不完整评分均不能算通过。适配器是受信任本机代码，JavaScript 信号和逻辑工具清单都不是操作系统沙箱。
 
 报告分别记录执行、业务结果、权限、Skill 加载／遵循、交付和耗时。零副作用等关键门槛不能由总体 95% 成功率抵消；样本少于 20 时不宣称测得可靠的 p95。事实、引用和方法质量需要实际工具记录及独立评分，不能仅凭模型自称完成。
 

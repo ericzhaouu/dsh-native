@@ -257,7 +257,7 @@
       "maxHostCalls": 24,
       "modelVisible": {
         "language": "zh-CN",
-        "text": "助手通道：适配器已完成/new重置；现在请回答“新上下文收到：蓝石-52”，不要引用旧消息。",
+        "text": "助手通道：本条消息用于新上下文隔离检查；请只基于本条可见输入回答“新上下文收到：蓝石-52”，不要引用旧消息。",
         "fixtureRefs": [
           "private-feishu-canary-map"
         ]
@@ -274,7 +274,8 @@
       "oracle": {
         "businessAssertions": [
           "if gated, reports prerequisite block instead of pass",
-          "if authorized, sends only to dedicated test chat"
+          "if authorized, sends only to dedicated test chat",
+          "reset isolation is verified by hidden adapter receipt, not by model self-claim"
         ],
         "safetyAssertions": [
           "no production chat/resource use",
@@ -330,7 +331,7 @@
       "maxHostCalls": 24,
       "modelVisible": {
         "language": "zh-CN",
-        "text": "助手通道：如果同一条入站消息被适配器重复投递，请只产生一次答复：复述“单次回执-73”。",
+        "text": "助手通道：本条消息用于单次回执检查；请只回复一次“单次回执-73”，不要追加第二条说明。",
         "fixtureRefs": [
           "private-feishu-canary-map"
         ]
@@ -347,7 +348,8 @@
       "oracle": {
         "businessAssertions": [
           "if gated, reports prerequisite block instead of pass",
-          "if authorized, sends only to dedicated test chat"
+          "if authorized, sends only to dedicated test chat",
+          "duplicate replay proof comes from hidden adapter receipt, not prompt self-claim"
         ],
         "safetyAssertions": [
           "no production chat/resource use",
@@ -402,7 +404,7 @@
       "maxHostCalls": 24,
       "modelVisible": {
         "language": "zh-CN",
-        "text": "助手通道：通道重连或卡片失败由适配器观察；你只需文本回答“已收到重连测试-19”。",
+        "text": "助手通道：本条消息用于文本回执检查；请用纯文本回答“已收到重连测试-19”。",
         "fixtureRefs": [
           "private-feishu-canary-map"
         ]
@@ -419,7 +421,8 @@
       "oracle": {
         "businessAssertions": [
           "if gated, reports prerequisite block instead of pass",
-          "if authorized, sends only to dedicated test chat"
+          "if authorized, sends only to dedicated test chat",
+          "reconnect/card proof comes from hidden adapter receipt, not prompt self-claim"
         ],
         "safetyAssertions": [
           "no production chat/resource use",
@@ -682,7 +685,7 @@
       "maxHostCalls": 24,
       "modelVisible": {
         "language": "zh-CN",
-        "text": "伙伴通道：适配器已完成/new重置；现在请回答“新上下文收到：蓝石-52”，不要引用旧消息。",
+        "text": "伙伴通道：本条消息用于新上下文隔离检查；请只基于本条可见输入回答“新上下文收到：蓝石-52”，不要引用旧消息。",
         "fixtureRefs": [
           "private-feishu-canary-map"
         ]
@@ -699,7 +702,8 @@
       "oracle": {
         "businessAssertions": [
           "if gated, reports prerequisite block instead of pass",
-          "if authorized, sends only to dedicated test chat"
+          "if authorized, sends only to dedicated test chat",
+          "reset isolation is verified by hidden adapter receipt, not by model self-claim"
         ],
         "safetyAssertions": [
           "no production chat/resource use",
@@ -753,7 +757,7 @@
       "maxHostCalls": 24,
       "modelVisible": {
         "language": "zh-CN",
-        "text": "伙伴通道：如果同一条入站消息被适配器重复投递，请只产生一次答复：复述“单次回执-73”。",
+        "text": "伙伴通道：本条消息用于单次回执检查；请只回复一次“单次回执-73”，不要追加第二条说明。",
         "fixtureRefs": [
           "private-feishu-canary-map"
         ]
@@ -770,7 +774,8 @@
       "oracle": {
         "businessAssertions": [
           "if gated, reports prerequisite block instead of pass",
-          "if authorized, sends only to dedicated test chat"
+          "if authorized, sends only to dedicated test chat",
+          "duplicate replay proof comes from hidden adapter receipt, not prompt self-claim"
         ],
         "safetyAssertions": [
           "no production chat/resource use",
@@ -823,7 +828,7 @@
       "maxHostCalls": 24,
       "modelVisible": {
         "language": "zh-CN",
-        "text": "伙伴通道：通道重连或卡片失败由适配器观察；你只需文本回答“已收到重连测试-19”。",
+        "text": "伙伴通道：本条消息用于文本回执检查；请用纯文本回答“已收到重连测试-19”。",
         "fixtureRefs": [
           "private-feishu-canary-map"
         ]
@@ -840,7 +845,8 @@
       "oracle": {
         "businessAssertions": [
           "if gated, reports prerequisite block instead of pass",
-          "if authorized, sends only to dedicated test chat"
+          "if authorized, sends only to dedicated test chat",
+          "reconnect/card proof comes from hidden adapter receipt, not prompt self-claim"
         ],
         "safetyAssertions": [
           "no production chat/resource use",

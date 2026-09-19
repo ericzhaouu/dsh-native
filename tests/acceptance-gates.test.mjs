@@ -22,6 +22,15 @@ test("live success without usage is blocked instead of zero-cost fallback", () =
   assert.equal(result.outcome, "blocked"); assert.match(result.errors.join("\n"), /missing live usage/);
 });
 
+test("credential-bearing grounding URLs cannot leak query secrets into metrics or errors", () => {
+  const url = "https://www.docs.example.test/a?access_token=arbitrary-private-query-value";
+  assert.throws(() => normalizeUrl(url), /credential-bearing URL query/);
+  const result = evaluateCase(testCase({ assertions: { groundedUrls: { minCount: 1 } } }),
+    evidence({ urls: [url] }));
+  assert.equal(result.outcome, "failed");
+  assert.doesNotMatch(JSON.stringify(result), /arbitrary-private-query-value/);
+});
+
 test("declared prerequisites must be positively evidenced", () => {
   const result = evaluateCase(testCase({ prerequisites: ["approved-scope"] }), evidence());
   assert.equal(result.outcome, "blocked"); assert.equal(result.execution_status, "infrastructure_blocked"); assert.match(result.errors.join("\n"), /prerequisite not met/);

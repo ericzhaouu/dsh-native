@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { compileManifestValidator, ensureAbsoluteRunRoot, ensureSafeRunRoot } from "./lib/acceptance-contract.mjs";
 
 const corpusRoot = new URL("../tests/acceptance/cases/", import.meta.url);
+const fixtureRoot = new URL("../tests/fixtures/acceptance/", import.meta.url);
 const CORPUS_VERSION = "approved1.0testplan.acceptanceCorpus.v1";
 const modes = new Set(["chat", "clarify", "draft", "execute"]);
 
@@ -49,7 +50,7 @@ export async function compileCorpus({ subset = "all" } = {}) {
     },
     cases: [],
   };
-  const oracles = { version: 1, suiteId: manifest.suiteId, corpusHashes: {}, cases: {} };
+  const oracles = { version: 1, suiteId: manifest.suiteId, corpusHashes: {}, fixtureHashes: {}, fixtures: {}, cases: {} };
   let submissions = 0;
   function add(item, id, prompt, turns, script) {
     const expected = script ? script.turns.at(-1).expected : item.expected;
@@ -72,6 +73,7 @@ export async function compileCorpus({ subset = "all" } = {}) {
       ...(approvedModes.length === 1 ? { mode: approvedModes[0] } : {}),
       prerequisites: required,
       fixtures: { names: fixtureNames },
+      ...(item.adapterControls?.length ? { adapterControls: item.adapterControls } : {}),
       expected: {
         executionStatus,
         businessResult: executionStatus === "correctly_blocked" ? "not_applicable" : "passed",
@@ -114,6 +116,20 @@ export async function compileCorpus({ subset = "all" } = {}) {
       }
     }
   }
+  for (const name of new Set(manifest.cases.flatMap((item) => item.fixtures.names))) {
+    if (name === "private-feishu-canary-map") continue;
+    if (!["synthetic-article", "feishu-table", "golden-search", "scoped-file", "poisonous-sample-canaries"].includes(name)) {
+      throw new Error(`Unrecognized acceptance fixture ${name}`);
+    }
+    const filename = `${name}.${name === "synthetic-article" ? "txt" : "json"}`;
+    const bytes = await readFile(new URL(filename, fixtureRoot));
+    oracles.fixtureHashes[filename] = createHash("sha256").update(bytes).digest("hex");
+    oracles.fixtures[name] = filename.endsWith(".json") ? JSON.parse(bytes) : { body: bytes.toString("utf8") };
+  }
+  manifest.corpusOracle = {
+    sha256: createHash("sha256").update(`${JSON.stringify(oracles, null, 2)}\n`).digest("hex"),
+    caseCount: manifest.cases.length,
+  };
   const validate = await compileManifestValidator();
   if (!validate(manifest)) {
     throw new Error(`Compiled corpus is incompatible with runner schema: ${JSON.stringify(validate.errors)}`);

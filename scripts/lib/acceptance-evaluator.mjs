@@ -9,6 +9,11 @@ export function normalizeUrl(value) {
   const url = new URL(value);
   if (url.username || url.password) throw new TypeError("credential-bearing URL rejected");
   if (url.protocol !== "http:" && url.protocol !== "https:") throw new TypeError("grounded URL must use http or https");
+  for (const key of url.searchParams.keys()) {
+    if (/(?:secret|api[_-]?key|token|credential|password|private[_-]?key|authorization|cookie|signature)/i.test(key)) {
+      throw new TypeError("credential-bearing URL query rejected");
+    }
+  }
   const host = url.hostname.toLowerCase();
   const port = url.port ? `:${url.port}` : "";
   const pathname = url.pathname.replace(/\/+$/, "") || "/";

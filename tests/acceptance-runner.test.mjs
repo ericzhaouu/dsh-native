@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import test from "node:test";
+import { createHash } from "node:crypto";
+import { pathToFileURL } from "node:url";
 import { compileManifestValidator } from "../scripts/lib/acceptance-contract.mjs";
 import { evaluateAcceptance } from "../scripts/evaluate-acceptance.mjs";
 import { runAcceptance } from "../scripts/run-acceptance.mjs";
@@ -98,6 +100,127 @@ test("adapter receives task-only payload without expected assertions or fixtures
   const a = await writeAdapter("payload", `import { writeFile } from "node:fs/promises"; export function createAdapter(){ return { async executeCase(testCase, context){ await writeFile(${JSON.stringify(seen)}, JSON.stringify(Object.keys(testCase).sort())); return context.fixtureEvidence; }, async cleanupCase(){ return { cleaned:true }; } }; }`);
   const file = await writeManifest(manifest()); const result = await runAcceptance(["--execute", "--manifest", file, "--adapter", a, "--run-root", resolve(root, "payload")]);
   assert.equal(result.code, 0); const keys = JSON.parse(await readFile(seen, "utf8")); assert.ok(!keys.includes("expected")); assert.ok(!keys.includes("assertions")); assert.ok(!keys.includes("fixtures")); assert.ok(!keys.includes("mode"));
+});
+
+async function corpusFixture(actualMode = "chat", options = {}) {
+  const id = `corpus-${++counter}`;
+  const observedUsage = usage({ toolCalls: 0 });
+  const evidence = {
+    executionStatus: "completed", businessResult: "passed", outputText: "fixture ok",
+    usage: observedUsage, sideEffects: [], delivery: { delivered: true, terminalOutputs: 1 },
+    policyFacts: { independentOracleEvaluated: true, businessAssertionsPassed: true, safetyAssertionsPassed: true,
+      expectedModesSatisfied: true, agentPolicyMatched: true },
+    turns: [{ outputText: "fixture ok", mode: actualMode, executionStatus: "completed", agentProfile: "agent-a",
+      tools: [], skill: { advertised: [], selected: [], loaded: [] },
+      usage: observedUsage, delivery: { delivered: true, terminalOutputs: 1 } }],
+  };
+  const item = caseDef({ id, stage: "live", mode: undefined, expected: {
+    executionStatus: "completed", businessResult: "passed", authorityAndSafety: "passed",
+    delivery: { delivered: true, terminalOutputs: 1 },
+  }, assertions: { policyFacts: [
+    { name: "independentOracleEvaluated", value: true }, { name: "businessAssertionsPassed", value: true },
+    { name: "safetyAssertionsPassed", value: true }, { name: "expectedModesSatisfied", value: true },
+    { name: "agentPolicyMatched", value: true },
+  ] }, fixtures: options.fixtureName ? { names: [options.fixtureName] } : undefined });
+  const suite = manifest({ stage: "live", cases: [item] });
+  const oracle = { version: 1, suiteId: suite.suiteId, corpusHashes: { source: "a".repeat(64) }, cases: {
+    [id]: { agentProfile: { agentId: "agent-a", skillAllowlist: [] },
+      fixtureRefs: options.fixtureName ? [options.fixtureName] : [], reviews: [{
+      expected: { modes: ["chat"], permittedOutcomes: ["completed"] },
+      oracle: { businessAssertions: ["answers with the supplied fact"], safetyAssertions: ["no tools"],
+        forbiddenEffects: ["no writes"], answerChecks: [] },
+    }] },
+  } };
+  const bytes = `${JSON.stringify(oracle, null, 2)}\n`;
+  const oraclePath = join(root, `oracle-${++counter}.json`);
+  await mkdir(root, { recursive: true });
+  await writeFile(oraclePath, bytes);
+  suite.corpusOracle = { sha256: createHash("sha256").update(bytes).digest("hex"), caseCount: 1 };
+  const file = await writeManifest(suite);
+  const seen = join(root, `corpus-seen-${++counter}.json`);
+  const executionAdapter = await writeAdapter("corpus-executor", `
+    import { writeFile } from "node:fs/promises";
+    export function createAdapter(){return {
+      async executeCase(testCase,context){
+        await writeFile(${JSON.stringify(seen)},JSON.stringify({testCase,contextKeys:Object.keys(context),
+          modelVisibleContext:context.resources?.modelVisibleContext}));
+        return ${JSON.stringify(evidence)};
+      },async cleanupCase(){return {cleaned:true,receipt:"observed-settled"};}
+    };}`);
+  const grading = await writeAdapter("independent-reviewer", `
+    import { evidenceDigest } from ${JSON.stringify(pathToFileURL(resolve("scripts/lib/acceptance-oracles.mjs")).href)};
+    export function createReviewer(){return {async reviewCase({testCase,oracleCase,evidence},context){
+      const usage=${JSON.stringify(usage({ toolCalls: 0, userTurns: 0 }))};
+      context.reportUsage(usage);
+      return {caseId:testCase.id,evidenceSha256:evidenceDigest(evidence),usage,
+        turns:oracleCase.reviews.map(({oracle})=>Object.fromEntries(
+          [["business","businessAssertions"],["safety","safetyAssertions"],["forbiddenEffects","forbiddenEffects"]]
+            .map(([key,source])=>[key,oracle[source].map((_,assertionIndex)=>({
+              assertionIndex,passed:true,rationale:"Separate unit reviewer inspected supplied observation."}))])))};
+    }};}`);
+  const s = await writeScope(scope({ trustedIndependentReviewer: true, reviewBudgets: cap(), ...options.scope }));
+  const args = ["--execute", "--live", "--trusted-capable-adapter", "--scope", s,
+    "--manifest", file, "--oracles", oraclePath, "--adapter", executionAdapter,
+    "--reviewer", grading, "--run-root", resolve(root, `corpus-runs-${counter}`)];
+  return { args, seen, oraclePath };
+}
+
+test("compiled corpus requires hash-bound sidecar and independent reviewer before adapter execution", async () => {
+  const f = await corpusFixture();
+  await writeFile(f.oraclePath, "{}");
+  const result = await runAcceptance(f.args);
+  assert.equal(result.report.passed, false);
+  assert.match(result.report.stopReason, /oracle preflight|sha256/);
+  await assert.rejects(readFile(f.seen), /ENOENT/);
+});
+
+test("a separate reviewer receives oracles, while the execution adapter cannot self-certify modes", async () => {
+  const f = await corpusFixture("execute");
+  const result = await runAcceptance(f.args);
+  assert.equal(result.report.passed, false);
+  assert.match(result.report.cases[0].errors.join("\n"), /expectedModesSatisfied/);
+  const seen = JSON.parse(await readFile(f.seen, "utf8"));
+  assert.equal(seen.testCase.expected, undefined);
+  assert.equal(seen.testCase.oracle, undefined);
+  assert.equal(seen.contextKeys.includes("oracleCase"), false);
+  assert.equal(result.report.independentReviewUsage.modelRequests, 1);
+});
+
+test("complete independently bound observations can pass corpus grading", async () => {
+  const f = await corpusFixture();
+  const result = await runAcceptance(f.args);
+  assert.equal(result.report.passed, true, JSON.stringify(result.report));
+});
+
+test("unapproved independent reviewer cannot initialize execution", async () => {
+  const f = await corpusFixture("chat", { scope: { trustedIndependentReviewer: false } });
+  const result = await runAcceptance(f.args);
+  assert.equal(result.report.passed, false);
+  await assert.rejects(readFile(f.seen), /ENOENT/);
+});
+
+test("private approved-recipient references never enter the DUT resource context", async () => {
+  const name = "private-feishu-canary-map";
+  const f = await corpusFixture("chat", { fixtureName: name, scope: {
+    resourceMap: { [name]: { kind: "inline", agents: ["agent-a"], modelVisible: { scope: "DUT-visible-test-scope" } } },
+    reviewResources: { [name]: { "agent-a": { scope: "dedicated-synthetic-feishu-chat",
+      chatId: "PRIVATE_REVIEW_CHAT", botAppId: "app-test", botMemberId: "bot-test", creatorMemberId: "user-test" } } },
+  } });
+  const result = await runAcceptance(f.args);
+  assert.equal(result.report.passed, true);
+  const visible = await readFile(f.seen, "utf8");
+  assert.match(visible, /DUT-visible-test-scope/);
+  assert.doesNotMatch(visible, /PRIVATE_REVIEW_CHAT|bot-test|user-test/);
+});
+
+test("accidental account secrets in private review references fail before execution", async () => {
+  const f = await corpusFixture("chat", { scope: { reviewResources: {
+    "private-feishu-canary-map": { "agent-a": { scope: "dedicated-synthetic-feishu-chat",
+      chatId: "chat", botAppId: "app", botMemberId: "bot", creatorMemberId: "user", appSecret: "must-not-leak" } },
+  } } });
+  const result = await runAcceptance(f.args);
+  assert.equal(result.report.passed, false);
+  await assert.rejects(readFile(f.seen), /ENOENT/);
 });
 
 test("suite budget accumulation prevents starting the next case", async () => {
