@@ -1,6 +1,6 @@
 # DSH Native for OpenClaw
 
-**实验性版本 0.6.2**：把官方 DeepSeek Harness（DSH）的模型／工具循环接入 OpenClaw 的原生 `AgentHarnessV2`，并保留 OpenClaw 对模型、认证、工具授权与会话入口的控制。
+**实验性版本 0.6.3**：把官方 DeepSeek Harness（DSH）的模型／工具循环接入 OpenClaw 的原生 `AgentHarnessV2`，并保留 OpenClaw 对模型、认证、工具授权与会话入口的控制。
 
 - 源码仓库：[ericzhaouu/dsh-native](https://github.com/ericzhaouu/dsh-native)
 - 作者：[ericzhaouu](https://github.com/ericzhaouu)
@@ -48,6 +48,8 @@ OpenClaw 2026.9.2 的普通对话会准备 Copilot 账户专属端点和请求�
 
 0.6.2 将 provider 准备显式绑定到该次压缩持有的插件代际快照，避免队列回调使用不相关的环境作用域。若已经应用 0.6.1 的旧压缩补丁，先在停机窗口用**旧版补丁工具**执行 `--restore --offline-confirmed`，再用新版工具应用；未知的已修改宿主文件仍拒绝覆盖。
 
+**0.6.3 原生会话模型保持**：当所选 Harness 为 `dsh-native` 时，压缩使用当前会话模型，而不是 `agents.defaults.compaction.model` 的全局摘要模型。这是原生历史与严格路由绑定的要求，不会修改全局配置；其他 Harness 继续遵循原有模型覆盖。此版本使用独立 v2 回执 `.dsh-native-compaction-auth-patch-v2`，同时校验认证交接和压缩目标选择两个宿主文件。升级已应用的 0.6.1／0.6.2 补丁时，先用旧工具恢复旧补丁，再应用 v2；保留两套回滚材料。
+
 **仅更新插件不会自动修改宿主。** 下载／构建包后，在停止该安装的 Gateway 的维护窗口中执行，`C:\PATH\TO\prepared-dsh-native` 指解包后的 `package` 目录：
 
 ```powershell
@@ -55,7 +57,7 @@ node C:\PATH\TO\prepared-dsh-native\host-patch\compact-auth\apply.mjs --root C:\
 node C:\PATH\TO\prepared-dsh-native\host-patch\compact-auth\apply.mjs --root C:\PATH\TO\openclaw --apply --offline-confirmed
 ```
 
-需要撤销时，同样先停止 Gateway，使用 `--restore --offline-confirmed`。补丁要求精确的 2026.9.2 文件哈希；遇到其他版本或本地改动拒绝覆盖，不自行重启服务。备份与回执位于宿主 `.dsh-native-compaction-auth-patch`，与现有 `.dsh-agent-harness-patch` 独立；可分别检查和恢复。不要为消除冲突修改端点、删除绑定或绕过账号校验。源凭据本身变更仍需 `/new`，不会猜测两个凭据属于同一账号。
+需要撤销时，同样先停止 Gateway，使用 `--restore --offline-confirmed`。补丁要求精确的 2026.9.2 文件哈希；遇到其他版本或本地改动拒绝覆盖，不自行重启服务。压缩补丁回执与现有 `.dsh-agent-harness-patch` 独立；可分别检查和恢复。不要为消除冲突修改端点、删除绑定或绕过账号校验。源凭据本身变更仍需 `/new`，不会猜测两个凭据属于同一账号。
 
 ## 0.6.0 原生压缩与独立维护
 
@@ -277,7 +279,7 @@ node --version
 npm.cmd ci
 ```
 
-确认所用源码的 `package.json` 版本为 `0.6.2`。本项目把 OpenClaw 声明为 **optional peer**，避免在生产插件内部自动安装第二份宿主；开发／类型检查／真实 SDK 测试仍需要匹配的 SDK。
+确认所用源码的 `package.json` 版本为 `0.6.3`。本项目把 OpenClaw 声明为 **optional peer**，避免在生产插件内部自动安装第二份宿主；开发／类型检查／真实 SDK 测试仍需要匹配的 SDK。
 
 若开发目录尚未提供精确 SDK，先从 [OpenClaw 官方仓库](https://github.com/openclaw/openclaw)的发行流程取得并验证上述 **2026.9.2 官方制品**，然后本地安装：
 
@@ -291,7 +293,7 @@ npm.cmd pack
 
 `--check` 只检查，不会应用补丁。未修改的匹配制品应报告 `unpatched`。如果所用 registry 没有这个版本，应使用已核验的精确官方制品，**不要猜测可用的 npm 版本、改用最新预览版或伪造 SDK 类型**。无法取得匹配制品时，应停止需要该 SDK 的构建／集成验证。
 
-`npm pack` 的 `prepack` 会再次执行构建，生成本地 `openclaw-dsh-native-0.6.2.tgz`。不要把开发目录中的 OpenClaw SDK、账号或会话状态随插件复制出去。
+`npm pack` 的 `prepack` 会再次执行构建，生成本地 `openclaw-dsh-native-0.6.3.tgz`。不要把开发目录中的 OpenClaw SDK、账号或会话状态随插件复制出去。
 
 ## 维护窗口安装与 Agent 级启用
 
@@ -315,7 +317,7 @@ openclaw gateway status --no-probe
 仍保持 Gateway 停止：
 
 ```powershell
-openclaw plugins install "C:\PATH\TO\openclaw-dsh-native-0.6.2.tgz" --force --accept-capabilities
+openclaw plugins install "C:\PATH\TO\openclaw-dsh-native-0.6.3.tgz" --force --accept-capabilities
 ```
 
 `--force` 用于确认本地来源／覆盖安装；`--accept-capabilities` 是官方安装器对声明能力的接受选项，**仅用于已审阅并信任的代码**，不是规避安全策略。先阅读安装器说明和能力提示，不要无条件接受陌生代码。归档安装会处理运行依赖；已有 provider 及认证应留在 OpenClaw，不填入插件设置。
@@ -324,7 +326,7 @@ openclaw plugins install "C:\PATH\TO\openclaw-dsh-native-0.6.2.tgz" --force --ac
 
 ```powershell
 New-Item -ItemType Directory -Path .\artifacts\prepared-dsh-native
-tar -xf .\openclaw-dsh-native-0.6.2.tgz -C .\artifacts\prepared-dsh-native
+tar -xf .\openclaw-dsh-native-0.6.3.tgz -C .\artifacts\prepared-dsh-native
 Push-Location .\artifacts\prepared-dsh-native\package
 npm.cmd ci --omit=dev
 Pop-Location

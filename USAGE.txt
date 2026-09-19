@@ -1,4 +1,4 @@
-DSH NATIVE FOR OPENCLAW -- EXPERIMENTAL 0.6.2
+DSH NATIVE FOR OPENCLAW -- EXPERIMENTAL 0.6.3
 
 Source: https://github.com/ericzhaouu/dsh-native
 Author: https://github.com/ericzhaouu
@@ -163,7 +163,7 @@ PowerShell examples follow; C:\PATH\TO values are placeholders.
   node --version
   npm.cmd ci
 
-Confirm package.json version 0.6.2. OpenClaw is an optional peer to avoid
+Confirm package.json version 0.6.3. OpenClaw is an optional peer to avoid
 bundling a second production host. Development still needs the genuine SDK.
 If it is absent, obtain and verify the exact official 2026.9.2 artifact from
 the OpenClaw release workflow, then install it locally:
@@ -177,7 +177,7 @@ the OpenClaw release workflow, then install it locally:
 If the configured registry lacks that SDK, use the verified official artifact,
 not speculative npm versions, a newer preview or hand-written replacement SDK
 types. The check is read-only; it should report unpatched for the stock pinned
-artifact. npm pack runs prepack/build and creates openclaw-dsh-native-0.6.2.tgz.
+artifact. npm pack runs prepack/build and creates openclaw-dsh-native-0.6.3.tgz.
 Use npm.cmd if PowerShell blocks npm.ps1; do not change execution policy.
 
 PACKAGE ACCEPTANCE AND CI
@@ -231,7 +231,7 @@ Use the correct installation/profile and keep its supervisor from respawning it.
 
   openclaw gateway stop --force
   openclaw gateway status --no-probe
-  openclaw plugins install "C:\PATH\TO\openclaw-dsh-native-0.6.2.tgz" --force --accept-capabilities
+  openclaw plugins install "C:\PATH\TO\openclaw-dsh-native-0.6.3.tgz" --force --accept-capabilities
 
 The operator must verify shutdown; service status alone is not proof that all
 old processes/tools have exited. For gateway stop, --force confirms a
@@ -246,7 +246,7 @@ a host version or rewriting shared host dependencies. A prepared-directory
 installation is an alternative, still with Gateway stopped:
 
   New-Item -ItemType Directory -Path .\artifacts\prepared-dsh-native
-  tar -xf .\openclaw-dsh-native-0.6.2.tgz -C .\artifacts\prepared-dsh-native
+  tar -xf .\openclaw-dsh-native-0.6.3.tgz -C .\artifacts\prepared-dsh-native
   Push-Location .\artifacts\prepared-dsh-native\package
   npm.cmd ci --omit=dev
   Pop-Location
@@ -470,14 +470,21 @@ for provider preparation, instead of inheriting an unrelated command-queue scope
 If the 0.6.1 companion is already applied, stop the Gateway, restore it with the
 OLD companion tool, then apply the new companion. Unknown host edits stay blocked.
 
+Version 0.6.3 preserves the current conversation model when dsh-native owns native
+compaction, instead of substituting agents.defaults.compaction.model. No global
+configuration is changed; other harnesses keep their existing override behavior.
+Its v2 companion verifies two host files and uses the separate
+.dsh-native-compaction-auth-patch-v2 receipt. Restore any applied 0.6.1/0.6.2
+companion with its OLD tool before applying v2; retain both rollback copies.
+
 Updating the plugin does NOT automatically modify the host. With the target
 Gateway stopped, run from the unpacked package directory:
   node host-patch\compact-auth\apply.mjs --root C:\PATH\TO\openclaw --check
   node host-patch\compact-auth\apply.mjs --root C:\PATH\TO\openclaw --apply --offline-confirmed
 To undo, stop the Gateway and use --restore --offline-confirmed.
 Exact 2026.9.2 hashes are required; modified/unknown builds are rejected.
-The separate .dsh-native-compaction-auth-patch backup/receipt does not replace the
-existing .dsh-agent-harness-patch. Neither patch restarts the Gateway.
+The separate compaction backup/receipt does not replace the existing
+.dsh-agent-harness-patch. Neither patch restarts the Gateway.
 Without the companion, "DSH model route or account changed" remains possible.
 Never weaken the account guard or overwrite session bindings to avoid this error.
 Real-account repeated compaction remains a release gate, not a blanket 1.0 claim.

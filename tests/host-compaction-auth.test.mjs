@@ -28,7 +28,7 @@ async function fixture(t) {
 }
 
 async function loadCompactionAuthHelpers() {
-  const edit = edits[0];
+  const edit = edits.find((edit) => edit.file.includes("compaction-successor"));
   const original = await readFile(join(genuineHost, ...edit.file.split("/")), "utf8");
   const patched = transform(original, edit);
   const start = patched.indexOf("function runtimePlanRequiresHostApiKey");
@@ -157,8 +157,9 @@ test("compaction companion and the genuine installed Agent-pin patch can be rest
 });
 
 test("transformed compaction successor syntax is valid and anchors are exact", async () => {
-  const original = await readFile(join(genuineHost, ...edits[0].file.split("/")), "utf8");
-  const patched = transform(original, edits[0]);
+  const edit = edits.find((edit) => edit.file.includes("compaction-successor"));
+  const original = await readFile(join(genuineHost, ...edit.file.split("/")), "utf8");
+  const patched = transform(original, edit);
   assert.match(patched, /prepareDshNativeCopilotCompactionRuntimeAuth/);
   assert.match(patched, /apiKey: resolved\.auth\.apiKey/);
   assert.doesNotMatch(patched, /apiKey:\s*preparedAuth\.apiKey/);
@@ -166,6 +167,29 @@ test("transformed compaction successor syntax is valid and anchors are exact", a
   assert.equal(syntax.status, 0, syntax.stderr);
   assert.throws(() => replaceExactly("x x", "x", "y", "fixture"), /one patch anchor/);
   assert.throws(() => replaceExactly("x", "missing", "y", "fixture"), /one patch anchor/);
+});
+
+test("native DSH keeps its conversation model while other harnesses retain the configured summary-model override", async () => {
+  const edit = edits.find((edit) => edit.file.includes("attempt-prompt-helpers"));
+  const original = await readFile(join(genuineHost, ...edit.file.split("/")), "utf8");
+  const patched = transform(original, edit);
+  const extract = (source) => new Function("normalizeOptionalAgentRuntimeId", "isDefaultAgentRuntimeId",
+    "resolveSelectedOpenAIRuntimeProvider", `${source.slice(source.indexOf("function resolveEmbeddedCompactionTarget("),
+      source.indexOf("function normalizeCompactionConfigKey("))}\nreturn resolveEmbeddedCompactionTarget;`)(
+        (value) => value, (value) => ["auto", "default"].includes(value), ({ provider }) => provider);
+  const before = extract(original);
+  const after = extract(patched);
+  const params = {
+    provider: "github-copilot", modelId: "gpt-6-astra", authProfileId: "same-account",
+    harnessRuntime: "dsh-native",
+    config: { agents: { defaults: { compaction: { model: "github-copilot/gpt-5.6-sol" } } } },
+  };
+  assert.equal(before(params).model, "gpt-5.6-sol", "Reproduce the production model substitution");
+  assert.equal(after(params).model, "gpt-6-astra");
+  assert.equal(after(params).authProfileId, "same-account");
+  assert.equal(after({ ...params, harnessRuntime: "openclaw" }).model, "gpt-5.6-sol");
+  assert.equal(after({ ...params, harnessRuntime: "another-native" }).model, "gpt-5.6-sol");
+  assert.equal(after({ ...params, modelSelectionLocked: true }).model, "gpt-6-astra");
 });
 
 test("dsh-native Copilot compaction prepares runtime route without forwarding the derived key", async () => {

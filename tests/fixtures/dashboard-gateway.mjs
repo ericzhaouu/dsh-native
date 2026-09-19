@@ -297,8 +297,9 @@ export async function startDashboardGateway(responder, {
             api: "openai-responses",
             ...(copilotAuthProfile ? {} : { apiKey: copilotAuth ? HOST_COPILOT_AUTH_SOURCE_KEY : "dashboard-not-a-real-key" }),
             headers: { "Copilot-Integration-Id": "copilot-developer-cli" },
-            models: [{
-              id: MODEL_ID,
+            models: [...new Set([MODEL_ID, ...(copilotAuth && compaction?.model?.startsWith("github-copilot/")
+              ? [compaction.model.slice("github-copilot/".length)] : [])])].map((id) => ({
+              id,
               name: "Dashboard Local Copilot",
               reasoning: true,
               input: ["text"],
@@ -309,7 +310,7 @@ export async function startDashboardGateway(responder, {
                 supportsReasoningEffort: true,
                 supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max"],
               },
-            }],
+            })),
           },
         },
       },

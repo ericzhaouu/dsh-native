@@ -1,5 +1,5 @@
 OPENCLAW AGENT HARNESS PIN -- OPTIONAL EXPERIMENTAL HOST PATCH
-DSH Native 0.6.2 (Agent-pin patch specification unchanged from 0.3.0)
+DSH Native 0.6.3 (Agent-pin patch specification unchanged from 0.3.0)
 
 INDEPENDENT COPILOT COMPACTION COMPANION
 
@@ -14,13 +14,15 @@ Stop the target Gateway before writes:
   node host-patch\compact-auth\apply.mjs --root C:\PATH\TO\openclaw --restore --offline-confirmed
 
 Apply and restore are alternatives, not consecutive installation steps.
-The companion uses .dsh-native-compaction-auth-patch and exact file hashes.
+The 0.6.3 companion uses .dsh-native-compaction-auth-patch-v2 and exact file hashes.
 It leaves this Agent-pin patch's receipt and files untouched. Check both patches
 after upgrading OpenClaw; unsupported host builds fail closed.
 
 The 0.6.2 companion binds provider preparation to the captured plugin generation.
-When upgrading an applied 0.6.1 companion, restore with the OLD tool first,
-then apply the new tool in the same stopped-Gateway window.
+When upgrading an applied 0.6.1/0.6.2 companion, restore with the OLD tool first,
+then apply the new tool in the same stopped-Gateway window. Version 0.6.3 also
+keeps the native DSH conversation model instead of using a different global
+summary model. Other harnesses and the authored global configuration are unchanged.
 
 Project: https://github.com/ericzhaouu/dsh-native
 Author: https://github.com/ericzhaouu
@@ -65,7 +67,7 @@ Do not change global defaults, credentials or policies merely to select DSH.
 If the Agent has no model override, it inherits the normal default.
 
 The pin takes precedence over model/provider runtime selection, including
-fallback candidates. That DOES NOT add provider support. DSH Native 0.6.2
+fallback candidates. That DOES NOT add provider support. DSH Native 0.6.3
 supports only deepseek / openai-completions and github-copilot GPT /
 openai-responses. Unsupported pins fail with a typed error, not a substitute
 model or an escape to the built-in runtime.
@@ -120,7 +122,7 @@ MAINTENANCE: STOP BEFORE INSTALL / PATCH / CONFIGURATION
    Gateway after plugin/runtime changes. Do not write live config first.
 4. Install the reviewed plugin while Gateway remains stopped:
 
-     openclaw plugins install "C:\PATH\TO\openclaw-dsh-native-0.6.2.tgz" --force --accept-capabilities
+     openclaw plugins install "C:\PATH\TO\openclaw-dsh-native-0.6.3.tgz" --force --accept-capabilities
 
    --force confirms the local source/overwrite; official --accept-capabilities
    accepts declared capabilities of reviewed code, not a policy bypass.

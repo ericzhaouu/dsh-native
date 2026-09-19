@@ -1,7 +1,7 @@
-export const PATCH_ID = "openclaw-compaction-auth-gap-v1";
+export const PATCH_ID = "openclaw-compaction-auth-gap-v2";
 export const HOST_VERSION = "2026.9.2";
 export const SOURCE_COMMIT = "3928bad9badfcb6c7d140530435e806fb8092190";
-export const stateName = ".dsh-native-compaction-auth-patch";
+export const stateName = ".dsh-native-compaction-auth-patch-v2";
 
 const compactionRuntimeAuthHelpers = `
 function shouldPrepareDshNativeCopilotCompactionRuntimeAuth(params) {
@@ -52,6 +52,14 @@ async function prepareDshNativeCopilotCompactionRuntimeAuth(params) {
 `;
 
 export const edits = [
+  {
+    file: "dist/attempt-prompt-helpers-Cmig-B3c.js",
+    sha256: "1d77534f59cd057343a9ac33c51f64e202f7e28e4cc2795677b5a48ebdf349fc",
+    replacements: [{
+      before: '\tconst override = params.modelSelectionLocked ? void 0 : params.config?.agents?.defaults?.compaction?.model?.trim();',
+      after: '\tconst override = params.modelSelectionLocked || normalizeOptionalAgentRuntimeId(params.harnessRuntime) === "dsh-native" ? void 0 : params.config?.agents?.defaults?.compaction?.model?.trim();',
+    }],
+  },
   {
     file: "dist/compaction-successor-D1lvjYXj.js",
     sha256: "ec3b9144411691b0e66cf89fb75b3cb8bc4d4f9444d7350cea81bd2d22ae8ef1",

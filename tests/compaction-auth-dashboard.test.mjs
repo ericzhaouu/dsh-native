@@ -88,18 +88,21 @@ async function runTurn(gateway, sessionKey, message, answer, state) {
   return settled;
 }
 
-for (const { compactionAuthPatch, trigger, authProfile = false } of [
+for (const { compactionAuthPatch, trigger, authProfile = false, summaryOverride = false } of [
   { compactionAuthPatch: false, trigger: "manual" },
   { compactionAuthPatch: true, trigger: "manual" },
   { compactionAuthPatch: true, trigger: "preflight" },
   { compactionAuthPatch: true, trigger: "manual", authProfile: true },
+  { compactionAuthPatch: true, trigger: "manual", authProfile: true, summaryOverride: true },
+  { compactionAuthPatch: true, trigger: "preflight", authProfile: true, summaryOverride: true },
 ]) {
-test(`Copilot runtime-auth ${trigger} ${authProfile ? "profile" : "config"} handoff ${compactionAuthPatch ? "prepares the account route and preserves source identity" : "reproduces the unpatched compaction route rejection"}`,
+test(`Copilot runtime-auth ${trigger} ${authProfile ? "profile" : "config"} ${summaryOverride ? "global-summary-override" : "session-model"} handoff ${compactionAuthPatch ? "prepares the account route and preserves source identity" : "reproduces the unpatched compaction route rejection"}`,
   { timeout: TIMEOUT },
   async () => {
     const state = { summaryRequests: 0, foregroundRequests: 0, routes: [] };
     const gateway = await startDashboardGateway(async ({ body, text, finish, request }) => {
       state.routes.push(request.url);
+      assert.equal(body.model, "gpt-6-astra", "Native compaction must preserve the session model");
       assert.equal(request.url, "/account/responses", "DSH must call the prepared account endpoint, never the configured endpoint");
       assert.equal(request.headers.authorization, "Bearer fixture-source-key",
         "DSH must receive the raw source credential owned by the host harness");
@@ -140,7 +143,7 @@ test(`Copilot runtime-auth ${trigger} ${authProfile ? "profile" : "config"} hand
       compactionAuthPatch,
       modelContextWindow: 65536,
       hostTools: [],
-      compaction: { enabled: true },
+      compaction: { enabled: true, ...(summaryOverride ? { model: "github-copilot/gpt-5.6-sol" } : {}) },
     });
 
     try {
