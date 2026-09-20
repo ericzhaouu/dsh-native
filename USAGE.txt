@@ -1,4 +1,4 @@
-DSH NATIVE FOR OPENCLAW -- EXPERIMENTAL 0.7.1
+DSH NATIVE FOR OPENCLAW -- EXPERIMENTAL 0.7.2
 
 Source: https://github.com/ericzhaouu/dsh-native
 Author: https://github.com/ericzhaouu
@@ -7,6 +7,37 @@ Plugin / harness ID: dsh-native
 Example Agent: dsh-experiment
 License: MIT; Copyright (c) 2026 ericzhaouu.
 The Chinese README.md contains the complete guide.
+
+STABILITY HARDENING (0.7.2; FEATURE SCOPE UNCHANGED)
+
+Cancellation now reaches bounded cleanup even when worker RPC/cancel stalls.
+Linux uses a dedicated DSH process group; uncertain child/tool termination keeps
+the ownership fence. Host business processes remain host-owned. No name-based
+process killing, automatic replay, unlock, auth bypass or new model tools.
+
+maxConcurrentRuns defaults to 8 (1-64), per runtime instance. Excess work fails
+before session admission. RPC bounds are 16 MiB/frame, 128 pending requests,
+64 inbound requests, 1024 notifications, 256 writes, and 32 MiB per read/write
+queue. These do not replace the host scheduler or constitute an OS sandbox.
+
+Finalizers and cleanup have bounded waits. A timeout is not proof a callback
+stopped; unresolved work retains its session fence. Normal message sends retain
+the attempt deadline, with shutdownTimeoutMs grace only after cancellation.
+
+Source delivery has confirmed-delivered, confirmed-not-delivered, and
+unknown-after-started receipts. A durable source-reply.lock/receipt prevents
+unconfirmed sends from being silently replayed after reload. Inspect rather than
+remove it. Receipts contain correlation metadata, not text or credentials.
+
+Binding writes fsync the file and parent directory around atomic rename.
+Owner records include process-start and instance identity. Unsupported Windows
+directory fsync warns explicitly; power-loss certification is not claimed there.
+
+  node scripts\inspect-state.mjs --state-dir C:\PATH\TO\private-dsh-state
+  node scripts\run-native-soak.mjs --execute --stability --turns 200 --keep-artifacts
+
+The inspector is read-only. Linux stability soak measures actual child resources
+with concurrent, same-epoch sessions; it is not real-channel fault certification.
 
 PRIVATE CURRENT-SOURCE REPLIES (0.7.0)
 

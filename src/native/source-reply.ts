@@ -10,20 +10,42 @@ export interface NativeSourceReplyDelivery {
   didSendViaMessagingTool: true;
   didDeliverSourceReplyViaMessageTool: true;
   sourceReplyDelivered: true;
+  receiptState?: "confirmed-delivered";
   messagingToolSentTexts: string[];
   messagingToolSentMediaUrls: string[];
   messagingToolSentTargets: ReturnType<Runtime["extractMessagingToolSendResult"]>[];
   messagingToolSourceReplyPayloads?: Array<Record<string, unknown>>;
 }
 
+export type NativeSourceReplyReceiptState =
+  "confirmed-delivered" | "confirmed-not-delivered" | "unknown-after-started";
+
+// These states report the host receipt boundary only. They are not a durable
+// transport dedupe key and do not provide exactly-once channel delivery.
 export class SourceReplyDeliveryError extends Error {
-  readonly delivery: NativeSourceReplyDelivery;
+  readonly delivery?: NativeSourceReplyDelivery;
   readonly originalError: unknown;
-  constructor(error: unknown, delivery: NativeSourceReplyDelivery) {
+  readonly receiptState: NativeSourceReplyReceiptState;
+  readonly replaySafe: boolean;
+  readonly runId?: string;
+  readonly privateCallId?: string;
+  readonly stage?: string;
+  constructor(error: unknown, delivery?: NativeSourceReplyDelivery, metadata: {
+    receiptState?: NativeSourceReplyReceiptState;
+    replaySafe?: boolean;
+    runId?: string;
+    privateCallId?: string;
+    stage?: string;
+  } = {}) {
     super(error instanceof Error ? error.message : String(error));
     this.name = "SourceReplyDeliveryError";
     this.originalError = error;
     this.delivery = delivery;
+    this.receiptState = metadata.receiptState ?? (delivery ? "confirmed-delivered" : "unknown-after-started");
+    this.replaySafe = metadata.replaySafe ?? this.receiptState === "confirmed-not-delivered";
+    this.runId = metadata.runId;
+    this.privateCallId = metadata.privateCallId;
+    this.stage = metadata.stage;
   }
 }
 
@@ -122,6 +144,7 @@ export function buildSourceReplyDeliveryEvidence(params: {
     didSendViaMessagingTool: true,
     didDeliverSourceReplyViaMessageTool: true,
     sourceReplyDelivered: true,
+    receiptState: "confirmed-delivered",
     messagingToolSentTargets: sent ? [sent] : [],
     messagingToolSentTexts: text ? [text] : [],
     messagingToolSentMediaUrls: sent?.mediaUrls ?? [],

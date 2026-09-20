@@ -271,12 +271,14 @@ test("OpenClaw 2026.9.2 public SDK release smoke", { concurrency: false }, async
       assert.deepEqual(entry.configSchema.parse(pluginConfig), {
         ...pluginConfig, allowedBaseUrls: ["http://127.0.0.1:4321/v1"],
         allowedCopilotBaseUrls: copilotEndpoints,
+        maxConcurrentRuns: 8,
       });
       const defaults = entry.configSchema.parse({ stateDir: runtimeStateDir });
       assert.deepEqual(defaults, {
         stateDir: runtimeStateDir, startupTimeoutMs: 60000, shutdownTimeoutMs: 15000,
         streamIdleTimeoutMs: 120000, allowedBaseUrls: ["https://api.deepseek.com"],
         allowedCopilotBaseUrls: copilotEndpoints,
+        maxConcurrentRuns: 8,
       });
       assert.deepEqual(entry.configSchema.parse(null), entry.configSchema.parse(undefined));
       for (const invalid of [

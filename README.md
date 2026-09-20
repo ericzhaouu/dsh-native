@@ -1,6 +1,6 @@
 # DSH Native for OpenClaw
 
-**实验性版本 0.7.1**：把官方 DeepSeek Harness（DSH）的模型／工具循环接入 OpenClaw 的原生 `AgentHarnessV2`，并保留 OpenClaw 对模型、认证、工具授权与会话入口的控制。
+**实验性版本 0.7.2**：把官方 DeepSeek Harness（DSH）的模型／工具循环接入 OpenClaw 的原生 `AgentHarnessV2`，并保留 OpenClaw 对模型、认证、工具授权与会话入口的控制。
 
 - 源码仓库：[ericzhaouu/dsh-native](https://github.com/ericzhaouu/dsh-native)
 - 作者：[ericzhaouu](https://github.com/ericzhaouu)
@@ -16,6 +16,7 @@
 
 ## 目录
 
+- [0.7.2 稳定性加固](#072-稳定性加固)
 - [0.7.0 当前会话私有回复](#070-当前会话私有回复)
 - [0.6.1 Copilot 压缩认证交接补丁](#061-copilot-压缩认证交接补丁)
 - [0.6.0 原生压缩与独立维护](#060-原生压缩与独立维护)
@@ -40,6 +41,24 @@
 - [仓库结构](#仓库结构)
 - [排错](#排错)
 - [致谢与许可证](#致谢与许可证)
+
+## 0.7.2 稳定性加固
+
+功能、模型路由和工具权限保持不变。本轮不调整任务模式选择或业务评分规则，也不以正常用例重复通过代替故障恢复证明。
+
+- 取消的升级路径不再依赖挂起的 RPC 返回。Linux DSH 子进程使用专属进程组，有界 TERM／KILL 后确认退出；宿主业务工具的进程仍由宿主负责，插件不会按名称杀进程。无法确认终止时保留所有权锁，不把会话标为可重放。
+- RPC 分别限制单帧 16 MiB、待响应请求 128、入站请求 64、通知队列 1024、发送队列 256，以及收／发排队数据各 32 MiB。超限明确关闭并拒绝等待者；不丢帧后继续假装成功。`maxConcurrentRuns` 默认 8、可配置 1–64，限制**每个 runtime 实例**的并发操作；超额在状态／子进程提交前拒绝，不自动排队或重试，不替代宿主全局并发限制。
+- 工具收尾、最终发布和结束 hook 设有有界等待。停止等待不等于工具已停止：实际回调尚未结束时，原会话继续被隔离。私有发送仍沿用原 attempt 的时限；只有取消发生后才开始收尾宽限期。
+- 当前来源投递区分 `confirmed-delivered`、`confirmed-not-delivered`、`unknown-after-started`。发送前持久化 `source-reply.lock` 和 `source-reply-receipt.json`；未知结果保留锁，重载插件也不能默默重发。记录不含消息正文或渠道凭据。确认送达后发生其他错误仍保留送达事实；这不是对平台端恰好一次投递的承诺。
+- `binding.json` 执行文件同步、原子替换及父目录同步；所有权记录增加进程启动身份、实例标识和状态键哈希。Linux 的真实落盘错误会失败；Windows 不支持目录同步时明确警告，不声称断电持久性已认证。
+
+可使用随包提供的只读诊断，不会修改或删除任何锁：
+
+```powershell
+node .\scripts\inspect-state.mjs --state-dir C:\PATH\TO\private-dsh-state
+```
+
+`operator-inspection-required` 表示必须核对旧进程、工具与平台回执。不要通过删锁、改成 `ready` 或重发原消息绕过不确定结果。必要时保留旧记录并使用明确的新会话／清空 epoch。升级仍须维护窗口；本版本不会自动部署或修改宿主补丁。
 
 ## 0.7.0 当前会话私有回复
 
@@ -332,18 +351,18 @@ openclaw gateway status --no-probe
 仍保持 Gateway 停止：
 
 ```powershell
-openclaw plugins install "C:\PATH\TO\openclaw-dsh-native-0.6.3.tgz" --force --accept-capabilities
+openclaw plugins install "C:\PATH\TO\openclaw-dsh-native-0.7.2.tgz" --force --accept-capabilities
 ```
 
 `--force` 用于确认本地来源／覆盖安装；`--accept-capabilities` 是官方安装器对声明能力的接受选项，**仅用于已审阅并信任的代码**，不是规避安全策略。先阅读安装器说明和能力提示，不要无条件接受陌生代码。归档安装会处理运行依赖；已有 provider 及认证应留在 OpenClaw，不填入插件设置。
 
-**若 managed npm 插件环境在 optional peer reconciliation 阶段失败**，例如试图从缺少精确 SDK 的 registry 解析宿主，不要修改共享宿主依赖或安装猜测版本。可以在独立目录准备完整运行制品，再使用官方目录安装入口：
+**0.7.2 的固定依赖安装／升级／回退应优先采用下面的准备目录路径。** 在已检查的宿主中，直接归档安装可能重新解析 DSH 的预发布 peer，选择与锁定版本冲突的新 RC；optional peer reconciliation 也可能试图从 registry 安装另一份宿主。不要用 npm 的 `--force`／`--legacy-peer-deps` 绕过冲突，不要修改共享宿主依赖或安装猜测版本。解包同一制品，用锁文件准备完整运行依赖，再使用官方目录安装入口：
 
 ```powershell
 New-Item -ItemType Directory -Path .\artifacts\prepared-dsh-native
-tar -xf .\openclaw-dsh-native-0.6.3.tgz -C .\artifacts\prepared-dsh-native
+tar -xf .\openclaw-dsh-native-0.7.2.tgz -C .\artifacts\prepared-dsh-native
 Push-Location .\artifacts\prepared-dsh-native\package
-npm.cmd ci --omit=dev
+npm.cmd ci --omit=dev --ignore-scripts
 Pop-Location
 $PreparedPlugin = (Resolve-Path .\artifacts\prepared-dsh-native\package).Path
 openclaw plugins install $PreparedPlugin --force --accept-capabilities
@@ -656,9 +675,12 @@ npm.cmd run acceptance:dry-run -- --manifest "$PlanRoot\manifest.json" --run-roo
 npm.cmd run soak:dry-run
 node .\scripts\run-native-soak.mjs --execute --turns 4
 node .\scripts\run-native-soak.mjs --execute --turns 200
+node .\scripts\run-native-soak.mjs --execute --stability --turns 200 --keep-artifacts
 ```
 
 压测显式执行后使用真实 DSH 子进程和本地合成模型，交替运行两个隔离身份、定期切换原生状态 epoch；不会访问生产账号。它不替代真实 Gateway／飞书端到端压力测试。启动失败必须失败，不能因为环境异常自动算通过；子进程 RSS 未测量时也不得冒充已观测。
+
+`--stability` 使用两个并发轮次且保持各自同一原生 epoch，不用定期重置掩盖长会话问题。Linux 从所属子进程的 `/proc` 采样 RSS、FD、进程数量，记录静止边界的父进程内存趋势、延迟和每批回执；失败或所有权未确认时保留证据。内存趋势是观测值，不是一次短测便可宣称“绝无泄漏”；非 Linux 平台不伪造资源测量。压缩／断流／取消等故障还需配套专门用例。
 
 `.github\workflows\test.yml` 在 PR 上默认只运行纯 Node 安装包检查器测试矩阵（Windows／Ubuntu，Node 22.23.1／24.15.0），不依赖真实账号或 SDK，也不等于当前源码包已通过全部验收。完整 SDK 工作流仅在 `workflow_dispatch` 启动，需要配置 `OPENCLAW_SDK_ARTIFACT_URL`／`OPENCLAW_SDK_ARTIFACT_SHA256` 或对应输入；只接受 OpenClaw 官方 GitHub Release／Actions 制品，内部 SDK 包摘要固定为 `3431f4cd2d8dbd6b936def2694ac27e19fa0256295cf4ada0f652ecf1c9ee520`。未配置或下载失败会明确失败，不能显示虚假的全量通过。工作流不发布、不打标签、不运行真实账号用例，也不使用 `pull_request_target`。
 

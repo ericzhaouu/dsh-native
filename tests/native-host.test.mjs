@@ -21,7 +21,10 @@ const sourceHooks = registerHooks({
         { compilerOptions: { target: ts.ScriptTarget.ES2023, module: ts.ModuleKind.ESNext } }).outputText } : next(url, context);
   },
 });
-const { assertNativeHostSupported, createNativeToolHost, prepareNativeHost, projectNativeToolResult, renderNativeSystemPrompt } =
+const {
+  assertNativeHostSupported, createNativeToolHost, NativeHostCleanupError, prepareNativeHost,
+  projectNativeToolResult, renderNativeSystemPrompt,
+} =
   await import("../dist/native/host.js");
 sourceHooks.deregister();
 
@@ -265,6 +268,24 @@ test("private source reply fails closed when hooks rewrite to an explicit foreig
   await assert.rejects(missingReceipt.deliverSourceReply("Final", signal()), /verified current-source delivery receipt/);
 });
 
+test("a settled-looking result cannot confirm delivery after private arguments are mutated", async () => {
+  const { host } = fixture([], { options: {
+    privateSourceReplyAttempt: { sourceReplyDeliveryMode: "message_tool_only", config: {} },
+    privateSourceReplyTool: messageTool(async (_id, args) => {
+      args.target = "foreign-channel";
+      return { content: [], details: { deliveredText: args.message,
+        messageDelivery: { sourceReplyDelivered: true, status: "settled" } } };
+    }),
+  } });
+  await assert.rejects(host.deliverSourceReply("Final", signal()), (error) => {
+    assert.equal(error.receiptState, "unknown-after-started");
+    assert.equal(error.delivery, undefined);
+    assert.match(error.message, /explicit message route/);
+    return true;
+  });
+  await host.dispose();
+});
+
 test("private delivery does not consume or bypass the model's business-tool preparation gate", async () => {
   let businessStarts = 0;
   const { host } = fixture([tool("read")], {
@@ -307,6 +328,117 @@ test("delivery evidence survives cancellation immediately after confirmed platfo
   });
   assert.equal(host.getReplayState().replaySafe, false);
   await host.dispose();
+});
+
+test("private source reply classifies ack loss after send as unknown and replay-unsafe", async () => {
+  const { host } = fixture([], {
+    options: {
+      privateSourceReplyTool: messageTool(async () => {
+        throw new Error("ack lost after source send");
+      }),
+      privateSourceReplyAttempt: { sourceReplyDeliveryMode: "message_tool_only", config: {} },
+      cleanupTimeoutMs: 25,
+    },
+  });
+  await assert.rejects(host.deliverSourceReply("Final", signal()), (error) => {
+    assert.equal(error.name, "SourceReplyDeliveryError");
+    assert.equal(error.receiptState, "unknown-after-started");
+    assert.equal(error.replaySafe, false);
+    assert.equal(error.delivery, undefined);
+    assert.match(error.privateCallId, /^dsh-source-reply:/u);
+    return true;
+  });
+  assert.equal(host.getReplayState().replaySafe, false);
+  await host.dispose();
+});
+
+test("private source reply classifies pre-execution denial as confirmed not delivered", async () => {
+  const { host } = fixture([], {
+    block: true,
+    options: {
+      privateSourceReplyTool: messageTool(),
+      privateSourceReplyAttempt: { sourceReplyDeliveryMode: "message_tool_only", config: {} },
+    },
+  });
+  await assert.rejects(host.deliverSourceReply("Final", signal()), (error) => {
+    assert.equal(error.name, "SourceReplyDeliveryError");
+    assert.equal(error.receiptState, "confirmed-not-delivered");
+    assert.equal(error.replaySafe, true);
+    return true;
+  });
+  assert.deepEqual(host.getToolCounts(), { startedCount: 0, completedCount: 0, activeCount: 0 });
+  await host.dispose();
+});
+
+test("hung private source reply returns a bounded unknown terminal while remaining quarantined until late settle", async () => {
+  let finish;
+  const { host } = fixture([], {
+    options: {
+      privateSourceReplyTool: messageTool(async (_id, args) => new Promise((resolve) => {
+        finish = () => resolve({ content: [{ type: "text", text: "sent" }],
+          details: { deliveredText: args.message, messageDelivery: { sourceReplyDelivered: true, status: "settled" } } });
+      })),
+      privateSourceReplyAttempt: { sourceReplyDeliveryMode: "message_tool_only", config: {} },
+      cleanupTimeoutMs: 20,
+    },
+  });
+  const startedAt = Date.now();
+  const controller = new AbortController();
+  const work = host.deliverSourceReply("Final", controller.signal);
+  await new Promise((resolve) => setImmediate(resolve));
+  controller.abort();
+  await assert.rejects(work, (error) => {
+    assert.equal(error.name, "SourceReplyDeliveryError");
+    assert.equal(error.receiptState, "unknown-after-started");
+    return true;
+  });
+  assert.ok(Date.now() - startedAt < 500);
+  assert.equal(host.getToolCounts().activeCount, 1);
+  assert.ok(host.getUnsettledOperationCount() > 0);
+  assert.equal(host.getReplayState().replaySafe, false);
+  await assert.rejects(host.dispose(), NativeHostCleanupError);
+  finish();
+  await host.settled;
+  assert.equal(host.getToolCounts().activeCount, 0);
+});
+
+test("normal source send may outlast cleanup grace; only cancellation starts that deadline", async () => {
+  const { host } = fixture([], { options: {
+    cleanupTimeoutMs: 10,
+    privateSourceReplyAttempt: { sourceReplyDeliveryMode: "message_tool_only", config: {} },
+    privateSourceReplyTool: messageTool(async (_id, args) => {
+      await new Promise((resolve) => setTimeout(resolve, 35));
+      return { content: [], details: { deliveredText: args.message,
+        messageDelivery: { sourceReplyDelivered: true, status: "settled" } } };
+    }),
+  } });
+  assert.equal((await host.deliverSourceReply("Final", signal())).sourceReplyDelivered, true);
+  await host.dispose();
+});
+
+test("confirmed delivery survives a hung post-send hook and cancellation deadline", async () => {
+  let entered, releaseHook;
+  const reached = new Promise((resolve) => { entered = resolve; });
+  const state = fixture([], { options: {
+    cleanupTimeoutMs: 10, privateSourceReplyTool: messageTool(),
+    privateSourceReplyAttempt: { sourceReplyDeliveryMode: "message_tool_only", config: {} },
+  } });
+  state.runtime.runAgentHarnessAfterToolCallHook = async () => {
+    entered();
+    await new Promise((resolve) => { releaseHook = resolve; });
+  };
+  const controller = new AbortController();
+  const sending = state.host.deliverSourceReply("Final", controller.signal);
+  await reached;
+  controller.abort();
+  await assert.rejects(sending, (error) => {
+    assert.equal(error.receiptState, "confirmed-delivered");
+    assert.equal(error.delivery.sourceReplyDelivered, true);
+    return true;
+  });
+  await assert.rejects(state.host.dispose(), NativeHostCleanupError);
+  releaseHook();
+  await state.host.settled;
 });
 
 test("tracks concurrent dispatch and does not announce replay safety during a pending read", async () => {
@@ -362,6 +494,37 @@ test("pre-aborted calls do not dispatch; disposal drains actual execution and ru
   assert.equal(cleaned, 2);
   assert.equal(host.getToolCounts().activeCount, 0);
   await assert.rejects(host.executeTool(call("read", "after"), signal()), /disposed/);
+});
+
+test("host cleanup timeout is bounded and late tool/cleanup completion does not imply early termination", async () => {
+  let finishTool;
+  let finishCleanup;
+  const cleaned = [];
+  const { host } = fixture([tool("read", async () => new Promise((resolve) => { finishTool = resolve; }))], {
+    options: { cleanupTimeoutMs: 20, cleanups: [async () => new Promise((resolve) => {
+      cleaned.push("started");
+      finishCleanup = resolve;
+    })] },
+  });
+  void host.executeTool(call(), signal()).catch(() => {});
+  await new Promise((resolve) => setImmediate(resolve));
+  const startedAt = Date.now();
+  await assert.rejects(host.dispose(), (error) => {
+    assert.ok(error instanceof NativeHostCleanupError);
+    assert.equal(error.outcome, "unknown");
+    assert.match(error.advice, /fenced/u);
+    assert.ok(error.unsettledOperations > 0);
+    return true;
+  });
+  assert.ok(Date.now() - startedAt < 500);
+  assert.deepEqual(cleaned, [], "Cleanup must not remove resources while the tool remains active");
+  assert.equal(host.getToolCounts().activeCount, 1);
+  finishTool({ content: [] });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(cleaned, ["started"]);
+  finishCleanup();
+  await host.settled;
+  assert.equal(host.getToolCounts().activeCount, 0);
 });
 
 test("after-tool hook failures cannot hide completed side effects or corrupt counts", async () => {

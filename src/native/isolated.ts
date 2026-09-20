@@ -186,6 +186,9 @@ export function createIsolatedCompletion(
 
   const run: IsolatedRun = async (p) => {
     if (disposed) fail("service is disposed");
+    if (activeControllers.size >= (config.maxConcurrentRuns ?? 8)) {
+      fail("isolated completion capacity reached before state or model submission");
+    }
     assertPreparedModel(p);
     const maxRequestBytes = options.maxRequestBytes ?? DEFAULT_MAX_REQUEST_BYTES;
     const requestBytes = new TextEncoder().encode(`${p.systemPrompt}\n${p.prompt}`).byteLength;

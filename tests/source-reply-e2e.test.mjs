@@ -105,3 +105,19 @@ for (const settings of [{ failSend: true }, { redirectHook: true }, { rewriteAct
       } finally { await gateway.close(); }
     });
 }
+
+test("accepted platform send with lost acknowledgement is unknown and never replayed", { timeout }, async () => {
+  const gateway = await startDashboardGateway(({ body, text, finish }) => {
+    assert.deepEqual(body.tools ?? [], []);
+    text("ACK-LOSS-SYNTHETIC-FINAL");
+    finish();
+  }, { sourceReplyFixture: { loseReceipt: true }, hostTools: [] });
+  try {
+    const { records, diagnostics } = await dispatch(gateway, "Reply with the synthetic acknowledgement-loss marker.");
+    assertNativeOutcome(records, "failed", false, diagnostics);
+    assert.equal(records.find((entry) => entry.kind === "native-result").receiptState, "unknown-after-started", diagnostics);
+    assert.equal(records.filter((entry) => entry.kind === "platform-accepted").length, 1, diagnostics);
+    assert.equal(records.filter((entry) => entry.kind === "send-attempt").length, 1, diagnostics);
+    assert.equal(gateway.responses.requests.length, 1);
+  } finally { await gateway.close(); }
+});

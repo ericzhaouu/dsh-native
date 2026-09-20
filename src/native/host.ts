@@ -11,7 +11,7 @@ import {
 } from "./tool-bridge.js";
 import {
   assertPrivateSourceReplyArgs, buildSourceReplyDeliveryEvidence, createPrivateSourceReplyArgs,
-  type NativeSourceReplyDelivery, SourceReplyDeliveryError,
+  type NativeSourceReplyDelivery, type NativeSourceReplyReceiptState, SourceReplyDeliveryError,
 } from "./source-reply.js";
 
 type Attempt = Parameters<AgentHarnessV2["runAttempt"]>[0];
@@ -27,6 +27,8 @@ export interface NativeHost {
   deliverSourceReply?: (text: string, signal: AbortSignal) => Promise<NativeSourceReplyDelivery>;
   getReplayState(): { hadPotentialSideEffects: boolean; replaySafe: boolean };
   getToolCounts(): { startedCount: number; completedCount: number; activeCount: number };
+  getUnsettledOperationCount(): number;
+  settled: Promise<void>;
   dispose(): Promise<void>;
 }
 
@@ -175,6 +177,22 @@ export interface NativeToolHostOptions {
   preparationGate?: PreparationGate;
   privateSourceReplyTool?: AnyAgentTool;
   privateSourceReplyAttempt?: Attempt;
+  cleanupTimeoutMs?: number;
+}
+
+export class NativeHostCleanupError extends Error {
+  readonly outcome = "unknown";
+  readonly advice = "Host callbacks or cleanup did not settle before the native cleanup deadline; keep this session fenced until the host reports settlement.";
+  readonly timeoutMs: number;
+  readonly unsettledOperations: number;
+  readonly originalErrors: unknown[];
+  constructor(message: string, params: { timeoutMs: number; unsettledOperations: number; originalErrors?: unknown[] }) {
+    super(message);
+    this.name = "NativeHostCleanupError";
+    this.timeoutMs = params.timeoutMs;
+    this.unsettledOperations = params.unsettledOperations;
+    this.originalErrors = params.originalErrors ?? [];
+  }
 }
 
 /** Installs the final dispatch gate before the host adds its before-tool policy wrapper. */
@@ -204,6 +222,17 @@ export function createNativeToolHost(options: NativeToolHostOptions): Omit<Nativ
   let hadPotentialSideEffects = options.initialReplayState?.hadPotentialSideEffects === true;
   let uncertain = options.initialReplayState?.replayInvalid === true;
   let disposePromise: Promise<void> | undefined;
+  let actualDisposePromise: Promise<void> | undefined;
+  let settle!: () => void;
+  const settled = new Promise<void>((resolve) => { settle = resolve; });
+  let cleanupPending = false;
+  let cleanupTimedOut = false;
+  const cleanupTimeoutMs = options.cleanupTimeoutMs ?? 15_000;
+  if (!Number.isSafeInteger(cleanupTimeoutMs) || cleanupTimeoutMs <= 0 || cleanupTimeoutMs > 3_600_000) {
+    throw new Error("Invalid native host cleanup timeout");
+  }
+  let privateSourceReplyStarted = false;
+  let privateSourceReplyDelivery: NativeSourceReplyDelivery | undefined;
 
   const check = (signal: AbortSignal = lifetime) => {
     signal.throwIfAborted();
@@ -272,6 +301,7 @@ export function createNativeToolHost(options: NativeToolHostOptions): Omit<Nativ
       if (invocation.privateSourceReplyText === undefined) options.preparationGate?.start(name);
       invocation.args = args as Record<string, unknown>;
       invocation.started = true;
+      if (invocation.privateSourceReplyText !== undefined) privateSourceReplyStarted = true;
       startedCount++;
       activeCount++;
       if (!replaySafeTools.get(name)) hadPotentialSideEffects = true;
@@ -295,8 +325,42 @@ export function createNativeToolHost(options: NativeToolHostOptions): Omit<Nativ
   const byName = new Map(bound.map((tool) => [tool.name, tool]));
   const advertised = new Set(selection.entries.map(({ source }) => source.name));
 
+  const getUnsettledOperationCount = () => pending.size + activeCount + (cleanupPending ? 1 : 0);
+  const sourceReplyError = (message: string, receiptState: NativeSourceReplyReceiptState, stage: string,
+    delivery?: NativeSourceReplyDelivery, original: unknown = new Error(message)) =>
+    new SourceReplyDeliveryError(original, delivery, {
+      receiptState, replaySafe: receiptState === "confirmed-not-delivered",
+      runId: options.runId, privateCallId: `dsh-source-reply:${options.runId}`, stage,
+    });
+  const timeoutError = (stage = "cleanup", originalErrors: unknown[] = []) => {
+    cleanupTimedOut = true;
+    uncertain = true;
+    return new NativeHostCleanupError(`Native host ${stage} did not settle within ${cleanupTimeoutMs}ms`, {
+      timeoutMs: cleanupTimeoutMs, unsettledOperations: getUnsettledOperationCount(), originalErrors,
+    });
+  };
+  const withDeadline = async <T>(work: Promise<T>, onTimeout: () => Error): Promise<T> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => reject(onTimeout()), cleanupTimeoutMs);
+    });
+    try { return await Promise.race([work, timeout]); }
+    finally { if (timer) clearTimeout(timer); }
+  };
+  const withAbortDeadline = async <T>(work: Promise<T>, signal: AbortSignal, onTimeout: () => Error): Promise<T> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let rejectTimeout!: (error: Error) => void;
+    const deadline = new Promise<never>((_resolve, reject) => { rejectTimeout = reject; });
+    const abort = () => { timer ??= setTimeout(() => rejectTimeout(onTimeout()), cleanupTimeoutMs); };
+    signal.addEventListener("abort", abort, { once: true });
+    if (signal.aborted) abort();
+    try { return await Promise.race([work, deadline]); }
+    finally { signal.removeEventListener("abort", abort); if (timer) clearTimeout(timer); }
+  };
+
   const executeOne = async (call: BridgeToolCall, signal: AbortSignal, privateSourceReplyText?: string):
-      Promise<{ bridge: BridgeToolResult; result?: ToolResult; isError: boolean; args: Record<string, unknown> }> => {
+      Promise<{ bridge: BridgeToolResult; result?: ToolResult; isError: boolean; args: Record<string, unknown>;
+        executionStarted: boolean }> => {
     const invocation = { name: call.name, started: false, args: undefined as Record<string, unknown> | undefined,
       privateSourceReplyText };
     const startedAt = Date.now();
@@ -314,10 +378,14 @@ export function createNativeToolHost(options: NativeToolHostOptions): Omit<Nativ
       result = await tool.execute(call.callId, call.arguments, executionSignal);
       isError = sdk.isToolResultError(result);
       if (privateSourceReplyText !== undefined && options.privateSourceReplyAttempt) {
-        sourceReplyDelivery = buildSourceReplyDeliveryEvidence({
-          sdk, attempt: options.privateSourceReplyAttempt,
-          args: invocation.args ?? call.arguments, result, isError,
-        });
+        assertPrivateSourceReplyArgs(invocation.args ?? call.arguments, privateSourceReplyText);
+        if (invocation.started) {
+          sourceReplyDelivery = buildSourceReplyDeliveryEvidence({
+            sdk, attempt: options.privateSourceReplyAttempt,
+            args: invocation.args ?? call.arguments, result, isError,
+          });
+          privateSourceReplyDelivery ??= sourceReplyDelivery;
+        }
       }
       check(executionSignal);
     } catch (error) {
@@ -329,10 +397,17 @@ export function createNativeToolHost(options: NativeToolHostOptions): Omit<Nativ
       const adjusted = sdk.consumeAdjustedParamsForToolCall(call.callId, options.runId);
       const blocked = sdk.consumePreExecutionBlockedToolCall(call.callId, options.runId);
       const args = invocation.args ?? (record(adjusted) ? adjusted : call.arguments);
-      if (privateSourceReplyText !== undefined) assertPrivateSourceReplyArgs(args, privateSourceReplyText);
+      if (privateSourceReplyText !== undefined) {
+        try { assertPrivateSourceReplyArgs(args, privateSourceReplyText); }
+        catch (error) {
+          sourceReplyDelivery = undefined;
+          privateSourceReplyDelivery = undefined;
+          throw error;
+        }
+      }
       if (invocation.started && (blocked || executionSignal.aborted)) uncertain = true;
       const error = failed ? sdk.formatToolExecutionErrorMessage(failure, "Host tool execution failed") : undefined;
-      if (privateSourceReplyText !== undefined && result && options.privateSourceReplyAttempt) {
+      if (privateSourceReplyText !== undefined && invocation.started && result && options.privateSourceReplyAttempt) {
         sourceReplyDelivery ??= buildSourceReplyDeliveryEvidence({
           sdk, attempt: options.privateSourceReplyAttempt, args, result, isError,
         });
@@ -359,10 +434,13 @@ export function createNativeToolHost(options: NativeToolHostOptions): Omit<Nativ
         result,
         isError,
         args,
+        executionStarted: invocation.started,
       };
     } catch (error) {
       if (invocation.started) uncertain = true;
-      if (sourceReplyDelivery) throw new SourceReplyDeliveryError(error, sourceReplyDelivery);
+      if (sourceReplyDelivery) throw sourceReplyError(
+        error instanceof Error ? error.message : String(error),
+        "confirmed-delivered", "post-receipt", sourceReplyDelivery, error);
       throw error;
     } finally {
       invocations.delete(call.callId);
@@ -403,39 +481,63 @@ export function createNativeToolHost(options: NativeToolHostOptions): Omit<Nativ
         validate("message", args);
         assertPrivateSourceReplyArgs(args, text);
       } catch (error) {
-        return Promise.reject(error);
+        return Promise.reject(sourceReplyError("Private source reply was not dispatched",
+          "confirmed-not-delivered", "pre-dispatch", undefined, error));
       }
       seen.add(call.callId);
       const work = Promise.resolve().then(async () => {
         const outcome = await executeOne(call, signal, text);
-        const delivery = outcome.result && options.privateSourceReplyAttempt
+        const delivery = outcome.executionStarted && outcome.result && options.privateSourceReplyAttempt
           ? buildSourceReplyDeliveryEvidence({
             sdk, attempt: options.privateSourceReplyAttempt, args: outcome.args, result: outcome.result, isError: outcome.isError,
           })
           : undefined;
-        if (!delivery) throw new Error("Private source reply did not return a verified current-source delivery receipt");
+        if (!delivery) {
+          const receiptState: NativeSourceReplyReceiptState = outcome.executionStarted
+            ? "unknown-after-started" : "confirmed-not-delivered";
+          if (outcome.executionStarted) uncertain = true;
+          throw sourceReplyError("Private source reply did not return a verified current-source delivery receipt",
+            receiptState, outcome.executionStarted ? "missing-receipt-after-start" : "not-started");
+        }
         return delivery;
+      }).catch((error: unknown) => {
+        if (error instanceof SourceReplyDeliveryError) throw error;
+        throw sourceReplyError("Private source reply failed", privateSourceReplyDelivery ? "confirmed-delivered" :
+          privateSourceReplyStarted ? "unknown-after-started" : "confirmed-not-delivered",
+        "dispatch", privateSourceReplyDelivery, error);
       });
       const pendingWork = work.then((delivery) => ({ text: delivery.messagingToolSentTexts.join("\n"), isError: false }));
       pending.add(pendingWork);
       void pendingWork.then(() => pending.delete(pendingWork), () => pending.delete(pendingWork));
-      return work;
+      return withAbortDeadline(work, AbortSignal.any([lifetime, signal]), () => {
+        uncertain = privateSourceReplyStarted;
+        return sourceReplyError("Private source reply cancellation did not settle before the cleanup deadline",
+          privateSourceReplyDelivery ? "confirmed-delivered" : privateSourceReplyStarted ? "unknown-after-started" : "confirmed-not-delivered",
+          "abort-deadline", privateSourceReplyDelivery);
+      });
     } : undefined,
     getReplayState: () => ({
       hadPotentialSideEffects,
-      replaySafe: !hadPotentialSideEffects && !uncertain && pending.size === 0,
+      replaySafe: !hadPotentialSideEffects && !uncertain && pending.size === 0 && !cleanupPending && !cleanupTimedOut,
     }),
     getToolCounts: () => ({ startedCount, completedCount, activeCount }),
+    getUnsettledOperationCount,
+    settled,
     dispose() {
       if (!disposePromise) {
         controller.abort(new Error("Native host disposed"));
-        disposePromise = (async () => {
+        cleanupPending = true;
+        actualDisposePromise = (async () => {
           await Promise.allSettled([...pending]);
           const results = await Promise.allSettled((options.cleanups ?? []).map((cleanup) =>
             Promise.resolve().then(() => cleanup("native-host-dispose"))));
           const errors = results.filter((result) => result.status === "rejected").map((result) => result.reason);
           if (errors.length) throw new AggregateError(errors, "Native host cleanup failed");
-        })();
+        })().finally(() => {
+          cleanupPending = false;
+          settle();
+        });
+        disposePromise = withDeadline(actualDisposePromise, () => timeoutError("cleanup"));
       }
       return disposePromise;
     },
@@ -445,7 +547,7 @@ export function createNativeToolHost(options: NativeToolHostOptions): Omit<Nativ
 export async function prepareNativeHost(p: Parameters<AgentHarnessV2["runAttempt"]>[0], signal: AbortSignal,
   assertActive: () => void, history: Awaited<ReturnType<AgentHarnessV2["runAttempt"]>>["messagesSnapshot"] = [],
   preparation?: { policy: PreparationPolicy; gate: PreparationGate },
-  toolAllowlist?: readonly string[]): Promise<NativeHost> {
+  toolAllowlist?: readonly string[], lifecycle?: { cleanupTimeoutMs?: number }): Promise<NativeHost> {
   assertNativeHostSupported(p);
   const controller = new AbortController();
   const lifetime = AbortSignal.any([signal, controller.signal, ...(p.abortSignal ? [p.abortSignal] : [])]);
@@ -623,6 +725,7 @@ export async function prepareNativeHost(p: Parameters<AgentHarnessV2["runAttempt
       preparationGate: preparation?.gate,
       toolAllowlist: requested, toolSources, toolNotices,
       privateSourceReplyTool, privateSourceReplyAttempt: requiresPrivateSourceReply ? p : undefined,
+      cleanupTimeoutMs: lifecycle?.cleanupTimeoutMs,
     });
     const preparedHost = host;
     return {

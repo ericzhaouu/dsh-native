@@ -7,7 +7,7 @@ import ts from "typescript";
 import { parseTaskPreparationConfig, resolvePreparationDecision } from "../dist/preparation.js";
 
 const sourceModules = new Map([
-  "native/harness", "native/host", "native/source-reply", "native/tool-bridge", "preparation",
+  "native/harness", "native/host", "native/source-reply", "native/tool-bridge", "native/delivery-journal", "durable-state", "preparation",
 ].map((name) => [
   new URL(`../dist/${name}.js`, import.meta.url).href,
   new URL(`../src/${name}.ts`, import.meta.url),
@@ -204,6 +204,8 @@ function fixture(t, overrides = {}) {
     loadSdk: f.spy("loadSdk", async () => f.sdk),
     prepareTranscript: f.spy("prepareTranscript", async () => f.transcript),
     prepareHost: f.spy("prepareHost", async () => f.host),
+    assertSourceReplySettled: async () => {},
+    beginSourceReplyJournal: async () => ({ settle: async () => {} }),
     readMaintenanceContext: f.spy("readMaintenanceContext", async () => f.maintenance),
   };
   /** @type {AgentHarnessV2} */
@@ -677,6 +679,43 @@ test("message-tool-only preserves a real receipt when later delivery accounting 
   assert.equal(f.sdk.emitAgentEvent.mock.callCount(), 0);
 });
 
+test("message-tool-only unknown source delivery returns bounded failure, no fallback, and fences retry until settle", async (t) => {
+  const f = fixture(t, { sourceReplyDeliveryMode: "message_tool_only" });
+  const settled = deferred();
+  let unsettled = 1;
+  f.host.getUnsettledOperationCount = () => unsettled;
+  f.host.settled = settled.promise;
+  f.host.deliverSourceReply = f.spy("sourceReply", async () => {
+    throw new SourceReplyDeliveryError(new Error("source send deadline"), undefined, {
+      receiptState: "unknown-after-started",
+      replaySafe: false,
+      runId: f.p.runId,
+      privateCallId: `dsh-source-reply:${f.p.runId}`,
+      stage: "deadline",
+    });
+  });
+  const result = await f.harness.runAttempt(f.p);
+  assert.equal(result.terminal.kind, "failed");
+  assert.match(result.terminal.error.message, /source send deadline/u);
+  assert.equal(result.didSendViaMessagingTool, false);
+  assert.equal(result.sourceReplyDelivered, undefined);
+  assert.equal(result.replayMetadata.replaySafe, false);
+  assert.equal(f.sdk.emitAgentEvent.mock.callCount(), 0);
+  const diagnostics = f.p.onAgentEvent.mock.calls.map((call) => call.arguments[0])
+    .filter((event) => event.stream === "dsh-native" && event.data?.diagnostic === "stability");
+  assert.equal(diagnostics.length, 1);
+  assert.equal(diagnostics[0].data.receiptState, "unknown-after-started");
+  const competing = await f.harness.runAttempt({ ...f.p, runId: "retry-while-fenced" });
+  assert.equal(competing.terminal.kind, "failed");
+  assert.match(competing.terminal.error.message, /owns this session/u);
+  unsettled = 0;
+  settled.resolve();
+  await tick();
+  f.host.deliverSourceReply = undefined;
+  const next = await f.harness.runAttempt({ ...f.p, runId: "retry-after-settle", sourceReplyDeliveryMode: undefined });
+  assert.equal(next.terminal.kind, "ok");
+});
+
 test("silent channel memory maintenance does not require or invoke a private reply sender", async (t) => {
   const f = fixture(t, {
     trigger: "memory", sourceReplyDeliveryMode: "message_tool_only", forceMessageTool: true,
@@ -687,6 +726,29 @@ test("silent channel memory maintenance does not require or invoke a private rep
   assert.equal(result.terminal.kind, "ok", result.terminal.error?.message);
   assert.equal(result.didSendViaMessagingTool, false);
   assert.equal(f.sdk.emitAgentEvent.mock.callCount(), 0);
+});
+
+test("a durable unknown-delivery fence blocks model entry even after a new harness instance", async (t) => {
+  const f = fixture(t);
+  f.dependencies.assertSourceReplySettled = async () => { throw new Error("Previous source reply settlement is unconfirmed"); };
+  const result = await f.harness.runAttempt(f.p);
+  assert.equal(result.terminal.kind, "failed");
+  assert.match(result.terminal.error.message, /settlement is unconfirmed/);
+  assert.equal(f.runtime.run.mock.callCount(), 0);
+});
+
+test("a non-cooperative final publication returns a bounded error but preserves active ownership", async (t) => {
+  const f = fixture(t);
+  const finish = deferred();
+  f.p.onAgentEvent = async () => finish.promise;
+  f.harness = createNativeHarness({ ...config, shutdownTimeoutMs: 20 }, f.runtime, f.dependencies);
+  const result = await f.harness.runAttempt(f.p);
+  assert.notEqual(result.terminal.kind, "ok");
+  const blocked = await f.harness.runAttempt({ ...f.p, runId: "competing" });
+  assert.match(blocked.terminal.error.message, /owns this session/);
+  await assert.rejects(f.harness.reset({ sessionId: f.p.sessionId, reason: "reset" }), /ownership remains fenced/);
+  finish.resolve();
+  await tick();
 });
 
 test("host-declared silent payload is not sent as a literal channel reply", async (t) => {

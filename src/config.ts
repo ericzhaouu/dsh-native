@@ -9,6 +9,7 @@ const KEYS = new Set([
   "stateDir", "startupTimeoutMs", "shutdownTimeoutMs", "streamIdleTimeoutMs", "allowedBaseUrls", "allowedCopilotBaseUrls",
   "taskPreparation",
   "toolAllowlist",
+  "maxConcurrentRuns",
 ]);
 
 export function normalizeBaseUrl(value: string): string {
@@ -56,11 +57,20 @@ export function parseDshConfig(value: unknown): DshConfig {
     startupTimeoutMs: timeout(input.startupTimeoutMs, 60_000, "startupTimeoutMs"),
     shutdownTimeoutMs: timeout(input.shutdownTimeoutMs, 15_000, "shutdownTimeoutMs"),
     streamIdleTimeoutMs: timeout(input.streamIdleTimeoutMs, 120_000, "streamIdleTimeoutMs"),
+    maxConcurrentRuns: concurrency(input.maxConcurrentRuns),
     allowedBaseUrls: urls.map((url: string) => normalizeBaseUrl(url)),
     allowedCopilotBaseUrls: copilotUrls.map((url: string) => normalizeBaseUrl(url)),
     ...(taskPreparation ? { taskPreparation } : {}),
     ...(toolAllowlist ? { toolAllowlist } : {}),
   };
+}
+
+function concurrency(value: unknown): number {
+  if (value === undefined) return 8;
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1 || value > 64) {
+    throw new Error("maxConcurrentRuns must be an integer between 1 and 64.");
+  }
+  return value;
 }
 
 function timeout(value: unknown, fallback: number, key: string): number {

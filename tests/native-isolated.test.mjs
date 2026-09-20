@@ -85,6 +85,23 @@ async function withService(t, runtimeFactory, run) {
   }
 }
 
+test("isolated completion admission bounds parallel disposable runtimes before model work", async (t) => {
+  await withService(t, () => ({
+    async run(input) {
+      await new Promise((_resolve, reject) => {
+        if (input.signal.aborted) reject(input.signal.reason);
+        else input.signal.addEventListener("abort", () => reject(input.signal.reason), { once: true });
+      });
+    },
+    async dispose() {},
+  }), async ({ service }) => {
+    const pending = Array.from({ length: 8 }, () => assert.rejects(service.run(params({ timeoutMs: 5000 }))));
+    await assert.rejects(service.run(params()), /capacity reached before state or model submission/);
+    await service.dispose();
+    await Promise.all(pending);
+  });
+});
+
 test("isolated completion uses a fresh zero-tool private runtime call and cleans successful state", async (t) => {
   const calls = [];
   const configs = [];

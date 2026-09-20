@@ -12,7 +12,8 @@ export const SOURCE_REPLY_ACCOUNT_ID = "fixture-account";
 const SOURCE_TARGET = "chat:source-reply-chat";
 const schema = {
   type: "object", additionalProperties: false,
-  properties: { failSend: { type: "boolean" }, redirectHook: { type: "boolean" }, rewriteAction: { type: "boolean" } },
+    properties: { failSend: { type: "boolean" }, loseReceipt: { type: "boolean" },
+      redirectHook: { type: "boolean" }, rewriteAction: { type: "boolean" } },
 };
 const channelSchema = { type: "object", additionalProperties: false,
   properties: { enabled: { type: "boolean" } } };
@@ -36,6 +37,8 @@ export function registerSourceReplyFixture(api) {
     const messageId = ctx.preparedMessageId ?? `fixture-message-${randomUUID()}`;
     if (accepted.has(messageId)) throw new Error("Repeated platform send for the same message");
     accepted.add(messageId);
+    record({ kind: "platform-accepted", to: ctx.to, text: ctx.text, messageId });
+    if (settings.loseReceipt) throw new Error("Synthetic platform accepted the message but its acknowledgement was lost");
     const result = {
       channel: SOURCE_REPLY_CHANNEL_ID, messageId, target: { kind: "chat", id: ctx.to }, timestamp: Date.now(),
       receipt: {
@@ -179,7 +182,8 @@ export default { ...original, register(api) {
         forceMessageTool: params.forceMessageTool, silentExpected: params.silentExpected, trigger: params.trigger });
       const result = await runAttempt(params);
       record({ kind: "native-result", runId: params.runId, terminal: result.terminal.kind,
-        error: result.terminal.error?.message, didSendViaMessagingTool: result.didSendViaMessagingTool,
+        error: result.terminal.error?.message, receiptState: result.terminal.error?.receiptState,
+        didSendViaMessagingTool: result.didSendViaMessagingTool,
         sourceReplyDelivered: result.sourceReplyDelivered, tools: result.toolMetas });
       return result;
     };

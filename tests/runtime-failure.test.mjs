@@ -17,7 +17,7 @@ function enotconn(message = "read ENOTCONN") {
 }
 
 function childFixture({
-  ignoreKill = false, ready = true, trailingGarbage = false, onRun, missingStdio,
+  ignoreKill = false, ignoreTerm = false, ready = true, trailingGarbage = false, onRun, missingStdio,
   onCompact, onInspectCompact, processErrorBeforeReady = false, stderrErrorBeforeReady = false, stderrChunks = [],
 } = {}) {
   const child = new EventEmitter();
@@ -33,7 +33,11 @@ function childFixture({
     child.stdout?.end();
     child.emit("close", 0);
   };
-  child.kill = (signal = "SIGTERM") => { kills.push(signal); if (!ignoreKill) exit(); return true; };
+  child.kill = (signal = "SIGTERM") => {
+    kills.push(signal);
+    if (!ignoreKill && !(ignoreTerm && signal === "SIGTERM")) exit();
+    return true;
+  };
   const peer = child.stdin && child.stdout ? new JsonRpcPeer(child.stdin, child.stdout, {
     onRequest: async (method, params) => {
       if (method === "run") {
@@ -64,6 +68,7 @@ function childFixture({
   if (ready && peer) setImmediate(() => peer.notify("event", { type: "ready", version: 1, dshVersion: "0.1.2-alpha.2" }));
   return {
     child, kills,
+    exit,
     close() { peer?.close(); exit(); child.stdin?.destroy(); child.stdout?.destroy(); child.stderr?.destroy(); },
   };
 }
@@ -74,12 +79,20 @@ async function withMock(t, options, run) {
   const children = [];
   const spawn = t.mock.method(childProcess, "spawn", () => {
     const fixture = childFixture(options);
+    fixture.child.pid += children.length;
     children.push(fixture);
     return fixture.child;
+  });
+  const processKill = t.mock.method(process, "kill", (pid, signal = "SIGTERM") => {
+    const fixture = children.find(({ child }) => child.pid === -pid);
+    if (!fixture) throw new Error("Refusing to signal an unowned test process group");
+    if (fixture.child.exitCode !== null) throw Object.assign(new Error("No process group"), { code: "ESRCH" });
+    return signal === 0 ? true : fixture.child.kill(signal);
   });
   syncBuiltinESMExports();
   const runtime = createDshRuntime(parseDshConfig({
     stateDir: root, startupTimeoutMs: 100, shutdownTimeoutMs: 100,
+    ...options.runtimeConfig,
   }));
   const input = {
     sessionId: "failure-session", runId: "first", workspaceDir: root,
@@ -90,9 +103,11 @@ async function withMock(t, options, run) {
   };
   try { await run({ root, runtime, input, children }); }
   finally {
-    await runtime.dispose();
+    try { await runtime.dispose(); }
+    catch (error) { assert.equal(error.code, "DSH_TERMINATION_UNCONFIRMED"); }
     for (const child of children) child.close();
     spawn.mock.restore();
+    processKill.mock.restore();
     syncBuiltinESMExports();
     await rm(root, { force: true, recursive: true });
   }
@@ -106,6 +121,119 @@ test("all consumed attempt IDs remain replay-protected", async (t) => {
     assert.equal(children.length, 2);
   });
 });
+
+test("cancel escalates independently when a running child ignores cancel and TERM", async (t) => {
+  let entered;
+  const running = new Promise((resolve) => { entered = resolve; });
+  await withMock(t, { ignoreTerm: true, async onRun() {
+    entered();
+    return new Promise(() => {});
+  } }, async ({ runtime, input, children }) => {
+    const controller = new AbortController();
+    const work = runtime.run({ ...input, signal: controller.signal });
+    const failure = assert.rejects(work, /cancel|abort|exit|termination|EOF/i);
+    await running;
+    controller.abort(new Error("test cancellation"));
+    // The rescue is test cleanup only; exceeding it must remain a failed assertion.
+    const rescue = setTimeout(() => children[0].exit(), 1200);
+    try {
+      await failure;
+      assert.ok(children[0].kills.includes("SIGKILL"), "Cancellation must escalate without waiting for RPC to return");
+    } finally { clearTimeout(rescue); }
+  });
+});
+
+test("cancel retains ownership when even forced termination cannot be confirmed", async (t) => {
+  let entered;
+  const running = new Promise((resolve) => { entered = resolve; });
+  await withMock(t, { ignoreKill: true, async onRun() { entered(); return new Promise(() => {}); } },
+    async ({ runtime, root, input, children }) => {
+      const controller = new AbortController();
+      const failure = assert.rejects(runtime.run({ ...input, signal: controller.signal }), /retaining.*lock/);
+      await running;
+      controller.abort();
+      const rescue = setTimeout(() => children[0].exit(), 1500);
+      try {
+        await failure;
+        assert.ok(children[0].kills.includes("SIGKILL"));
+        const lock = JSON.parse(await readFile(join(root,
+          createHash("sha256").update(input.sessionId).digest("hex"), "owner.lock"), "utf8"));
+        assert.equal(lock.runId, input.runId);
+        await assert.rejects(runtime.run({ ...input, runId: "retry" }), /already has an owner/);
+        await assert.rejects(runtime.dispose(), /cannot confirm all prior operations/);
+      } finally { clearTimeout(rescue); }
+    });
+});
+
+test("an event callback that never settles cannot leave drain waiting without a terminal diagnostic", async (t) => {
+  await withMock(t, { async onRun(_params, peer) {
+    await peer.notify("event", { type: "text", text: "synthetic" });
+    return {};
+  } }, async ({ runtime, input, root }) => {
+    input.onEvent = (event) => event.type === "text" ? new Promise(() => {}) : undefined;
+    await assert.rejects(runtime.run(input), /event callback.*retaining.*lock/);
+    const key = createHash("sha256").update(input.sessionId).digest("hex");
+    assert.ok(await readFile(join(root, key, "owner.lock"), "utf8"));
+  });
+});
+
+test("runtime admission rejects excess sessions before creating state or submitting work", async (t) => {
+  let entered, finish;
+  const running = new Promise((resolve) => { entered = resolve; });
+  await withMock(t, { runtimeConfig: { maxConcurrentRuns: 1 },
+    async onRun() { entered(); await new Promise((resolve) => { finish = resolve; }); return {}; },
+  }, async ({ runtime, input, root, children }) => {
+    const first = runtime.run(input);
+    await running;
+    const second = { ...input, sessionId: "excess-session", runId: "other-run" };
+    try {
+      await assert.rejects(runtime.run(second), /capacity reached before session admission/);
+      await assert.rejects(runtime.compact(second), /capacity reached before session admission/);
+      assert.equal(children.length, 1);
+      await assert.rejects(readFile(bindingPath(root, second), "utf8"), /ENOENT/);
+    } finally { finish(); }
+    await first;
+  });
+});
+
+for (const operation of ["run", "compact"]) {
+  test(`unconfirmed ${operation} retains its capacity and diagnostic when failure-state persistence also fails`, async (t) => {
+    let entered, corruptBinding;
+    const running = new Promise((resolve) => { entered = resolve; });
+    const hang = async () => {
+      await corruptBinding();
+      entered();
+      return new Promise(() => {});
+    };
+    const options = { ignoreKill: true, runtimeConfig: { maxConcurrentRuns: 1 },
+      ...(operation === "run" ? { onRun: hang } : { onCompact: hang }) };
+    await withMock(t, options, async ({ root, runtime, input, children }) => {
+      if (operation === "compact") await runtime.run(input);
+      corruptBinding = async () => {
+        const path = bindingPath(root, input);
+        await rm(path);
+        await mkdir(path);
+      };
+      const controller = new AbortController();
+      const failure = assert.rejects(runtime[operation]({ ...input, runId: "combined-fault", signal: controller.signal }), (error) => {
+        assert.equal(error.code, "DSH_TERMINATION_UNCONFIRMED");
+        assert.match(error.message, /failure state could not be persisted/);
+        return true;
+      });
+      await running;
+      controller.abort();
+      const rescue = setTimeout(() => children.at(-1).exit(), 1500);
+      try {
+        await failure;
+        await assert.rejects(runtime.run({ ...input, sessionId: "another-session", runId: "excess" }), /capacity reached/);
+        await assert.rejects(runtime.dispose(), /cannot confirm all prior operations/);
+        const key = createHash("sha256").update(input.sessionId).digest("hex");
+        const lock = JSON.parse(await readFile(join(root, key, "owner.lock"), "utf8"));
+        assert.equal(lock.runId, "combined-fault");
+      } finally { clearTimeout(rescue); }
+    });
+  });
+}
 
 test("Windows rejects an overlong child cwd before spawning or creating a binding",
   { skip: process.platform !== "win32" }, async (t) => {

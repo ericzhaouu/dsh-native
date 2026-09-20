@@ -172,6 +172,7 @@ function isAllowedPackageFile(path) {
   if (/^package\/host-patch\/(?:apply|spec|engine)\.mjs$/.test(path)) return true;
   if (/^package\/host-patch\/compact-auth\/(?:apply|spec)\.mjs$/.test(path)) return true;
   if (path === "package/host-patch/USAGE.txt") return true;
+  if (path === "package/scripts/inspect-state.mjs") return true;
   return false;
 }
 

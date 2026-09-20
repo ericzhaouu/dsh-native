@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import type { BridgeContextUsage, BridgeEvent, BridgeResult, BridgeUsage } from "../protocol.js";
 import { RUNTIME_ID } from "../protocol.js";
 import type { DshConfig, DshRuntime } from "../runtime-types.js";
-import { prepareNativeHost, type NativeHost } from "./host.js";
+import { NativeHostCleanupError, prepareNativeHost, type NativeHost } from "./host.js";
 import { nativeSupports, resolveNativeRoute } from "./route.js";
 import { prepareNativeTranscript, readNativeMaintenanceContext } from "./transcript.js";
 import { prepareNativeContinuity } from "./continuity.js";
@@ -13,7 +13,10 @@ import {
   isNativeMemoryAttempt, renderMemoryPrompt, MEMORY_OUTPUT_TOKENS, MEMORY_TIMEOUT_MS, MEMORY_TOOL_LIMIT,
 } from "./memory.js";
 import { createIsolatedCompletion, type IsolatedCompletion } from "./isolated.js";
-import { isSilentSourceReply, SourceReplyDeliveryError, type NativeSourceReplyDelivery } from "./source-reply.js";
+import {
+  isSilentSourceReply, SourceReplyDeliveryError, type NativeSourceReplyDelivery, type NativeSourceReplyReceiptState,
+} from "./source-reply.js";
+import { assertSourceReplySettled, beginSourceReplyJournal } from "./delivery-journal.js";
 
 type Attempt = Parameters<AgentHarnessV2["runAttempt"]>[0];
 type Result = Awaited<ReturnType<AgentHarnessV2["runAttempt"]>>;
@@ -33,6 +36,8 @@ export interface NativeHarnessDependencies {
   prepareTranscript: typeof prepareNativeTranscript;
   prepareContinuity?: typeof prepareNativeContinuity;
   readMaintenanceContext?: typeof readNativeMaintenanceContext;
+  assertSourceReplySettled?: typeof assertSourceReplySettled;
+  beginSourceReplyJournal?: typeof beginSourceReplyJournal;
 }
 
 const defaults: NativeHarnessDependencies = {
@@ -121,6 +126,23 @@ function describe(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+async function boundedWait(work: Promise<unknown>, timeoutMs: number): Promise<void> {
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) throw new Error("Invalid native finalization timeout");
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      work,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new NativeHostCleanupError(
+          "Native finalization did not settle; session ownership remains fenced",
+          { timeoutMs, unsettledOperations: 1 })), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 function attributeAssistant(
   message: Assistant | undefined,
   model: { provider: string; model: string } | undefined,
@@ -179,6 +201,19 @@ export function createNativeHarness(
     let streamedReasoning = "";
     let startedAssistant = false;
     let sourceReplyDelivery: NativeSourceReplyDelivery | undefined;
+    const finalizers = new Set<Promise<unknown>>();
+    const finalize = async <T>(work: Promise<T>): Promise<T> => {
+      finalizers.add(work);
+      void work.then(() => finalizers.delete(work), () => finalizers.delete(work));
+      try {
+        await boundedWait(work, config.shutdownTimeoutMs);
+        return await work;
+      } catch (error) {
+        if (error instanceof NativeHostCleanupError) controller.abort(error);
+        throw error;
+      }
+    };
+    let sourceReplyReceiptState: NativeSourceReplyReceiptState | undefined;
     const toolMetas: Result["toolMetas"] = [];
     let hookContext: Parameters<LifecycleSdk["awaitAgentHarnessAgentEndHook"]>[0]["ctx"] | undefined;
     let assertContinuity: (() => void) | undefined;
@@ -210,7 +245,8 @@ export function createNativeHarness(
       isStopped: () => stopped,
       isAborted: () => signal.aborted,
       isAbortable: () => !stopped && !signal.aborted,
-      ownsLiveness: () => runtimeEntered && !runtimeSettled && !signal.aborted,
+      ownsLiveness: () => runtimeEntered && !runtimeSettled && !signal.aborted ||
+        (host?.getUnsettledOperationCount?.() ?? 0) > 0,
       isCompacting: () => false,
       abort: cancel, cancel,
     };
@@ -319,6 +355,8 @@ export function createNativeHarness(
           maintenance = await (dependencies.readMaintenanceContext ?? readNativeMaintenanceContext)(p, assertActive);
         } else {
           transcript = await dependencies.prepareTranscript(p, assertActive);
+          await (dependencies.assertSourceReplySettled ?? assertSourceReplySettled)(
+            config.stateDir, transcript.nativeStateId ?? p.sessionId);
           await runtime.recoverCompaction?.({
             ...route, sessionId: p.sessionId, nativeStateId: transcript.nativeStateId,
             runId: p.runId, workspaceDir: p.cwd ?? p.workspaceDir, signal, assertActive,
@@ -332,7 +370,8 @@ export function createNativeHarness(
         const history = transcript?.contextMessages ?? maintenance?.contextMessages ?? [];
         host = await dependencies.prepareHost(p, signal, assertActive, history,
           preparationPolicy && preparationGate ? { policy: preparationPolicy, gate: preparationGate } : undefined,
-          memory ? (config.toolAllowlist ?? ["read", "write"]).filter((name) => name === "read" || name === "write") : config.toolAllowlist);
+          memory ? (config.toolAllowlist ?? ["read", "write"]).filter((name) => name === "read" || name === "write") : config.toolAllowlist,
+          { cleanupTimeoutMs: config.shutdownTimeoutMs });
         assertActive();
         if (p.sourceReplyDeliveryMode === "message_tool_only" && !p.silentExpected && !memory && !host.deliverSourceReply) {
           failure("message-tool-only source reply requires a private current-source message route");
@@ -444,16 +483,30 @@ export function createNativeHarness(
             [undefined, "final_answer"].includes(Reflect.get(completedAssistant, "phase"))) {
           const text = completedAssistant.content.filter((block) => block.type === "text").map((block) => block.text).join("\n");
           if (text.trim() && !isSilentSourceReply(p, text)) {
+            const journal = await (dependencies.beginSourceReplyJournal ?? beginSourceReplyJournal)(
+              config.stateDir, transcript!.nativeStateId ?? p.sessionId, p.runId);
+            let journalState: NativeSourceReplyReceiptState = "unknown-after-started";
             try {
               sourceReplyDelivery = await host.deliverSourceReply!(text, signal);
+              journalState = "confirmed-delivered";
             } catch (error) {
-              if (error instanceof SourceReplyDeliveryError) sourceReplyDelivery = error.delivery;
+              if (error instanceof SourceReplyDeliveryError) {
+                sourceReplyDelivery = error.delivery;
+                sourceReplyReceiptState = error.receiptState;
+                journalState = error.receiptState;
+                await finalize(Promise.resolve(p.onAgentEvent?.({ stream: "dsh-native", sessionKey: p.sessionKey,
+                  data: { diagnostic: "stability", stage: error.stage ?? "source-reply",
+                    receiptState: error.receiptState, replaySafe: error.replaySafe,
+                     runId: p.runId, privateCallId: error.privateCallId } })));
+              }
               throw error;
+            } finally {
+              await journal.settle(journalState);
             }
             assertActive();
           }
         }
-        if (streamedReasoning) await p.onReasoningEnd?.();
+        if (streamedReasoning) await finalize(Promise.resolve(p.onReasoningEnd?.()));
         assertActive();
       } catch (error) {
         const committed = transcript?.getAssistantPersistence?.();
@@ -473,8 +526,8 @@ export function createNativeHarness(
           }
         };
         if (host) await cleanup(() => host!.dispose());
-        if (attached) await cleanup(() => p.replyOperation!.detachBackend(handle));
-        if (registered) await cleanup(() => sdk!.clearActiveEmbeddedRun(p.sessionId, handle, p.sessionKey, p.sessionFile, "dsh-native-settled"));
+        if (attached) await cleanup(() => finalize(Promise.resolve(p.replyOperation!.detachBackend(handle))));
+        if (registered) await cleanup(() => finalize(Promise.resolve(sdk!.clearActiveEmbeddedRun(p.sessionId, handle, p.sessionKey, p.sessionFile, "dsh-native-settled"))));
       }
       const replay = host?.getReplayState() ?? {
         hadPotentialSideEffects: p.initialReplayState?.hadPotentialSideEffects === true,
@@ -482,6 +535,7 @@ export function createNativeHarness(
       };
       // DSH consumes the native turn durably; automatic replay cannot safely use the mirror as history.
       if (runtimeEntered || emittedVisibleOutput) replay.replaySafe = false;
+      if (sourceReplyReceiptState && sourceReplyReceiptState !== "confirmed-not-delivered") replay.replaySafe = false;
       const result: Result = {
         terminal, sessionIdUsed: p.sessionId, sessionFileUsed: p.sessionFile, agentHarnessId: RUNTIME_ID,
         messagesSnapshot: transcript?.messages ?? maintenance?.messages ?? [], assistantTexts: completedAssistant
@@ -507,14 +561,14 @@ export function createNativeHarness(
       };
       if (sdk && hookContext) {
         try {
-          await sdk.awaitAgentHarnessAgentEndHook({
+          await finalize(sdk.awaitAgentHarnessAgentEndHook({
             ctx: hookContext, event: {
               runId: p.runId, messages: transcript?.contextMessages ?? [], success: terminal.kind === "ok",
               durationMs: Date.now() - startedAt,
               ...(terminal.kind === "failed" ? { error: describe(terminal.error) } :
                 terminal.kind === "ok" ? {} : { error: terminal.kind }),
             },
-          });
+          }));
         } catch (error) {
           if (terminal.kind === "ok") result.terminal = { kind: "failed", source: "prompt", error };
         }
@@ -542,7 +596,7 @@ export function createNativeHarness(
             };
             // Publish only the committed, rewritten/redacted final snapshot. Raw partial
             // callbacks stay separate; the Gateway cannot build its final from history.
-            await p.onAgentEvent?.(event);
+            await finalize(Promise.resolve(p.onAgentEvent?.(event)));
             assertPublishable();
             sdk.emitAgentEvent({
               ...event, runId: p.runId, sessionId: p.sessionId,
@@ -561,8 +615,16 @@ export function createNativeHarness(
     } finally {
       settled = true;
       if (timer) clearTimeout(timer);
-      if (claimed && active.get(p.sessionId) === owner) active.delete(p.sessionId);
-      release();
+      const releaseOwner = () => {
+        if (claimed && active.get(p.sessionId) === owner) active.delete(p.sessionId);
+        release();
+      };
+      const hostSettled = host?.settled;
+      const unsettled = host?.getUnsettledOperationCount?.() ?? 0;
+      if (unsettled > 0 || finalizers.size) {
+        void Promise.allSettled([...(hostSettled && unsettled > 0 ? [hostSettled] : []), ...finalizers]).then(releaseOwner);
+      }
+      else releaseOwner();
     }
   }
 
@@ -680,7 +742,7 @@ export function createNativeHarness(
       for (const [sessionId, run] of active) {
         if (params.sessionId === sessionId || params.sessionKey && params.sessionKey === run.sessionKey) {
           run.controller.abort(new Error("DSH session reset"));
-          await run.done;
+          await boundedWait(run.done, config.shutdownTimeoutMs);
         }
       }
       // Old state is retained; a new host identity or clear-reset epoch starts fresh native history.
@@ -694,7 +756,7 @@ export function createNativeHarness(
           const errors = outcomes.filter((outcome) => outcome.status === "rejected").map((outcome) => outcome.reason);
           if (errors.length) throw new AggregateError(errors, "DSH harness disposal failed");
         }
-        finally { await Promise.all([...active.values()].map((run) => run.done)); }
+        finally { await boundedWait(Promise.all([...active.values()].map((run) => run.done)), config.shutdownTimeoutMs); }
       })();
       return disposal;
     },

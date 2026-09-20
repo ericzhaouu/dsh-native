@@ -15,6 +15,7 @@ export interface DshConfig {
   startupTimeoutMs: number;
   shutdownTimeoutMs: number;
   streamIdleTimeoutMs: number;
+  maxConcurrentRuns?: number;
   allowedBaseUrls: string[];
   allowedCopilotBaseUrls?: string[];
   taskPreparation?: TaskPreparationConfig;

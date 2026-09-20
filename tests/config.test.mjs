@@ -9,6 +9,20 @@ test("defaults are opt-in and use a dedicated absolute state directory", () => {
   const config = parseDshConfig(undefined);
   assert.ok(isAbsolute(config.stateDir));
   assert.deepEqual(config.allowedBaseUrls, ["https://api.deepseek.com"]);
+  assert.equal(config.maxConcurrentRuns, 8);
+});
+
+test("runtime concurrency guard is bounded and consistent with the manifest", async () => {
+  const manifest = JSON.parse(await readFile(new URL("../openclaw.plugin.json", import.meta.url), "utf8"));
+  const validate = new Ajv().compile(manifest.configSchema);
+  for (const value of [1, 2, 8, 64]) {
+    assert.equal(parseDshConfig({ maxConcurrentRuns: value }).maxConcurrentRuns, value);
+    assert.equal(validate({ maxConcurrentRuns: value }), true);
+  }
+  for (const value of [0, 65, 1.5, "8", null]) {
+    assert.throws(() => parseDshConfig({ maxConcurrentRuns: value }), /maxConcurrentRuns/);
+    assert.equal(validate({ maxConcurrentRuns: value }), false);
+  }
 });
 
 test("rejects unknown settings, relative state, credentials and remote plaintext", () => {

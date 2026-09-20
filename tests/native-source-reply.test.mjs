@@ -60,6 +60,7 @@ test("delivery flags are derived only from a verified message tool current-sourc
   });
   assert.equal(evidence.didSendViaMessagingTool, true);
   assert.equal(evidence.didDeliverSourceReplyViaMessageTool, true);
+  assert.equal(evidence.receiptState, "confirmed-delivered");
   assert.deepEqual(evidence.messagingToolSentTexts, ["Final text"]);
   assert.deepEqual(evidence.messagingToolSourceReplyPayloads, [{ text: "Final text", sourceReplyFinal: true }]);
   const denied = buildSourceReplyDeliveryEvidence({

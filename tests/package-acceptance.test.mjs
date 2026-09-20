@@ -150,6 +150,15 @@ test("fails closed for a wrong archive hash", async () => {
   assert.equal(report.findings[0].code, "archive-sha-mismatch");
 });
 
+test("allows only the explicit read-only recovery inspector, not arbitrary bundled scripts", async () => {
+  const allowed = await writeTgz("inspector.tgz", goodEntries([["package/scripts/inspect-state.mjs", "export {};\n"]]));
+  assert.equal((await checkPackage({ packagePath: allowed })).ok, true);
+  const rejected = await writeTgz("unapproved-script.tgz", goodEntries([["package/scripts/private-rollout.mjs", "export {};\n"]]));
+  const report = await checkPackage({ packagePath: rejected });
+  assert.equal(report.ok, false);
+  assert.ok(report.findings.some((item) => item.code === "unexpected-file"));
+});
+
 test("accepts only the explicit reversible compaction companion patch modules", async () => {
   const allowed = goodEntries([
     ["package/host-patch/engine.mjs", "export {};\n"],

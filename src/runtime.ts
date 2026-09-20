@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, open, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -13,6 +13,7 @@ import {
   type BridgeCompactResult, type BridgeContextUsage, type BridgeEvent, type BridgeResult, type BridgeToolCall, type BridgeUsage,
 } from "./protocol.js";
 import { asError, JsonRpcPeer } from "./rpc.js";
+import { createDurableOwnership, writeDurableJson, type DurableOwnership } from "./durable-state.js";
 import type { DshAttempt, DshCompactAttempt, DshConfig, DshRuntime } from "./runtime-types.js";
 import {
   PREPARATION_TOOL_NAME, parsePreparationPolicy, parsePreparationRequest,
@@ -126,15 +127,18 @@ function policyFingerprint(policy: PreparationPolicy): string {
 }
 
 async function saveState(path: string, state: SessionState): Promise<void> {
-  const temp = `${path}.${randomUUID()}.tmp`;
-  try {
-    const file = await open(temp, "wx", 0o600);
-    try { await file.writeFile(JSON.stringify(state)); await file.sync(); }
-    finally { await file.close(); }
-    await rename(temp, path);
-  } finally {
-    await rm(temp, { force: true });
-  }
+  await writeDurableJson(path, state);
+}
+
+async function finishOwnership(lock: DurableOwnership, release: boolean, apiKey: string): Promise<void> {
+  let failure: unknown;
+  try { if (release) await lock.release(); }
+  catch (error) { failure = error; }
+  try { await lock.handle.close(); }
+  catch (error) { failure ??= error; }
+  if (failure) throw Object.assign(new Error(
+    `DSH ownership cleanup is unconfirmed; inspect its lock. ${asError(failure).message.replaceAll(apiKey, "[redacted]")}`),
+  { code: "DSH_TERMINATION_UNCONFIRMED" });
 }
 
 function childEnvironment(home: string, apiKey: string): NodeJS.ProcessEnv {
@@ -256,24 +260,37 @@ export function createDshRuntime(config: DshConfig): DshRuntime {
   const active = new Set<AbortController>();
   const running = new Set<Promise<unknown>>();
   let disposed = false;
+  let unconfirmedOperations = 0;
+  const maxConcurrentRuns = config.maxConcurrentRuns ?? 8;
+  if (!Number.isSafeInteger(maxConcurrentRuns) || maxConcurrentRuns < 1 || maxConcurrentRuns > 64) {
+    throw new Error("Invalid DSH runtime concurrency limit.");
+  }
+  const admit = () => {
+    if (disposed) throw new Error("dsh-native runtime has been disposed.");
+    if (active.size + unconfirmedOperations >= maxConcurrentRuns) throw new Error("DSH runtime capacity reached before session admission; no operation was submitted.");
+  };
+  const trackUnconfirmed = (error: unknown): never => {
+    if (code(error) === "DSH_TERMINATION_UNCONFIRMED") unconfirmedOperations++;
+    throw error;
+  };
   const compact = (input: DshCompactAttempt) => {
-    if (disposed) return Promise.reject(new Error("dsh-native runtime has been disposed."));
+    try { admit(); } catch (error) { return Promise.reject(error); }
     const controller = new AbortController();
     active.add(controller);
     const result = compactChild(config, {
       ...input, signal: AbortSignal.any([input.signal, controller.signal]),
-    }).finally(() => { active.delete(controller); running.delete(result); });
+    }).catch(trackUnconfirmed).finally(() => { active.delete(controller); running.delete(result); });
     running.add(result);
     return result;
   };
   return {
     run(input) {
-      if (disposed) return Promise.reject(new Error("dsh-native runtime has been disposed."));
+      try { admit(); } catch (error) { return Promise.reject(error); }
       const controller = new AbortController();
       active.add(controller);
       const result = runChild(config, {
         ...input, signal: AbortSignal.any([input.signal, controller.signal]),
-      }).finally(() => { active.delete(controller); running.delete(result); });
+      }).catch(trackUnconfirmed).finally(() => { active.delete(controller); running.delete(result); });
       running.add(result);
       return result;
     },
@@ -283,6 +300,10 @@ export function createDshRuntime(config: DshConfig): DshRuntime {
       disposed = true;
       for (const controller of active) controller.abort();
       await Promise.allSettled([...running]);
+      if (unconfirmedOperations) {
+        throw Object.assign(new Error("DSH runtime disposal cannot confirm all prior operations stopped; inspect retained ownership locks."),
+          { code: "DSH_TERMINATION_UNCONFIRMED" });
+      }
     },
   };
 }
@@ -344,9 +365,9 @@ async function runChild(config: DshConfig, input: DshAttempt): Promise<BridgeRes
   await mkdir(home, { recursive: true, mode: 0o700 });
   const lockPath = join(directory, "owner.lock");
   let lock;
-  try { lock = await open(lockPath, "wx", 0o600); }
+  try { lock = await createDurableOwnership(lockPath, { runId: input.runId, operation: "run", stateKey: input.nativeStateId ?? input.sessionId }); }
   catch (error: unknown) {
-    if (code(error) === "EEXIST") {
+    if (code(error) === "ELOCKED") {
       throw new Error("This DSH session already has an owner. A stale lock requires operator inspection; start a new session.");
     }
     throw error;
@@ -356,7 +377,6 @@ async function runChild(config: DshConfig, input: DshAttempt): Promise<BridgeRes
   let submitted = false;
   let releaseLock = true;
   try {
-    await lock.writeFile(JSON.stringify({ pid: process.pid, runId: input.runId }));
     const previous = await loadState(statePath);
     if (previous && previous.status !== "ready") {
       throw new Error("Previous DSH outcome is uncertain; refusing to replay possible tool side effects. Start a new session.");
@@ -435,15 +455,17 @@ async function runChild(config: DshConfig, input: DshAttempt): Promise<BridgeRes
     return result;
   } catch (error: unknown) {
     if (error instanceof ChildTerminationError) releaseLock = false;
+    let persistenceFailure: unknown;
     if (submitted && state) {
       state.status = "blocked";
-      await saveState(statePath, state);
+      try { await saveState(statePath, state); }
+      catch (failure) { persistenceFailure = failure; releaseLock = false; }
     }
-    const message = asError(error).message.replaceAll(input.apiKey, "[redacted]");
-    throw new Error(message);
+    const message = asError(error).message.replaceAll(input.apiKey, "[redacted]") +
+      (persistenceFailure ? `; failure state could not be persisted (${code(persistenceFailure) ?? "I/O error"}); ownership retained.` : "");
+    throw Object.assign(new Error(message), !releaseLock ? { code: "DSH_TERMINATION_UNCONFIRMED" } : {});
   } finally {
-    await lock.close();
-    if (releaseLock) await rm(lockPath, { force: true });
+    await finishOwnership(lock, releaseLock, input.apiKey);
   }
 }
 
@@ -481,9 +503,9 @@ async function compactChild(config: DshConfig, input: DshCompactAttempt): Promis
   await mkdir(home, { recursive: true, mode: 0o700 });
   const lockPath = join(directory, "owner.lock");
   let lock;
-  try { lock = await open(lockPath, "wx", 0o600); }
+  try { lock = await createDurableOwnership(lockPath, { runId: input.runId, operation: "compact", stateKey: input.nativeStateId ?? input.sessionId }); }
   catch (error: unknown) {
-    if (code(error) === "EEXIST") {
+    if (code(error) === "ELOCKED") {
       throw new Error("This DSH session already has an owner. A stale lock requires operator inspection; start a new session.");
     }
     throw error;
@@ -493,7 +515,6 @@ async function compactChild(config: DshConfig, input: DshCompactAttempt): Promis
   let submitted = false;
   let releaseLock = true;
   try {
-    await lock.writeFile(JSON.stringify({ pid: process.pid, runId: input.runId, operation: "compact" }));
     const previous = await loadState(statePath);
     if (input.recoverOnly && (!previous || previous.status === "ready" && !previous.pendingCompact)) {
       return { compacted: false, sessionId: previous?.sessionId ?? input.sessionId, details: { recovered: false } };
@@ -552,16 +573,18 @@ async function compactChild(config: DshConfig, input: DshCompactAttempt): Promis
     return result;
   } catch (error: unknown) {
     if (error instanceof ChildTerminationError) releaseLock = false;
+    let persistenceFailure: unknown;
     if (submitted && state) {
       state.status = "running";
       state.pendingCompact ??= { runId: input.runId };
-      await saveState(statePath, state);
+      try { await saveState(statePath, state); }
+      catch (failure) { persistenceFailure = failure; releaseLock = false; }
     }
-    const message = asError(error).message.replaceAll(input.apiKey, "[redacted]");
-    throw new Error(message);
+    const message = asError(error).message.replaceAll(input.apiKey, "[redacted]") +
+      (persistenceFailure ? `; failure state could not be persisted (${code(persistenceFailure) ?? "I/O error"}); ownership retained.` : "");
+    throw Object.assign(new Error(message), !releaseLock ? { code: "DSH_TERMINATION_UNCONFIRMED" } : {});
   } finally {
-    await lock.close();
-    if (releaseLock) await rm(lockPath, { force: true });
+    await finishOwnership(lock, releaseLock, input.apiKey);
   }
 }
 
@@ -583,7 +606,26 @@ async function executeChild(
   const child = spawn(process.execPath, [cliPath, "--profile", "sdk-minimal", "--patch", patchPath], {
     cwd: directory, env: childEnvironment(home, input.apiKey),
     stdio: ["pipe", "pipe", "pipe"], windowsHide: true, shell: false,
+    detached: process.platform === "linux",
   });
+  const signalChild = (signal: NodeJS.Signals = "SIGTERM") => {
+    if (process.platform === "linux" && child.pid !== undefined) {
+      try { process.kill(-child.pid, signal); }
+      catch (error) { if (code(error) !== "ESRCH") throw error; }
+    } else if (child.exitCode === null && child.signalCode === null) child.kill(signal);
+  };
+  const groupActive = () => {
+    if (process.platform !== "linux" || child.pid === undefined) return false;
+    try { process.kill(-child.pid, 0); return true; }
+    catch (error) { if (code(error) === "ESRCH") return false; throw error; }
+  };
+  const waitGroupClosed = async (ms: number) => {
+    const deadline = Date.now() + ms;
+    while (groupActive()) {
+      if (Date.now() >= deadline) throw new Error("DSH process group termination is unconfirmed.");
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  };
   let stage: ChildLifecycleStage = "spawn";
   let stderr = "";
   const diagnostic = (message: string): string => {
@@ -609,7 +651,6 @@ async function executeChild(
     childFailure ??= failure;
     rejectChildFailed(childFailure);
     peer?.close(childFailure, { fatal: true });
-    if (stream === "stderr") child.kill();
     return childFailure;
   };
   child.once("close", resolveClosed);
@@ -620,7 +661,7 @@ async function executeChild(
   if (!child.stdin || !child.stdout || !child.stderr) {
     const missing = !child.stdin ? "stdin" : !child.stdout ? "stdout" : "stderr";
     const failure = recordChildFailure(missing, new Error("missing stdio"));
-    child.kill();
+    signalChild();
     try {
       await timeout(childClosed, Math.min(config.shutdownTimeoutMs, 1000), "DSH child has not exited.");
     } catch (error: unknown) {
@@ -636,6 +677,7 @@ async function executeChild(
   const toolControllers = new Map<string, AbortController>();
   const toolTasks = new Set<Promise<unknown>>();
   const preparationTasks = new Set<Promise<void>>();
+  const eventTasks = new Set<Promise<void>>();
   const seenCalls = new Set<string>();
   const hostToolNames = input.tools.map((tool) => tool.name);
   const onPreparationDecision = input.onPreparationDecision;
@@ -645,13 +687,16 @@ async function executeChild(
   let dispatchedTools = 0;
   let preparationFailure: Error | undefined;
   let abortTimer: NodeJS.Timeout | undefined;
+  let rejectCancellation!: (error: Error) => void;
+  const cancellationExpired = new Promise<never>((_resolve, reject) => { rejectCancellation = reject; });
+  void cancellationExpired.catch(() => {});
   const failPreparation = (error: unknown): Error => {
     preparationFailure ??= asError(error);
     acceptingTools = false;
     resolved = undefined;
     for (const controller of toolControllers.values()) controller.abort();
     peer?.close(preparationFailure, { fatal: true });
-    child.kill();
+    signalChild();
     return preparationFailure;
   };
   peer = new JsonRpcPeer(child.stdout, child.stdin, {
@@ -659,7 +704,14 @@ async function executeChild(
       if (method !== "event") throw new Error("Unknown worker notification.");
       const event = parseEvent(params);
       if (event.type === "tool-cancel") toolControllers.get(event.callId)?.abort();
-      await input.onEvent(event);
+      if (input.signal.aborted) {
+        if (event.type === "ready") input.signal.throwIfAborted();
+        // Drain the worker's interrupted result without forwarding late visible events.
+        return;
+      }
+      const task = Promise.resolve().then(() => input.onEvent(event));
+      eventTasks.add(task);
+      try { await task; } finally { eventTasks.delete(task); }
       if (event.type === "ready") {
         input.signal.throwIfAborted();
         input.assertActive();
@@ -736,8 +788,13 @@ async function executeChild(
   const abort = (): void => {
     acceptingTools = false;
     for (const controller of toolControllers.values()) controller.abort();
-    void peer!.notify("cancel", {}).catch(() => { child.kill(); });
-    abortTimer ??= setTimeout(() => { child.kill(); }, config.shutdownTimeoutMs);
+    void peer!.notify("cancel", {}).catch((error: unknown) => rejectCancellation(asError(error)));
+    // Enter bounded finalization even if the worker ignores both cancel and TERM.
+    abortTimer ??= setTimeout(() => {
+      const error = new Error("DSH cancellation acknowledgement timed out.");
+      rejectCancellation(error);
+      peer?.close(error, { fatal: true });
+    }, config.shutdownTimeoutMs);
   };
   input.signal.addEventListener("abort", abort, { once: true });
   try {
@@ -747,6 +804,7 @@ async function executeChild(
       peer.closed.then(() => { throw preparationFailure ?? peer!.failureReason ?? childFailure ??
         new Error(diagnostic("DSH stopped before bridge initialization")); }),
       childFailed,
+      cancellationExpired,
       childClosed.then((value) => { throw childFailure ?? new Error(diagnostic(`DSH startup exited (${value})`)); }),
     ]), config.startupTimeoutMs, () => diagnostic("DSH bridge startup timed out"));
     input.signal.throwIfAborted();
@@ -770,6 +828,7 @@ async function executeChild(
         reasoningEffort: input.reasoningEffort, maxTokens: input.maxTokens,
       }),
       childFailed,
+      cancellationExpired,
       childClosed.then((value) => { throw childFailure ?? peer!.failureReason ??
         new Error(diagnostic(`DSH exited during run (${value})`)); }),
     ]);
@@ -790,7 +849,7 @@ async function executeChild(
     if (preparationRequested && !resolved) {
       throw new Error("DSH aborted before its parent preparation callback completed.");
     }
-    await peer.drain();
+    await timeout(Promise.race([peer.drain(), cancellationExpired]), config.shutdownTimeoutMs, "DSH event drain timed out.");
     stage = "shutdown";
     await timeout(Promise.race([
       peer.request("shutdown", {}),
@@ -798,10 +857,10 @@ async function executeChild(
       childClosed.then((value) => { throw childFailure ?? peer!.failureReason ??
         new Error(diagnostic(`DSH exited before shutdown acknowledgement (${value})`)); }),
     ]), config.shutdownTimeoutMs, "DSH shutdown did not acknowledge.");
-    await peer.drain();
+    await timeout(Promise.race([peer.drain(), cancellationExpired]), config.shutdownTimeoutMs, "DSH shutdown drain timed out.");
     child.stdin.end();
     const exitCode = await timeout(childClosed, config.shutdownTimeoutMs, "DSH did not exit after shutdown.");
-    await peer.drain();
+    await timeout(Promise.race([peer.drain(), cancellationExpired]), config.shutdownTimeoutMs, "DSH final drain timed out.");
     if (childFailure) throw childFailure;
     if (exitCode !== 0) throw new Error(diagnostic(`DSH shutdown failed (${exitCode})`));
     if (preparationFailure) throw preparationFailure;
@@ -816,16 +875,19 @@ async function executeChild(
     for (const controller of toolControllers.values()) controller.abort();
     peer?.close();
     if (child.pid !== undefined) {
-      if (child.exitCode === null && child.signalCode === null) child.kill();
       try {
-        await timeout(childClosed, Math.min(config.shutdownTimeoutMs, 1000), "DSH child has not exited.");
-      } catch {
-        child.kill("SIGKILL");
-        try { await timeout(childClosed, config.shutdownTimeoutMs, "DSH child termination is unconfirmed."); }
-        catch (error: unknown) {
-          throw new ChildTerminationError("DSH child could not be terminated; retaining its session ownership lock.",
-            { cause: error });
+        if (child.exitCode === null && child.signalCode === null || groupActive()) signalChild();
+        try {
+          const graceMs = Math.min(config.shutdownTimeoutMs, 1000);
+          await timeout(Promise.all([childClosed, waitGroupClosed(graceMs)]), graceMs,
+            "DSH child or its process group has not exited.");
+        } catch {
+          signalChild("SIGKILL");
+          await timeout(Promise.all([childClosed, waitGroupClosed(config.shutdownTimeoutMs)]),
+            config.shutdownTimeoutMs, "DSH child termination is unconfirmed.");
         }
+      } catch (error) {
+        throw new ChildTerminationError("DSH child could not be terminated; retaining its session ownership lock.", { cause: error });
       }
     }
     try {
@@ -841,6 +903,11 @@ async function executeChild(
     } catch (error: unknown) {
       throw new ChildTerminationError("DSH preparation callback did not settle; retaining its session ownership lock.",
         { cause: error });
+    }
+    try {
+      await timeout(Promise.allSettled([...eventTasks]), config.shutdownTimeoutMs, "DSH event callback did not settle.");
+    } catch (error) {
+      throw new ChildTerminationError("DSH event callback cancellation is unconfirmed; retaining its session ownership lock.", { cause: error });
     }
   }
 }
