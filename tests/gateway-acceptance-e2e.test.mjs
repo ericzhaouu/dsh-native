@@ -54,6 +54,17 @@ test("acceptance adapter observes real Gateway frames, canonical records and DSH
     assert.equal(result.turns[0].sessionId, result.turns[1].sessionId);
     assert.notEqual(result.turns[0].nativeSessionId, result.turns[1].nativeSessionId);
     assert.equal(result.usage.modelRequests, gateway.responses.requests.length);
+    assert.equal(result.budgetAttestation.status, "legacy-unattested");
+    assert.equal(result.budgetAttestation.hardLimitsVerified, false);
     assert.equal((await adapter.cleanupCase(task, context)).cleaned, true);
+    const requestsBefore = gateway.responses.requests.length;
+    const budgeted = { ...task, id: "genuine-budget-preflight" };
+    const blocked = await adapter.executeCase(budgeted, { ...context, operationalBudget: {
+      maxModelRequests: 4, maxInputTokens: 262144, maxOutputTokens: 8192, maxToolCalls: 4, maxDurationMs: 180000,
+    } });
+    assert.equal(blocked.executionStatus, "infrastructure_blocked");
+    assert.equal(blocked.budgetAttestation.hardLimitsVerified, false);
+    assert.match(blocked.policyFacts.blockedReason, /proof unsupported/);
+    assert.equal(gateway.responses.requests.length, requestsBefore, "Missing runtime enforcement must block before provider work");
   } finally { await gateway.close(); }
 });

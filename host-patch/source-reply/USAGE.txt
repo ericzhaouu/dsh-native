@@ -1,0 +1,40 @@
+NATIVE CURRENT-SOURCE TRANSCRIPT OWNERSHIP -- OPENCLAW 2026.9.2
+
+This companion fixes a dual-writer ownership defect exposed by actual Feishu
+continuations: message normalization removed Markdown hardbreak spaces, defeating
+the host's exact-text delivery-mirror deduplication after DSH committed its final.
+
+The patch is required for updated DSH message_tool_only source delivery.
+Unpatched tools fail during preparation, before model inference or a send.
+The model-visible schema remains {action:"send", message:committedText, final:true}.
+No model parameter can grant transcript suppression.
+
+The trusted plugin binds one committed assistant to the core tool out of band.
+The grant includes agent, session, run, active reset state and assistant identity.
+The host consumes it for exactly one private invocation, checks its resolved
+destination matches the source, and rechecks the canonical snapshot immediately
+before delivery. Only the redundant mirror is suppressed; platform send,
+credentials, policy hooks, receipts and unknown-delivery fences remain in force.
+Ordinary tool calls without the grant retain their original mirror behavior.
+
+Current scope: local, text-only current-source delivery and internal-UI replies.
+Remote/gateway action forwarding, cross-session routes and media are rejected,
+not silently sent without validated ownership. This does not provide exactly-once
+platform delivery or authorize automatic retry after uncertainty.
+
+  node host-patch\source-reply\apply.mjs --root C:\PATH\TO\openclaw --check
+
+Stop/drain the selected Gateway under an exclusive maintenance window before:
+
+  node host-patch\source-reply\apply.mjs --root C:\PATH\TO\openclaw --apply --offline-confirmed
+  node host-patch\source-reply\apply.mjs --root C:\PATH\TO\openclaw --restore --offline-confirmed
+
+Only the exact pinned 2026.9.2 artifact is supported. Files are hash checked and
+backed up with an independent receipt. Unknown builds, edits or corrupt backups
+are rejected. Agent-pin, compaction-auth and table-policy patches are independent.
+Restart after a successful apply or restore. Do not restore this patch while the
+updated plugin still requires private source replies.
+
+Previously contaminated histories are NOT rewritten or automatically repaired.
+Preserve their evidence and use an explicitly authorized new test/session epoch;
+never delete foreign rows, relabel them native, remove locks or loosen the guard.

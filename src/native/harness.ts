@@ -17,6 +17,8 @@ import {
   isSilentSourceReply, SourceReplyDeliveryError, type NativeSourceReplyDelivery, type NativeSourceReplyReceiptState,
 } from "./source-reply.js";
 import { assertSourceReplySettled, beginSourceReplyJournal } from "./delivery-journal.js";
+import { prepareSourceReplyOwnership } from "./source-reply-ownership.js";
+import { rethrowBudgetFailure } from "../bridge/budget-terminal.js";
 
 type Attempt = Parameters<AgentHarnessV2["runAttempt"]>[0];
 type Result = Awaited<ReturnType<AgentHarnessV2["runAttempt"]>>;
@@ -38,6 +40,7 @@ export interface NativeHarnessDependencies {
   readMaintenanceContext?: typeof readNativeMaintenanceContext;
   assertSourceReplySettled?: typeof assertSourceReplySettled;
   beginSourceReplyJournal?: typeof beginSourceReplyJournal;
+  prepareSourceReplyOwnership?: typeof prepareSourceReplyOwnership;
 }
 
 const defaults: NativeHarnessDependencies = {
@@ -326,7 +329,7 @@ export function createNativeHarness(
         p.onAttemptTimeoutArmed?.();
         sdk = await dependencies.loadSdk();
         assertActive();
-        if (config.taskPreparation && !p.agentId) {
+        if ((config.taskPreparation || config.operationalBudgetByAgent) && !p.agentId) {
           const { sessionAgentId } = sdk.resolveSessionAgentIds({ config: p.config, sessionKey: p.sessionKey });
           p = { ...p, agentId: sessionAgentId };
         }
@@ -359,8 +362,9 @@ export function createNativeHarness(
             config.stateDir, transcript.nativeStateId ?? p.sessionId);
           await runtime.recoverCompaction?.({
             ...route, sessionId: p.sessionId, nativeStateId: transcript.nativeStateId,
+            agentId: p.agentId,
             runId: p.runId, workspaceDir: p.cwd ?? p.workspaceDir, signal, assertActive,
-          });
+          }).catch(rethrowBudgetFailure);
         }
         assertActive();
         assertContinuity = transcript && dependencies.prepareContinuity?.(
@@ -404,6 +408,7 @@ export function createNativeHarness(
         assertActive();
         const output = await runtime.run({
           ...route, sessionId: p.sessionId, runId: p.runId,
+          agentId: p.agentId,
           nativeStateId: memory ? `${maintenance!.nativeStateId}\0memory\0${p.runId}` : transcript!.nativeStateId,
           workspaceDir: p.cwd ?? p.workspaceDir, prompt: host.prompt, systemPrompt: host.systemPrompt,
           tools: host.tools, signal,
@@ -434,7 +439,7 @@ export function createNativeHarness(
               throw error;
             }
           },
-        });
+        }).catch(rethrowBudgetFailure);
         runtimeSettled = true;
         assertActive();
         assertContinuity?.();
@@ -483,11 +488,15 @@ export function createNativeHarness(
             [undefined, "final_answer"].includes(Reflect.get(completedAssistant, "phase"))) {
           const text = completedAssistant.content.filter((block) => block.type === "text").map((block) => block.text).join("\n");
           if (text.trim() && !isSilentSourceReply(p, text)) {
+            const ownership = host.sourceReplyOwnershipRequired
+              ? await (dependencies.prepareSourceReplyOwnership ?? prepareSourceReplyOwnership)(
+                p, completedAssistant, idempotencyKey, assertActive)
+              : undefined;
             const journal = await (dependencies.beginSourceReplyJournal ?? beginSourceReplyJournal)(
               config.stateDir, transcript!.nativeStateId ?? p.sessionId, p.runId);
             let journalState: NativeSourceReplyReceiptState = "unknown-after-started";
             try {
-              sourceReplyDelivery = await host.deliverSourceReply!(text, signal);
+              sourceReplyDelivery = await host.deliverSourceReply!(text, signal, ownership);
               journalState = "confirmed-delivered";
             } catch (error) {
               if (error instanceof SourceReplyDeliveryError) {
@@ -676,6 +685,8 @@ export function createNativeHarness(
         ...route,
         provider,
         sessionId: p.sessionId,
+        agentId: p.agentId ?? (config.operationalBudgetByAgent
+          ? sdk.resolveSessionAgentIds({ config: p.config, sessionKey: p.sessionKey }).sessionAgentId : undefined),
         nativeStateId: context.nativeStateId,
         runId,
         workspaceDir: p.cwd ?? p.workspaceDir,
@@ -684,7 +695,7 @@ export function createNativeHarness(
           assertActive();
           p.compactionTimeoutReset?.();
         },
-      });
+      }).catch(rethrowBudgetFailure);
       await context.assertCurrent();
       return {
         ok: true,

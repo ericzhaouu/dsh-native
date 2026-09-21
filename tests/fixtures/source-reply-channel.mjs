@@ -9,6 +9,7 @@ import { createChannelMessageAdapterFromOutbound } from "openclaw/plugin-sdk/cha
 export const SOURCE_REPLY_CHANNEL_ID = "dsh-reply-fixture";
 export const SOURCE_REPLY_PLUGIN_ID = "dsh-source-reply-fixture";
 export const SOURCE_REPLY_ACCOUNT_ID = "fixture-account";
+export const sourceReplySessionKey = (agentId) => `agent:${agentId}:${SOURCE_REPLY_CHANNEL_ID}:group:source-reply-chat`;
 const SOURCE_TARGET = "chat:source-reply-chat";
 const schema = {
   type: "object", additionalProperties: false,
@@ -75,7 +76,8 @@ export function registerSourceReplyFixture(api) {
         ctx.setStatus({ ...ctx.getStatus(), running: false, connected: false });
       },
     },
-    messaging: { normalizeTarget: (target) => target.trim(),
+    messaging: { normalizeTarget: (target) => target.trim().replace(/^chat:/u, ""),
+      inferTargetChatType: () => "group",
       targetResolver: { looksLikeId: (target) => target.startsWith("chat:"), hint: "chat:source-reply-chat" } },
     actions: { describeMessageTool: () => ({ actions: ["send"], capabilities: ["presentation"] }) },
     outbound,

@@ -7,6 +7,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { createGatewayAcceptanceAdapter, nativeTurnEvidence } from "./gateway-acceptance-adapter.mjs";
 import { validateUsageShape, zeroUsage } from "./acceptance-contract.mjs";
+import { createFeishuAcceptanceControls, FEISHU_CONTROL_CONTRACT } from "./feishu-acceptance-controls.mjs";
 
 const execFileDefault = promisify(execFileCallback);
 const packageRoot = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
@@ -16,7 +17,10 @@ const sumUsage = (a, b) => Object.fromEntries([
   ...usageKeys.map((key) => [key, (a[key] ?? 0) + (b[key] ?? 0)]), ["priced", false],
 ]);
 const DELIVERY_CONTROLS = new Set(["plain-nonce", "unicode-format", "long-bounded", "new-reset-prompt"]);
-const UNSAFE_CONTROLS = new Set(["duplicate-replay", "reconnect-card"]);
+const FAULT_CONTROLS = new Set(Object.keys(FEISHU_CONTROL_CONTRACT.operations));
+const unconfirmedSettlement = "Previous source reply settlement is unconfirmed";
+const scopeKey = ({ agentId, accountId, chatId, channel }, evidenceClass) =>
+  JSON.stringify([evidenceClass, agentId, accountId, chatId, channel]);
 
 function textOf(message) {
   if (typeof message?.content === "string") return message.content;
@@ -245,6 +249,8 @@ export async function createFeishuAcceptanceAdapter(options = {}) {
   const deps = options.deps ?? await defaultDeps(config);
   const execFile = options.execFile ?? execFileDefault;
   const states = new Map();
+  const unknownScopes = new Set();
+  let faultControls;
   let receiptSequence = 0;
   const storeEnv = { ...process.env, OPENCLAW_STATE_DIR: config.stateDir, OPENCLAW_CONFIG_PATH: config.configPath };
   const lark = async (args, context, label) => {
@@ -384,22 +390,110 @@ export async function createFeishuAcceptanceAdapter(options = {}) {
     }, context.signal, 240000, "actual Feishu bot reply readback");
   }
 
+  async function executeFaultControl(testCase, context, state, type) {
+    let ticket;
+    let scope;
+    try {
+      // Only function-valued capabilities supplied by the test host can cross this gate.
+      // Nothing from the case, prompt, environment or private JSON config grants authority.
+      assert.ok(options.transportControls?.provider, "Missing receipted host/channel control backend capability");
+      const agentId = config.logicalAgentMap[testCase.agentProfile];
+      assert.ok(agentId, "Agent profile not authorized for Feishu delivery");
+      const physical = selectPhysical(JSON.parse(await readFile(config.chatLedgerPath, "utf8")), agentId);
+      scope = { agentId, accountId: agentId, chatId: physical.chatId, channel: "feishu" };
+      assert.deepEqual(options.transportControls.scope, scope, "Control provider does not own the exact private ledger scope");
+      const evidenceClass = options.transportControls?.evidenceClass ?? "actual-feishu";
+      assert.ok(!unknownScopes.has(scopeKey(scope, evidenceClass)), unconfirmedSettlement);
+      faultControls ??= createFeishuAcceptanceControls(options.transportControls);
+      ticket = await faultControls.prepare({
+        caseId: testCase.id, runId: context.runId, type, prompt: testCase.prompt, scope, signal: context.signal,
+      });
+    } catch (error) {
+      state.settled = true;
+      const prerequisite = {
+        type, requiredOperations: FEISHU_CONTROL_CONTRACT.operations[type],
+        reason: error.message, evidenceClass: options.transportControls?.evidenceClass ?? "actual-feishu",
+      };
+      await appendLedger(context, { event: "delivery_control_blocked", caseId: testCase.id, ...prerequisite });
+      return { ...block(`Feishu ${type} prerequisite unavailable: ${error.message}; no input sent`), prerequisite };
+    }
+    await mkdir(context.runDir, { recursive: true, mode: 0o700 });
+    const marker = join(context.runDir, `feishu-case-${hash(`${context.runId}:${testCase.id}`).slice(0, 24)}.json`);
+    await writeFile(marker, JSON.stringify({ caseId: testCase.id, runId: context.runId, type }), { flag: "wx", mode: 0o600 });
+    await appendLedger(context, { event: "delivery_control_planned", caseId: testCase.id, type });
+    state.faultStarted = true;
+    state.faultScope = scope;
+    state.evidenceClass = options.transportControls.evidenceClass ?? "actual-feishu";
+    try {
+      const result = await faultControls.execute(ticket, { signal: context.signal });
+      const { observation, evidenceClass, receipt } = result;
+      const usageErrors = validateUsageShape(observation.usage);
+      assert.equal(usageErrors.length, 0, `Missing verified control usage: ${usageErrors.join("; ")}`);
+      assert.equal(observation.usage.modelRequests, observation.modelRequests, "Usage differs from verified model count");
+      assert.equal(observation.usage.userTurns, 1, "Transport controls must admit one original user turn");
+      assert.equal(observation.usage.toolCalls, 0, "Transport controls cannot authorize business tool side effects");
+      context.reportUsage(observation.usage);
+      const delivered = observation.delivery.acknowledgement === "received";
+      if (!delivered) unknownScopes.add(scopeKey(scope, evidenceClass));
+      const delivery = {
+        delivered, terminalOutputs: observation.terminalReplyIds.length,
+        receiptId: observation.delivery.receiptId, acknowledgement: observation.delivery.acknowledgement,
+        recipient: scope.chatId, inboundId: observation.inboundMessageId,
+        transport: evidenceClass === "actual-feishu" ? "feishu" : "isolated-sdk",
+      };
+      state.settled = true;
+      await appendLedger(context, {
+        event: "delivery_control_verified", caseId: testCase.id, type, evidenceClass,
+        receiptIdHash: hash(receipt.receiptId), verificationId: receipt.verificationId,
+        inboundIdHash: hash(observation.inboundEventId), acknowledgement: delivery.acknowledgement,
+      });
+      return {
+        executionStatus: "completed", businessResult: "partial", outputText: observation.outputText,
+        evidenceClass, channelCertified: evidenceClass === "actual-feishu",
+        usage: observation.usage, sideEffects: [], delivery, controlReceipts: [receipt],
+        turns: [{ agentProfile: testCase.agentProfile, prompt: testCase.prompt, outputText: observation.outputText,
+          executionStatus: "completed", runId: observation.runIds[0], usage: observation.usage,
+          tools: [], delivery }],
+        policyFacts: {
+          adapter: evidenceClass, actualReadbackReceipt: evidenceClass === "actual-feishu",
+          verifiedTransportControl: true, noAutomaticResend: true,
+          observedModelRequests: observation.modelRequests, observedRunCount: observation.runIds.length,
+        },
+      };
+    } catch (error) {
+      state.settled = false;
+      await appendLedger(context, { event: "delivery_control_unresolved", caseId: testCase.id, type, reason: error.message });
+      throw error;
+    }
+  }
+
   return {
     async executeCase(testCase, context) {
       if (testCase.category !== "delivery") return gateway.executeCase(testCase, context);
       const type = controlType(testCase);
+      const previous = states.get(testCase.id);
+      if (previous?.faultStarted && !previous.settled) {
+        return block("Previous transport control is unresolved; no automatic resend or cleanup certification");
+      }
       const state = { settled: false, delivery: true };
       states.set(testCase.id, state);
-      if (UNSAFE_CONTROLS.has(type)) {
-        state.settled = true;
-        await appendLedger(context, { event: "delivery_control_blocked", caseId: testCase.id, type });
-        return block(`No safe authentic Feishu ${type} platform control is available; no input sent`);
-      }
+      if (FAULT_CONTROLS.has(type)) return executeFaultControl(testCase, context, state, type);
       if (!DELIVERY_CONTROLS.has(type)) { state.settled = true; return block("Unsupported Feishu delivery control; no input sent"); }
       const agentId = config.logicalAgentMap[testCase.agentProfile];
       if (!agentId) { state.settled = true; return block("Agent profile not authorized for Feishu delivery"); }
       const ledgerDoc = JSON.parse(await readFile(config.chatLedgerPath, "utf8"));
       const physical = selectPhysical(ledgerDoc, agentId);
+      const realScope = { agentId, accountId: agentId, chatId: physical.chatId, channel: "feishu" };
+      if (unknownScopes.has(scopeKey(realScope, "actual-feishu"))) {
+        state.settled = true;
+        return block(`${unconfirmedSettlement}; no additional input sent`);
+      }
+      if ([...states.values()].some((value) => value.faultStarted && !value.settled &&
+        value.evidenceClass === "actual-feishu" && value.faultScope?.agentId === agentId &&
+        value.faultScope?.chatId === physical.chatId)) {
+        state.settled = true;
+        return block("This actual Feishu scope has an unresolved transport operation; no additional input sent");
+      }
       await mkdir(context.runDir, { recursive: true, mode: 0o700 });
       const marker = join(context.runDir, `feishu-case-${hash(`${context.runId}:${testCase.id}`).slice(0, 24)}.json`);
       await writeFile(marker, JSON.stringify({ caseId: testCase.id, runId: context.runId, type }), { flag: "wx", mode: 0o600 });
@@ -425,6 +519,7 @@ export async function createFeishuAcceptanceAdapter(options = {}) {
           const reset = await waitForReset(physical, agentId, before, context);
           controlReceipts.push({
             type: "new-reset-prompt", transportControlled: true, selfAsserted: false,
+            evidenceClass: "actual-feishu",
             receiptId: reset.boundary.resetId, controlMessageId: resetMessage.outboundId,
           });
         }
@@ -471,6 +566,7 @@ export async function createFeishuAcceptanceAdapter(options = {}) {
         };
         return {
           executionStatus: turn.executionStatus, businessResult: "partial", outputText,
+          evidenceClass: "actual-feishu",
           turns: [turn], usage, sideEffects: effects.effects,
           unknownEffects: effects.unknown || business.length > 0 || undefined,
           controlReceipts, controlMessages: state.controlMessages ?? [],

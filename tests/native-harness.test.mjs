@@ -8,6 +8,7 @@ import { parseTaskPreparationConfig, resolvePreparationDecision } from "../dist/
 
 const sourceModules = new Map([
   "native/harness", "native/host", "native/source-reply", "native/tool-bridge", "native/delivery-journal", "durable-state", "preparation",
+  "native/isolated", "config", "bridge/budget-terminal",
 ].map((name) => [
   new URL(`../dist/${name}.js`, import.meta.url).href,
   new URL(`../src/${name}.ts`, import.meta.url),

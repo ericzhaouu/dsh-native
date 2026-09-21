@@ -15,6 +15,10 @@ export async function createPatchedHostFixture(root, { compactionAuth = false } 
   // A separately installed optional SDK has its own dependency tree.
   await symlink(dirname(await realpath(source)), join(host, "node_modules"), "junction");
   await patchHost(host, { action: "apply", offlineConfirmed: true });
+  const { patchHost: patchSourceReply } = await import("../../host-patch/source-reply/apply.mjs");
+  await patchSourceReply(host, { action: "apply", offlineConfirmed: true });
+  const { patchHost: patchTablePolicy } = await import("../../host-patch/table-policy/apply.mjs");
+  await patchTablePolicy(host, { action: "apply", offlineConfirmed: true });
   if (compactionAuth) {
     const { patchHost: patchCompactionAuth } = await import("../../host-patch/compact-auth/apply.mjs");
     await patchCompactionAuth(host, { action: "apply", offlineConfirmed: true });

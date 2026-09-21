@@ -81,6 +81,7 @@ const tool = (name, fields = {}) => ({ name, label: name, description: name, par
   execute: async () => ({ content: [{ type: "text", text: "ok" }] }), ...fields });
 const messageTool = (fields = {}) => tool("message", {
   parameters: messageSchema,
+  bindNativeSourceReplyOwnership() {},
   execute: async (_id, args) => ({ content: [{ type: "text", text: "sent" }],
     details: { deliveredText: args.message, messageDelivery: { sourceReplyDelivered: true, status: "settled" } } }),
   ...fields,
@@ -191,8 +192,17 @@ test("private current-source message is forced for construction but never advert
   assert.match(host.systemPrompt, /Available policy-filtered host tools: \(none\)/);
   assert.doesNotMatch(host.systemPrompt, /Available policy-filtered host tools: message/);
   assert.equal(typeof host.deliverSourceReply, "function");
-  const delivered = await host.deliverSourceReply("Final current-source reply", signal());
+  assert.equal(host.sourceReplyOwnershipRequired, true);
+  const delivered = await host.deliverSourceReply("Final current-source reply", signal(), {
+    text: "Final current-source reply",
+  });
   assert.equal(delivered.sourceReplyDelivered, true);
+});
+
+test("an unpatched core message tool is rejected before native inference", async (t) => {
+  await assert.rejects(prepare(t, {}, {
+    constructedTools: [messageTool({ bindNativeSourceReplyOwnership: undefined })],
+  }, []), /ownership host companion patch/);
 });
 
 test("explicit run-level tool denies are preserved for private source replies", async (t) => {

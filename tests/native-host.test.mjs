@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { registerHooks } from "node:module";
 import { readFileSync } from "node:fs";
 import ts from "typescript";
+import { AgentHarnessPreflightError } from "openclaw/plugin-sdk/agent-harness-runtime";
 
 // Load source in memory, including the main-owned preparation contract; never write shared dist output.
 const sourceModules = new Map(["native/host", "native/source-reply", "native/tool-bridge", "preparation"].map((name) => [
@@ -590,26 +591,65 @@ test("host prompt injects workspace bootstrap, skill prompt and extra instructio
   assert.equal(prompt.split("Keep output brief.").length, 2);
 });
 
-test("unsupported capabilities fail closed before constructing tools", () => {
+function unsupportedContract(reason) {
+  return (error) => {
+    assert.ok(error instanceof AgentHarnessPreflightError, error.stack);
+    assert.equal(error.scope, undefined);
+    assert.equal(error.code, undefined, "unsupported contracts are not transcript corruption");
+    assert.equal(error.message, `DSH native host does not support ${reason}`);
+    assert.ok(error.cause instanceof Error);
+    assert.equal(error.cause.message, error.message);
+    return true;
+  };
+}
+
+test("unsupported capabilities are explicit terminal preflight decisions before constructing tools", () => {
   const base = { hostCapabilities: { bindToolSurface() {} } };
   assert.doesNotThrow(() => assertNativeHostSupported(base));
   assert.doesNotThrow(() => assertNativeHostSupported({ ...base, taskSuggestionDeliveryMode: "gateway" }));
   assert.doesNotThrow(() => assertNativeHostSupported({ ...base, sourceReplyDeliveryMode: "message_tool_only" }));
+  assert.doesNotThrow(() => assertNativeHostSupported({ ...base, forceMessageTool: true, sourceReplyDeliveryMode: "message_tool_only" }));
+  assert.doesNotThrow(() => assertNativeHostSupported({ ...base, cronCreationCapability: {
+    invoke() { assert.fail("foreground cron creation authority must not be invoked"); },
+  } }));
   assert.doesNotThrow(() => assertNativeHostSupported({ ...base, skillLibraryAuthoring: {
     invoke() { throw new Error("Optional authoring must not be invoked"); },
   } }));
-  for (const fields of [
-    { clientTools: [{}] }, { images: [{}] }, { media: [{}] }, { sandbox: { enabled: true } },
-    { execOverrides: { host: "node" } }, { toolOverrides: { mcpServers: [] } }, { permissionMode: "full" },
-    { forceMessageTool: true }, { enableHeartbeatTool: true },
-    { runtimePluginToolGrant: {} }, { modelRun: true }, { codeModeOverride: true },
-    { taskSuggestionDeliveryMode: "message_tool" },
-    { skillWorkshopProposalOnly: true }, { skillWorkshopAutonomousCapture: true },
-    { skillWorkshopUpdateProposals: {} }, { skillWorkshopCollectionReconcile: true },
-    { skillWorkshopProposalRevision: {} },
-    { config: { agents: { defaults: { sandbox: { mode: "all" } } } } },
-    { config: { tools: { exec: { host: "node" } } } },
-  ]) assert.throws(() => assertNativeHostSupported({ ...base, ...fields }), /does not support/);
+  for (const [fields, reason] of [
+    [{ hostCapabilities: undefined }, "runs without a host-bound tool capability"],
+    [{ clientTools: [{}] }, "clientTools"],
+    ...[{ images: [{}] }, { media: [{}] }, { imageOrder: [0] }, { currentInboundAudio: {} }]
+      .map((fields) => [fields, "media input"]),
+    ...[{ sandbox: { enabled: true } }, { sandbox: { required: true } }]
+      .map((fields) => [fields, "sandbox placement"]),
+    [{ execOverrides: { host: "node" } }, "remote or sandbox exec placement"],
+    ...[{ execOverrides: { node: "remote" } }, { execOverrides: { nodeCwd: "remote" } },
+      { config: { tools: { exec: { node: "remote" } } } }]
+      .map((fields) => [fields, "node exec placement"]),
+    [{ toolOverrides: { mcpServers: [] } }, "session tool/MCP overrides"],
+    [{ permissionMode: "full" }, "session permission overrides"],
+    [{ sessionRoot: "relative" }, "noncanonical session root overrides"],
+    [{ sessionRoot: process.cwd() }, "noncanonical session root overrides"],
+    [{ forceMessageTool: true }, "message-tool-only delivery"],
+    ...[{ enableHeartbeatTool: true }, { forceHeartbeatTool: true }]
+      .map((fields) => [fields, "structured heartbeat tools"]),
+    ...[{ runtimePluginToolGrant: {} }, { toolBindings: { tool: {} } }]
+      .map((fields) => [fields, "plugin tool grants/bindings"]),
+    ...[{ modelRun: true }, { promptMode: "none" }]
+      .map((fields) => [fields, "raw-model prompt mode"]),
+    ...[{ codeModeOverride: true }, { forceCodeModeTools: true }]
+      .map((fields) => [fields, "Code Mode"]),
+    [{ taskSuggestionDeliveryMode: "message_tool" }, "task suggestion delivery"],
+    ...[{ swarmCollector: {} }, { swarmOutputSchema: {} }]
+      .map((fields) => [fields, "swarm collector tools"]),
+    ...[{ scheduledToolPolicy: { mode: "trusted" } }, { scheduledRuntimeAuthority: {} }]
+      .map((fields) => [fields, "scheduled tool authority"]),
+    ...[{ skillWorkshopProposalOnly: true }, { skillWorkshopAutonomousCapture: true },
+      { skillWorkshopUpdateProposals: {} }, { skillWorkshopCollectionReconcile: true },
+      { skillWorkshopProposalRevision: {} }].map((fields) => [fields, "Skill Workshop authority"]),
+    [{ config: { agents: { defaults: { sandbox: { mode: "all" } } } } }, "unresolved sandbox policy"],
+    [{ config: { tools: { exec: { host: "node" } } } }, "remote or sandbox exec placement"],
+  ]) assert.throws(() => assertNativeHostSupported({ ...base, ...fields }), unsupportedContract(reason));
 });
 
 test("canonical session roots work while canonical per-agent remote placement fails closed", () => {
@@ -617,12 +657,18 @@ test("canonical session roots work while canonical per-agent remote placement fa
     workspaceDir: process.cwd(), sessionRoot: process.cwd() };
   assert.doesNotThrow(() => assertNativeHostSupported(base));
   assert.doesNotThrow(() => assertNativeHostSupported({ ...base, cwd: join(process.cwd(), "src") }));
-  assert.throws(() => assertNativeHostSupported({ ...base, cwd: join(process.cwd(), "..") }), /outside/);
-  assert.throws(() => assertNativeHostSupported({ ...base, sessionRoot: join(process.cwd(), "other") }), /noncanonical/);
-  for (const policy of [{ sandbox: { mode: "all" } }, { tools: { exec: { host: "node" } } }]) {
+  assert.throws(() => assertNativeHostSupported({ ...base, cwd: join(process.cwd(), "..") }),
+    unsupportedContract("working directories outside the canonical session root"));
+  assert.throws(() => assertNativeHostSupported({ ...base, sessionRoot: join(process.cwd(), "other") }),
+    unsupportedContract("noncanonical session root overrides"));
+  for (const [policy, reason] of [
+    [{ sandbox: { mode: "all" } }, "unresolved sandbox policy"],
+    [{ tools: { exec: { host: "node" } } }, "remote or sandbox exec placement"],
+    [{ tools: { exec: { node: "remote" } } }, "node exec placement"],
+  ]) {
     assert.throws(() => assertNativeHostSupported({
       ...base, config: { agents: { entries: { main: policy } } },
-    }), /does not support/);
+    }), unsupportedContract(reason));
   }
 });
 

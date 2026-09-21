@@ -1,6 +1,6 @@
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
-import { isRecord } from "./protocol.js";
+import { isRecord, type OperationalBudget } from "./protocol.js";
 import type { DshConfig } from "./runtime-types.js";
 import { COPILOT_ENDPOINTS } from "./copilot-policy.js";
 import { parseTaskPreparationConfig, parseToolAllowlist } from "./preparation.js";
@@ -10,7 +10,59 @@ const KEYS = new Set([
   "taskPreparation",
   "toolAllowlist",
   "maxConcurrentRuns",
+  "operationalBudget", "operationalBudgetByAgent",
 ]);
+
+const BUDGET_KEYS = ["maxModelRequests", "maxInputTokens", "maxOutputTokens", "maxToolCalls", "maxDurationMs"] as const;
+
+function budgetConfigError(message: string): never {
+  throw Object.assign(new TypeError(message), { code: "DSH_BUDGET_EXCEEDED" });
+}
+
+function budgetRecord(value: unknown, label: string): Record<string, unknown> {
+  if (!isRecord(value) || ![Object.prototype, null].includes(Object.getPrototypeOf(value))) {
+    return budgetConfigError(`${label} must be a plain object.`);
+  }
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  if (Reflect.ownKeys(descriptors).some((key) => typeof key !== "string" || !("value" in descriptors[key]!))) {
+    return budgetConfigError(`${label} must contain only data properties.`);
+  }
+  return value;
+}
+
+export function parseOperationalBudget(value: unknown): OperationalBudget {
+  const input = budgetRecord(value, "operationalBudget");
+  if (Reflect.ownKeys(input).length !== BUDGET_KEYS.length ||
+      BUDGET_KEYS.some((key) => !Object.hasOwn(input, key) ||
+        typeof input[key] !== "number" || !Number.isSafeInteger(input[key]) || input[key] <= 0)) {
+    return budgetConfigError("operationalBudget requires all five positive safe integer limits and no extra fields.");
+  }
+  return Object.fromEntries(BUDGET_KEYS.map((key) => [key, input[key]])) as unknown as OperationalBudget;
+}
+
+function parseAgentBudgets(value: unknown): Record<string, OperationalBudget> {
+  const input = budgetRecord(value, "operationalBudgetByAgent");
+  const agents = Object.getOwnPropertyNames(input);
+  if (agents.length > 64 ||
+      agents.some((key) => !/^[a-z][a-z0-9_-]{0,63}$/.test(key))) {
+    return budgetConfigError("operationalBudgetByAgent requires at most 64 exact Agent identifiers.");
+  }
+  return Object.fromEntries(agents.map((agent) => [agent, parseOperationalBudget(input[agent])]));
+}
+
+/** Global, exact-Agent and trusted per-attempt caps can only narrow one another. */
+export function resolveOperationalBudget(
+  config: Pick<DshConfig, "operationalBudget" | "operationalBudgetByAgent">,
+  agentId?: string,
+  attemptCap?: OperationalBudget,
+): OperationalBudget | undefined {
+  const byAgent = config.operationalBudgetByAgent === undefined ? undefined : parseAgentBudgets(config.operationalBudgetByAgent);
+  const selected = agentId && byAgent && Object.hasOwn(byAgent, agentId) ? byAgent[agentId] : undefined;
+  const caps = [config.operationalBudget, selected, attemptCap]
+    .filter((cap) => cap !== undefined).map(parseOperationalBudget);
+  if (!caps.length) return undefined;
+  return Object.fromEntries(BUDGET_KEYS.map((key) => [key, Math.min(...caps.map((cap) => cap[key]))])) as unknown as OperationalBudget;
+}
 
 export function normalizeBaseUrl(value: string): string {
   const url = new URL(value);
@@ -62,6 +114,8 @@ export function parseDshConfig(value: unknown): DshConfig {
     allowedCopilotBaseUrls: copilotUrls.map((url: string) => normalizeBaseUrl(url)),
     ...(taskPreparation ? { taskPreparation } : {}),
     ...(toolAllowlist ? { toolAllowlist } : {}),
+    ...(input.operationalBudget === undefined ? {} : { operationalBudget: parseOperationalBudget(input.operationalBudget) }),
+    ...(input.operationalBudgetByAgent === undefined ? {} : { operationalBudgetByAgent: parseAgentBudgets(input.operationalBudgetByAgent) }),
   };
 }
 

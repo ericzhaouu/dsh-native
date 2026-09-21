@@ -1,7 +1,28 @@
 import assert from "node:assert/strict";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { readFileSync } from "node:fs";
+import { registerHooks } from "node:module";
 import test from "node:test";
-import { prepareNativeTranscript, readNativeMaintenanceContext } from "../dist/native/transcript.js";
+import ts from "typescript";
+
+const sourceModules = new Map(["transcript", "reset-boundary"].map((name) => [
+  new URL(`../dist/native/${name}.js`, import.meta.url).href,
+  new URL(`../src/native/${name}.ts`, import.meta.url),
+]));
+const sourceHooks = registerHooks({
+  resolve(specifier, context, next) {
+    const url = context.parentURL && new URL(specifier, context.parentURL).href;
+    return sourceModules.has(url) ? { url, shortCircuit: true } : next(specifier, context);
+  },
+  load(url, context, next) {
+    return sourceModules.has(url) ? { format: "module", shortCircuit: true,
+      source: ts.transpileModule(readFileSync(sourceModules.get(url), "utf8"),
+        { compilerOptions: { target: ts.ScriptTarget.ES2023, module: ts.ModuleKind.ESNext } }).outputText } : next(url, context);
+  },
+});
+const { prepareNativeTranscript, readNativeMaintenanceContext } = await import("../dist/native/transcript.js");
+const { resolveActiveResetBoundary } = await import("../dist/native/reset-boundary.js");
+sourceHooks.deregister();
 
 const USER_KEY = "run-1:user";
 const ASSISTANT_KEY = "dsh-native:run-1:assistant";
@@ -231,6 +252,118 @@ function fixture(overrides = {}) {
 function assertScope(actual, expected) {
   for (const [key, value] of Object.entries(expected)) assert.deepEqual(actual[key], value, key);
   assert.equal(Object.hasOwn(actual, "sessionFile"), false, "legacy sessionFile must not route storage");
+}
+
+const TERMINAL_CODE = "openclaw_transcript_not_continuable";
+function terminalError(message) {
+  return (error) => {
+    assert.ok(error instanceof Error);
+    assert.equal(error.name, "NativeTranscriptError");
+    assert.equal(error.code, TERMINAL_CODE);
+    assert.equal(error.message, message);
+    return true;
+  };
+}
+
+for (const [name, arrange, reason] of [
+  ["foreign assistant", (f) => {
+    f.add(user("previous", "old:user"));
+    f.add(assistant("mirror", "old:message-tool:mirror"));
+  }, "history contains a non-DSH assistant or ambiguous ownership; DSH owns its history. Start a fresh session with /new."],
+  ["missing admission", (f) => { f.state.persisted = user(); }, "persisted user has no authoritative admission receipt"],
+  ["mismatched admission", (f) => { f.adopt(f.add(user()), { sessionId: "other" }); },
+    "missing or mismatched user admission receipt"],
+  ["rewritten input", (f) => { f.state.resolved = user("different"); },
+    "rewritten user text differs from transcriptPrompt/prompt; provider submission is forbidden"],
+  ["invalid projection", (f) => { f.transport.readVisibleSessionTranscriptMessageEntries = async () => null; },
+    "invalid visible transcript projection"],
+  ["invalid raw events", (f) => { f.state.rawEvents = {}; }, "invalid raw transcript events"],
+]) {
+  test(`native ${name} is terminal without changing its diagnostic`, async () => {
+    const f = fixture();
+    arrange(f);
+    await assert.rejects(f.prepare(), terminalError(`DSH native transcript: ${reason}`));
+    assertNoWrites(f);
+  });
+}
+
+for (const [role, arrange, cause] of [
+  ["user", (f) => { f.add({ ...user("previous", "old:user"), content: [{ type: "image", data: "unsupported" }] }); },
+    "canonical user input must be plain text or a single text block"],
+  ["assistant", (f) => {
+    f.add(user("previous", "old:user"));
+    f.add({ ...assistant("previous", "dsh-native:old:assistant"), stopReason: "toolUse" });
+  }, "expected a canonical final text assistant message"],
+]) {
+  test(`unsupported ${role} history retains its validation cause and /new guidance`, async () => {
+    const f = fixture();
+    arrange(f);
+    await assert.rejects(f.prepare(), (error) => {
+      terminalError(`DSH native transcript: unsupported ${role} history; DSH owns its history. Start a fresh session with /new.`)(error);
+      terminalError(`DSH native transcript: ${cause}`)(error.cause);
+      return true;
+    });
+  });
+}
+
+for (const [name, events, message] of [
+  ["malformed reset", [{ type: "reset", id: " ", parentId: null }], "malformed reset transcript boundary"],
+  ["unknown reset context", [{ type: "reset", id: "r", parentId: null, context: "unknown" }], "unsupported reset boundary context"],
+  ["malformed retained tail", [{ type: "reset", id: "r", parentId: null, firstKeptEntryId: "" }], "malformed retained-tail reset boundary"],
+  ["malformed tree", [{ type: "message", id: "m", parentId: 7 }], "malformed transcript tree entry"],
+  ["duplicate tree identity", [
+    { type: "reset", id: "r", parentId: null }, { type: "reset", id: "r", parentId: null },
+  ], "duplicate transcript tree identity"],
+  ["dangling tree", [{ type: "reset", id: "r", parentId: "missing" }], "dangling active transcript branch"],
+  ["cyclic tree", [{ type: "reset", id: "r", parentId: "r" }], "cyclic active transcript branch"],
+  ["active compaction", [{ type: "compaction", id: "c", parentId: null }],
+    "unsupported active compaction boundary; start a fresh session with /new"],
+  ["active branch summary", [{ type: "branch_summary", id: "b", parentId: null }],
+    "unsupported active branch summary; start a fresh session with /new"],
+  ["retained reset tail", [{ type: "reset", id: "r", parentId: null, context: "preserve-tail" }],
+    "unsupported retained-tail reset boundary; start a fresh session with /new"],
+]) {
+  test(`${name} is terminal at the reset boundary and maintenance boundary`, async () => {
+    assert.throws(() => resolveActiveResetBoundary(events, "session-1"), terminalError(message));
+    const f = fixture();
+    f.state.rawEvents = events;
+    await assert.rejects(f.prepare(), terminalError(message));
+    await assert.rejects(readNativeMaintenanceContext(f.p, f.assertActive, f.transport), terminalError(message));
+    assertNoWrites(f);
+  });
+}
+
+for (const stage of ["resolve", "read", "raw read", "user write", "user hook", "assistant write", "assistant hook", "publish", "authority"]) {
+  test(`${stage} exceptions keep their identity, cause and non-terminal code`, async () => {
+    const f = fixture();
+    const cause = new Error("original external failure");
+    const error = Object.assign(new Error("temporary external failure", { cause }), { code: "ETIMEDOUT" });
+    const reject = () => { throw error; };
+    let run;
+    if (stage === "resolve") f.state.beforeResolve = reject;
+    if (stage === "read") f.state.beforeRead = reject;
+    if (stage === "raw read") f.state.beforeRawRead = reject;
+    if (stage === "authority") f.state.activeError = error;
+    if (["resolve", "read", "raw read", "authority"].includes(stage)) run = () => f.prepare();
+    else if (stage.startsWith("assistant")) {
+      const transcript = await f.ready();
+      if (stage === "assistant write") f.state.beforeStrict = reject;
+      else f.state.onHook = reject;
+      run = () => transcript.persistAssistant(assistant());
+    } else {
+      const transcript = await f.prepare();
+      if (stage === "user write") f.state.beforeUserPersist = reject;
+      if (stage === "user hook") f.state.onHook = reject;
+      if (stage === "publish") f.state.beforePublish = reject;
+      run = () => transcript.persistUser();
+    }
+    await assert.rejects(run(), (actual) => {
+      assert.equal(actual, error);
+      assert.equal(actual.cause, cause);
+      assert.equal(actual.code, "ETIMEDOUT");
+      return true;
+    });
+  });
 }
 
 test("maintenance reads a reset-scoped snapshot without admitting or persisting a user turn", async () => {

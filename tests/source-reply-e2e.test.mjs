@@ -3,16 +3,15 @@ import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { messageText, startDashboardGateway } from "./fixtures/dashboard-gateway.mjs";
-import { SOURCE_REPLY_ACCOUNT_ID } from "./fixtures/source-reply-channel.mjs";
+import { SOURCE_REPLY_ACCOUNT_ID, sourceReplySessionKey } from "./fixtures/source-reply-channel.mjs";
 
 const timeout = 600000;
-async function dispatch(gateway, prompt) {
-  const sessionKey = `agent:${gateway.agentId}:source-reply-${randomUUID()}`;
+async function dispatch(gateway, prompt, sessionKey = sourceReplySessionKey(gateway.agentId)) {
   const response = await gateway.chat.request("sourceReplyFixture.dispatch", {
     agentId: gateway.agentId, sessionKey, messageId: `inbound-${randomUUID()}`, text: prompt,
   }, { timeoutMs: 180000 });
   const history = await gateway.chat.request("chat.history", {
-    agentId: gateway.agentId, sessionKey, limit: 20,
+    agentId: gateway.agentId, sessionKey, limit: 200,
   }, { timeoutMs: 30000 });
   const records = await gateway.sourceReply.readRecords();
   return { response, history, records, sessionKey, diagnostics: JSON.stringify({
@@ -20,6 +19,36 @@ async function dispatch(gateway, prompt) {
     log: (await readFile(gateway.logPath, "utf8")).slice(-20000),
   }) };
 }
+
+test("50 committed source replies containing hardbreaks continue without a foreign mirror", { timeout }, async () => {
+  const formats = ["First  \nSecond  \nThird", "First\r\nSecond",
+    "```text\nkeep  \nspaces\tunchanged\n```\n\nAfter  \ncode", "Continued after formatted replies"];
+  const answers = Array.from({ length: 50 }, (_, i) => `${formats[i % formats.length]}\nTurn ${i + 1}`);
+  let index = 0;
+  const gateway = await startDashboardGateway(({ body, text, finish }) => {
+    assert.deepEqual(body.tools ?? [], []);
+    text(answers[index++]);
+    finish();
+  }, { sourceReplyFixture: {}, hostTools: [] });
+  try {
+    const sessionKey = sourceReplySessionKey(gateway.agentId);
+    for (let turn = 0; turn < answers.length; turn++) {
+      const result = await dispatch(gateway, `Continue this synthetic conversation, turn ${turn + 1}.`, sessionKey);
+      const attempts = result.records.filter((entry) => entry.kind === "native-attempt");
+      const nativeResults = result.records.filter((entry) => entry.kind === "native-result");
+      assert.equal(attempts.length, turn + 1, result.diagnostics);
+      assert.equal(nativeResults.at(-1).terminal, "ok", result.diagnostics);
+      const settled = await gateway.waitForDurableSettle(sessionKey, attempts.at(-1).runId);
+      assert.equal(messageText(settled.assistant), answers[turn]);
+      const assistants = result.history.messages.filter((message) => message.role === "assistant");
+      assert.equal(assistants.length, turn + 1, result.diagnostics);
+      assert.ok(assistants.every((message) => message.model !== "delivery-mirror"), result.diagnostics);
+      assert.equal(result.records.filter((entry) => entry.kind === "send-settled").length, turn + 1);
+    }
+    assert.equal(gateway.responses.requests.length, answers.length);
+    await gateway.assertHealthyLogs();
+  } finally { await gateway.close(); }
+});
 
 function assertNativeOutcome(records, terminal, delivered, diagnostics) {
   const attempts = records.filter((entry) => entry.kind === "native-attempt");

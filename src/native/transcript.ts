@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { isDeepStrictEqual } from "node:util";
 import type { AgentHarnessV2 } from "openclaw/plugin-sdk/agent-harness";
-import { resolveActiveResetBoundary, type ActiveResetBoundary } from "./reset-boundary.js";
+import { NativeTranscriptError, resolveActiveResetBoundary, type ActiveResetBoundary } from "./reset-boundary.js";
 
 type Attempt = Parameters<AgentHarnessV2["runAttempt"]>[0];
 type Result = Awaited<ReturnType<AgentHarnessV2["runAttempt"]>>;
@@ -68,12 +68,12 @@ function nonblank(value: unknown): value is string {
   return typeof value === "string" && value.length > 0 && value.trim() === value;
 }
 
-function fail(reason: string): never {
-  throw new Error(`DSH native transcript: ${reason}`);
+function fail(reason: string, options?: ErrorOptions): never {
+  throw new NativeTranscriptError(`DSH native transcript: ${reason}`, options);
 }
 
-function historyError(reason: string): never {
-  return fail(`${reason}; DSH owns its history. Start a fresh session with /new.`);
+function historyError(reason: string, options?: ErrorOptions): never {
+  return fail(`${reason}; DSH owns its history. Start a fresh session with /new.`, options);
 }
 
 function userText(message: unknown): string {
@@ -233,7 +233,10 @@ function validateHistory(
     const entry = entries[index]!;
     if (entry.role === "user") {
       if (pending) historyError("earlier unresolved user turns cannot be imported");
-      try { userText(entry.message); } catch { historyError("unsupported user history"); }
+      try { userText(entry.message); } catch (error) {
+        if (!(error instanceof NativeTranscriptError)) throw error;
+        historyError("unsupported user history", { cause: error });
+      }
       pending = entry;
     } else if (entry.role === "assistant") {
       const key = keyOf(entry.message);
@@ -241,7 +244,10 @@ function validateHistory(
           key.length <= assistantPrefix.length + ":assistant".length || keys.has(key)) {
         historyError("history contains a non-DSH assistant or ambiguous ownership");
       }
-      try { assistantMessage(entry.message); } catch { historyError("unsupported assistant history"); }
+      try { assistantMessage(entry.message); } catch (error) {
+        if (!(error instanceof NativeTranscriptError)) throw error;
+        historyError("unsupported assistant history", { cause: error });
+      }
       if (!pending) historyError("assistant history has no canonical user turn");
       if (key === assistantKey && pending.entryId !== current?.entryId) historyError("run id belongs to another user turn");
       if (pending.entryId === current?.entryId && (key !== assistantKey || index !== entries.length - 1)) {

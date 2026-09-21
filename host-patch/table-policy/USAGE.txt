@@ -1,0 +1,116 @@
+RU50-03: scoped host table-policy compatibility patch
+===================================================
+
+Status and scope
+---------------
+Local implementation and isolated tests only. No installed host was patched,
+no configuration was changed, and no gateway was stopped, started, or contacted.
+Live maintenance and integration remain owned by the main session.
+
+RC03/S19/S20 in the RU50 root-cause review show that case14's raw model output
+was already bullets under the host system instruction "Avoid Markdown tables."
+The native, canonical, and platform text matched. This patch fixes that host
+prompt conflict, not DSH prompts, output rewriting, or a proven Feishu renderer
+defect. It does not promise that a model will obey a requested format.
+
+Only buildGroupChatContext and its call site in get-reply-DsCSrfQ0.js change.
+The call site passes the host's already resolved cfg and agentId. The actual
+resolveAgentConfig must return runtime.type = "embedded" and
+runtime.harness = "dsh-native" for that agent. No message body, room title,
+inbound AgentId, model name, provider name, or session text selects the harness.
+Unpinned agents and other harnesses retain the original prompt byte for byte.
+Direct conversations, delivery ownership, silent replies, and other group
+guidance are unchanged. Existing Agent-pin support is a separate prerequisite
+for accepting/running that runtime configuration; this patch does not add it.
+
+Table semantics
+---------------
+The host's real resolveMarkdownTableMode reads account markdown.tables first,
+then channel markdown.tables (including legacy channel sections), then the
+loaded channel default, with code as its fallback. An unregistered channel
+also falls back to code; a config entry alone does not establish capability.
+The old group prompt only
+read messaging.defaultMarkdownTableMode and ignored configuration overrides.
+
+For the scoped agent, concise prose remains the default. An explicit user
+format request is honored within the resolved delivery policy:
+  off: Table conversion is disabled, NOT table output. Generate the requested
+       Markdown rows/columns as plain-text Markdown. Do not claim it renders
+       as a native table. This supports a textual Markdown table on Feishu
+       text delivery when its effective conversion mode is off.
+  code: Supply a compact code-block text table; explain the text fallback if
+        rendered Markdown was requested, without promising native rendering.
+  bullets: Explain that channel policy converts tables to bullets and supply
+           a labeled row-by-row list retaining every requested column value.
+  block: The generic group context has no affirmative runtime block-table
+         capability signal. Do NOT infer one from a plugin's default mode.
+         The real resolver conservatively downgrades block to code when
+         supportsBlockTables is not supplied. Use the text-table fallback.
+  unknown: Explain the unestablished rendering capability and use a labeled
+           list. Do not grant unsupported rendering capabilities.
+
+The generic converter leaves off-mode text unchanged, converts code/bullets,
+and treats block as code outside a block-capable channel implementation.
+This patch does not change those converters, channel configuration, or tools.
+There is no request-keyword detector: trusted policy describes how to honor
+explicit format requests without interpreting untrusted text as configuration.
+
+The local RU50 artifacts do NOT establish the campaign's effective Feishu
+markdown.tables or renderMode setting; the separately installed Feishu plugin
+is not present here. Tests use explicitly synthetic Feishu registry/config
+contexts with genuine host resolvers, not a claimed production configuration.
+Main integration must verify the actual channel/account mode and delivery
+path. Do not assume off, or equate it with rendered-table support.
+
+Supported build and safety
+--------------------------
+OpenClaw: exactly 2026.9.2
+Source commit: 3928bad9badfcb6c7d140530435e806fb8092190
+Target: dist\get-reply-DsCSrfQ0.js
+Original SHA256 (derived from the local installed artifact):
+51f917b5d5432abaa9de9ea1cc855ef72ba6e8d679614481be8d8eb45b1c2892
+Patch ID: openclaw-dsh-native-table-policy-v1
+Independent state/receipt: .dsh-native-table-policy-patch-v1
+
+Uses the existing createHostPatcher engine: exact version/hash, unique anchors,
+original backup, receipt validation, locking, atomic writes, and restoration.
+Check is read-only. Apply and restore require --offline-confirmed; the flag is
+an operator assertion, NOT a gateway stop or liveness check. The tool never
+restarts anything. Unsupported builds, missing/duplicate anchors, altered
+targets, incompatible receipts, and corrupt backups fail closed. Do not edit
+hashes to bypass rejection. A later host patch touching this same bundle must
+be explicitly composed and revalidated by main; independent receipts alone
+do not make overlapping edits compatible.
+
+Operator commands (future approved offline maintenance only)
+-----------------------------------------------------------
+Run from the dsh-native project; replace C:\offline\openclaw with the exact
+selected OpenClaw package directory. Do NOT use a live gateway installation.
+
+node host-patch\table-policy\apply.mjs --root C:\offline\openclaw --check
+node host-patch\table-policy\apply.mjs --root C:\offline\openclaw --apply --offline-confirmed
+node host-patch\table-policy\apply.mjs --root C:\offline\openclaw --restore --offline-confirmed
+
+Omitting the action defaults to check. Apply/restore are repeatable. Retain
+the receipt and original backup for rollback. Never restore over later edits.
+For an abandoned lock, inspect the recorded owner first; only after that
+process exits may the operator add --recover-stale-lock. Live owners are not
+displaced.
+
+Validation and main integration
+-------------------------------
+node --test --test-concurrency=1 tests\host-table-policy.test.mjs tests\host-compaction-auth.test.mjs tests\host-patch.test.mjs
+
+Tests copy genuine target bytes only into project-local .test-state fixtures,
+then clean up their own directories. They execute original/transformed host
+group/direct functions and the real group call site, using genuine agent,
+active-registry/generation, table-mode and table-conversion implementations. No model
+or network is used. They cover mode/account precedence, Agent isolation,
+unchanged delivery/silence guidance, exact anchors, check/apply/restore, CLI
+offline enforcement, independent patch receipts, and tamper rejection.
+
+Main must wire any shared integration fixture, compose with the other RU50
+fixes, and run the wider acceptance suite. It must check the deployed Feishu
+configuration and compare raw requested-table generation with text delivery
+separately. No package, shared fixture, source, or existing documentation was
+changed as part of this owned patch.

@@ -9,7 +9,30 @@
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
+    "definitions": {
+      "operationalBudget": {
+        "type": "object", "additionalProperties": false,
+        "required": ["maxModelRequests", "maxInputTokens", "maxOutputTokens", "maxToolCalls", "maxDurationMs"],
+        "properties": {
+          "maxModelRequests": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+          "maxInputTokens": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+          "maxOutputTokens": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+          "maxToolCalls": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+          "maxDurationMs": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 }
+        }
+      }
+    },
     "properties": {
+      "operationalBudget": {
+        "$ref": "#/definitions/operationalBudget",
+        "description": "Opt-in trusted per-attempt ceilings. Actual provider requests include retries/preparation/automatic compaction. Reserve contextWindow input before each request (not exact tokenization); known usage includes cache and reasoning. Output is clipped to the remaining aggregate allowance. Unknown usage retains durable reservations and fences replay. Duration stops admission and requests cancellation, not remote-quiescence proof. Explicit compaction/review are separately capped attempts. Omit for legacy behavior."
+      },
+      "operationalBudgetByAgent": {
+        "type": "object", "maxProperties": 64,
+        "propertyNames": { "pattern": "^[a-z][a-z0-9_-]{0,63}$" },
+        "additionalProperties": { "$ref": "#/definitions/operationalBudget" },
+        "description": "Exact trusted Agent ceilings per attempt, intersected with operationalBudget and any trusted host attempt cap. Unlisted Agents inherit the global cap, or remain unlimited when it is absent."
+      },
       "stateDir": {
         "type": "string",
         "description": "Absolute directory for private DSH sessions; default ~/.openclaw/dsh-native."

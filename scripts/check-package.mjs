@@ -171,6 +171,7 @@ function isAllowedPackageFile(path) {
   if (/^package\/examples\/[A-Za-z0-9._-]+\.json$/.test(path)) return true;
   if (/^package\/host-patch\/(?:apply|spec|engine)\.mjs$/.test(path)) return true;
   if (/^package\/host-patch\/compact-auth\/(?:apply|spec)\.mjs$/.test(path)) return true;
+  if (/^package\/host-patch\/(?:source-reply|table-policy|group-readonly)\/(?:(?:apply|spec)\.mjs|USAGE\.txt)$/.test(path)) return true;
   if (path === "package/host-patch/USAGE.txt") return true;
   if (path === "package/scripts/inspect-state.mjs") return true;
   return false;
@@ -324,6 +325,16 @@ export async function checkPackage(options) {
     for (const path of [...companionFiles, "package/host-patch/engine.mjs"]) requireFile(byPath, findings, path);
   } else if (byPath.get("package/host-patch/apply.mjs")?.data.toString("utf8").includes("./engine.mjs")) {
     requireFile(byPath, findings, "package/host-patch/engine.mjs");
+  }
+  for (const name of ["source-reply", "table-policy"]) {
+    const files = ["apply.mjs", "spec.mjs", "USAGE.txt"].map((file) => `package/host-patch/${name}/${file}`);
+    if (files.some((path) => byPath.has(path)) || byPath.has("package/dist/native/source-reply-ownership.js")) {
+      for (const path of [...files, "package/host-patch/engine.mjs"]) requireFile(byPath, findings, path);
+    }
+  }
+  const groupReadOnlyFiles = ["apply.mjs", "spec.mjs", "USAGE.txt"].map((file) => `package/host-patch/group-readonly/${file}`);
+  if (groupReadOnlyFiles.some((path) => byPath.has(path))) {
+    for (const path of [...groupReadOnlyFiles, "package/host-patch/engine.mjs"]) requireFile(byPath, findings, path);
   }
   if (manifest && shrinkwrap) {
     if (shrinkwrap.name !== manifest.name || shrinkwrap.version !== manifest.version) findings.push({ code: "shrinkwrap-root", path: "package/npm-shrinkwrap.json", detail: "root shrinkwrap name/version must match package.json" });

@@ -2,7 +2,7 @@
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { recomputeReportGates, validateReportShape } from "./lib/acceptance-evaluator.mjs";
+import { recomputeReport, validateReportShape } from "./lib/acceptance-evaluator.mjs";
 
 function usage() { return "Usage: node scripts\\evaluate-acceptance.mjs --report <report.json>"; }
 
@@ -22,10 +22,15 @@ export async function evaluateAcceptance(argv = process.argv.slice(2)) {
   const reportPath = resolve(args.report);
   const report = JSON.parse(await readFile(reportPath, "utf8"));
   const shapeErrors = validateReportShape(report);
-  const recomputedGates = shapeErrors.length ? {} : recomputeReportGates(report);
+  let rebuilt;
+  try { rebuilt = recomputeReport(report); }
+  catch (error) { shapeErrors.push(`report recomputation failed: ${error.message}`); }
+  const recomputedGates = rebuilt?.gates ?? {};
   const failedGates = Object.entries(recomputedGates).filter(([, status]) => status !== "passed");
-  const totals = report.totals ?? {};
-  const ok = shapeErrors.length === 0 && failedGates.length === 0 && report.passed === true && (totals.blocked ?? 0) === 0 && (totals.failed ?? 0) === 0;
+  if (shapeErrors.length) failedGates.push(["reportIntegrity", "failed"]);
+  const totals = rebuilt?.totals ?? {};
+  const legacyClean = report?.version !== 1 || ((totals.blocked ?? 0) === 0 && (totals.failed ?? 0) === 0);
+  const ok = shapeErrors.length === 0 && failedGates.length === 0 && rebuilt?.passed === true && legacyClean;
   return { code: ok ? 0 : 1, reportPath, shapeErrors, failedGates, recomputedGates, blocked: totals.blocked ?? 0, failed: totals.failed ?? 0 };
 }
 

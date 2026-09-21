@@ -1,16 +1,18 @@
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
-import { normalizeBaseUrl } from "./config.js";
+import { normalizeBaseUrl, parseOperationalBudget, resolveOperationalBudget } from "./config.js";
 import { COPILOT_ENDPOINTS, copilotHeaders } from "./copilot-policy.js";
 import { createBridgePatch } from "./bridge/profile.js";
+import { BudgetLedger, budgetError } from "./bridge/budget-ledger.js";
 import {
   BRIDGE_VERSION, DSH_VERSION, isRecord,
   type BridgeCompactResult, type BridgeContextUsage, type BridgeEvent, type BridgeResult, type BridgeToolCall, type BridgeUsage,
+  type OperationalBudget,
 } from "./protocol.js";
 import { asError, JsonRpcPeer } from "./rpc.js";
 import { createDurableOwnership, writeDurableJson, type DurableOwnership } from "./durable-state.js";
@@ -38,6 +40,7 @@ interface SessionState {
   compactRunIds?: string[];
   pendingCompact?: { runId: string };
   modelRoute?: string;
+  budgetFailure?: "DSH_BUDGET_EXCEEDED" | "DSH_BUDGET_UNCERTAIN";
   taskPreparation?: SessionPreparation;
 }
 
@@ -80,6 +83,7 @@ async function loadState(path: string): Promise<SessionState | undefined> {
         Object.keys(value.pendingCompact).some((key) => key !== "runId") ||
         typeof value.pendingCompact.runId !== "string" || !value.pendingCompact.runId) ||
       value.modelRoute !== undefined && (typeof value.modelRoute !== "string" || !/^[a-f0-9]{64}$/.test(value.modelRoute)) ||
+      value.budgetFailure !== undefined && !["DSH_BUDGET_EXCEEDED", "DSH_BUDGET_UNCERTAIN"].includes(String(value.budgetFailure)) ||
       typeof value.lastRunId !== "string" || !["ready", "running", "blocked"].includes(String(value.status))) {
     throw new Error("Invalid or incompatible DSH session state; start a new OpenClaw session.");
   }
@@ -111,6 +115,7 @@ async function loadState(path: string): Promise<SessionState | undefined> {
     ...(value.compactRunIds ? { compactRunIds: value.compactRunIds } : {}),
     ...(value.pendingCompact ? { pendingCompact: { runId: String(value.pendingCompact.runId) } } : {}),
     modelRoute: value.modelRoute,
+    ...(value.budgetFailure ? { budgetFailure: value.budgetFailure as SessionState["budgetFailure"] } : {}),
     status: value.status === "ready" ? "ready" : value.status === "running" ? "running" : "blocked",
     ...(taskPreparation ? { taskPreparation } : {}),
   };
@@ -130,15 +135,25 @@ async function saveState(path: string, state: SessionState): Promise<void> {
   await writeDurableJson(path, state);
 }
 
-async function finishOwnership(lock: DurableOwnership, release: boolean, apiKey: string): Promise<void> {
+async function finishOwnership(lock: DurableOwnership, release: boolean, apiKey: string,
+  ledger?: BudgetLedger, shutdownTimeoutMs = 1000, onUncertain?: () => Promise<void>): Promise<void> {
   let failure: unknown;
   try { if (release) await lock.release(); }
   catch (error) { failure = error; }
   try { await lock.handle.close(); }
   catch (error) { failure ??= error; }
-  if (failure) throw Object.assign(new Error(
-    `DSH ownership cleanup is unconfirmed; inspect its lock. ${asError(failure).message.replaceAll(apiKey, "[redacted]")}`),
-  { code: "DSH_TERMINATION_UNCONFIRMED" });
+  if (failure) {
+    if (ledger) {
+      try {
+        await timeout(Promise.allSettled([ledger.fence(), onUncertain?.()]),
+          shutdownTimeoutMs, "Budget fence persistence is unconfirmed.");
+      }
+      catch { /* Retain the authoritative uncertainty code. */ }
+    }
+    throw Object.assign(new Error(
+      `DSH ownership cleanup is unconfirmed; inspect its lock. ${asError(failure).message.replaceAll(apiKey, "[redacted]")}`),
+    { code: ledger ? "DSH_BUDGET_UNCERTAIN" : "DSH_TERMINATION_UNCONFIRMED" });
+  }
 }
 
 function childEnvironment(home: string, apiKey: string): NodeJS.ProcessEnv {
@@ -256,41 +271,213 @@ function timeout<T>(promise: Promise<T>, ms: number, message: string | (() => st
   ]).finally(() => clearTimeout(timer));
 }
 
+interface AttemptBudget {
+  cap: OperationalBudget;
+  admittedAt: number;
+}
+
+function snapshotAttempt<T extends DshAttempt | DshCompactAttempt>(config: DshConfig, input: T): {
+  input: T; budget?: AttemptBudget;
+} {
+  const snapshot = { ...input };
+  if (!Number.isSafeInteger(snapshot.contextWindow) || snapshot.contextWindow <= 0 ||
+      snapshot.maxTokens !== undefined && (!Number.isSafeInteger(snapshot.maxTokens) || snapshot.maxTokens <= 0)) {
+    throw new Error("DSH contextWindow and maxTokens must be positive safe integers.");
+  }
+  if (snapshot.agentId !== undefined && (typeof snapshot.agentId !== "string" || !snapshot.agentId.trim())) {
+    throw new Error("Invalid DSH agent identity.");
+  }
+  const resolved = resolveOperationalBudget(config, snapshot.agentId ?? "host", snapshot.operationalBudget);
+  if (resolved === undefined) return { input: snapshot };
+  const cap = structuredClone(parseOperationalBudget(resolved));
+  snapshot.operationalBudget = cap;
+  snapshot.maxTokens = Math.min(snapshot.maxTokens ?? snapshot.contextWindow, snapshot.contextWindow, cap.maxOutputTokens);
+  if (snapshot.contextWindow > cap.maxInputTokens) {
+    throw budgetError("DSH_BUDGET_EXCEEDED", "Input budget cannot reserve a full contextWindow.");
+  }
+  return { input: snapshot, budget: { cap, admittedAt: Date.now() } };
+}
+
+function budgetTimer(budget: AttemptBudget | undefined, controller: AbortController): () => void {
+  let timer: NodeJS.Timeout | undefined;
+  const tick = () => {
+    const remaining = budget!.cap.maxDurationMs - (Date.now() - budget!.admittedAt);
+    if (remaining <= 0) controller.abort(budgetError("DSH_BUDGET_EXCEEDED", "Operational duration budget exhausted."));
+    else timer = setTimeout(tick, Math.min(remaining, 2_147_483_647));
+  };
+  if (budget) tick();
+  return () => clearTimeout(timer);
+}
+
+function ledgerFor(directory: string, input: DshAttempt | DshCompactAttempt, budget: AttemptBudget,
+  purpose: "main" | "compaction"): BudgetLedger {
+  return new BudgetLedger(directory, {
+    version: 1, runId: input.runId, sessionKey: input.sessionId, agentId: input.agentId ?? "host",
+    operationalBudget: budget.cap, contextWindow: input.contextWindow, maxTokens: input.maxTokens!,
+  }, purpose, budget.admittedAt);
+}
+
+async function assertBudgetSettled(directory: string): Promise<void> {
+  const read = async (path: string) => {
+    try { return await readFile(path, "utf8"); }
+    catch (error) { if (code(error) === "ENOENT") return undefined; throw error; }
+  };
+  try {
+    const configText = await read(join(directory, "operational-budget-config.json"));
+    const ledgerText = await read(join(directory, "operational-budget-ledger.json"));
+    if (configText === undefined && ledgerText === undefined) {
+      try { await stat(join(directory, "budgets")); }
+      catch (error) { if (code(error) === "ENOENT") return; throw error; }
+      throw new Error("Missing budget evidence.");
+    }
+    if (configText === undefined || ledgerText === undefined) throw new Error("Incomplete budget evidence.");
+    const config: unknown = JSON.parse(configText);
+    const ledger: unknown = JSON.parse(ledgerText);
+    if (!isRecord(config) || !isRecord(ledger) || config.version !== 1 || ledger.version !== 1 ||
+        typeof config.runId !== "string" || !config.runId ||
+        ["runId", "sessionKey", "agentId"].some((key) => ledger[key] !== config[key]) ||
+        ledger.configSha256 !== createHash("sha256").update(JSON.stringify(config)).digest("hex") ||
+        !Array.isArray(ledger.entries) || ledger.entries[0]?.type !== "admitted" ||
+        ledger.entries.some((entry, seq) => !isRecord(entry) || entry.seq !== seq || entry.type === "fenced")) {
+      throw new Error("Invalid budget evidence.");
+    }
+    const terminal = ledger.entries.at(-1);
+    if (terminal?.type !== "settled" || terminal.providerSettled !== true || terminal.toolsSettled !== true) {
+      throw new Error("Unsettled budget evidence.");
+    }
+    const historical = join(directory, "budgets", createHash("sha256").update(config.runId).digest("hex"));
+    if (await read(join(historical, "operational-budget-config.json")) !== configText ||
+        await read(join(historical, "operational-budget-ledger.json")) !== ledgerText) {
+      throw new Error("Budget evidence mirrors disagree.");
+    }
+  } catch {
+    throw budgetError("DSH_BUDGET_UNCERTAIN", "Prior budget evidence is unsettled or unreadable; operator inspection is required.");
+  }
+}
+
+async function retainBudgetOwnership(directory: string, statePath: string, state: SessionState | undefined,
+  input: DshAttempt | DshCompactAttempt, operation: "run" | "compact"): Promise<void> {
+  if (state) { state.status = "blocked"; state.budgetFailure = "DSH_BUDGET_UNCERTAIN"; }
+  await Promise.allSettled([
+    state ? saveState(statePath, state) : Promise.resolve(),
+    (async () => {
+      try {
+        const retained = await createDurableOwnership(join(directory, "owner.lock"), {
+          runId: input.runId, operation, stateKey: input.nativeStateId ?? input.sessionId,
+        });
+        await retained.handle.close();
+      } catch (error) { if (code(error) !== "ELOCKED") throw error; }
+    })(),
+  ]);
+}
+
+function waitBudgetAdmission<T>(pending: Promise<T>, signal: AbortSignal): Promise<T> {
+  let abort!: () => void;
+  const cancelled = new Promise<never>((_, reject) => {
+    abort = () => reject(signal.reason);
+    signal.addEventListener("abort", abort, { once: true });
+    if (signal.aborted) abort();
+  });
+  return Promise.race([pending, cancelled]).finally(() => signal.removeEventListener("abort", abort));
+}
+
+async function hasBudgetHistory(directory: string, runId: string): Promise<boolean> {
+  try {
+    await stat(join(directory, "budgets", createHash("sha256").update(runId).digest("hex")));
+    return true;
+  } catch (error) {
+    if (code(error) === "ENOENT") return false;
+    throw error;
+  }
+}
+
+async function rejectLockedBudget(directory: string, budget?: AttemptBudget): Promise<void> {
+  if (!budget) {
+    try { await stat(join(directory, "budgets")); }
+    catch (error) { if (code(error) === "ENOENT") return; }
+  }
+  // A lock is an unresolved owner, not permission to retry on another model.
+  // Inspect only; never mutate another owner's evidence while rejecting admission.
+  throw budgetError("DSH_BUDGET_UNCERTAIN", "This budgeted DSH session already has an owner; operator inspection is required.");
+}
+
+async function finishBudget(ledger: BudgetLedger | undefined, error: unknown, shutdownTimeoutMs: number): Promise<unknown> {
+  if (!ledger) return error;
+  // JSON-RPC only carries an error message. Recover only our closed, explicit budget prefix.
+  const wireCode = /^DSH_BUDGET_(EXCEEDED|UNCERTAIN):/.exec(asError(error).message)?.[1];
+  if (!code(error) && wireCode) error = budgetError(`DSH_BUDGET_${wireCode}` as "DSH_BUDGET_EXCEEDED" | "DSH_BUDGET_UNCERTAIN",
+    "Budgeted worker rejected the operation.");
+  try {
+    const done = error instanceof ChildTerminationError || code(error) === "DSH_BUDGET_UNCERTAIN"
+      ? ledger.fence() : ledger.finish();
+    await timeout(done, shutdownTimeoutMs, "Budget finalization is unconfirmed.");
+  } catch {
+    // Latch independently of queued disk I/O; a deadline is never evidence of remote settlement.
+    void ledger.fence().catch(() => {});
+  }
+  return ledger.failure ?? error;
+}
+
+function operationError(error: unknown, releaseLock: boolean, persistenceFailure: unknown, apiKey: string,
+  ledger?: BudgetLedger): Error {
+  const errorCode = code(error) === "DSH_BUDGET_UNCERTAIN" ||
+    ledger?.failure && code(ledger.failure) === "DSH_BUDGET_UNCERTAIN" || ledger && !releaseLock
+    ? "DSH_BUDGET_UNCERTAIN"
+    : !releaseLock ? "DSH_TERMINATION_UNCONFIRMED" : code(error);
+  const message = asError(error).message.replaceAll(apiKey, "[redacted]") +
+    (persistenceFailure ? "; failure state could not be persisted; ownership retained." : "");
+  return Object.assign(new Error(message), errorCode ? { code: errorCode } : {});
+}
+
 export function createDshRuntime(config: DshConfig): DshRuntime {
   const active = new Set<AbortController>();
   const running = new Set<Promise<unknown>>();
   let disposed = false;
   let unconfirmedOperations = 0;
+  let uncertainBudgets = 0;
   const maxConcurrentRuns = config.maxConcurrentRuns ?? 8;
   if (!Number.isSafeInteger(maxConcurrentRuns) || maxConcurrentRuns < 1 || maxConcurrentRuns > 64) {
     throw new Error("Invalid DSH runtime concurrency limit.");
   }
   const admit = () => {
     if (disposed) throw new Error("dsh-native runtime has been disposed.");
-    if (active.size + unconfirmedOperations >= maxConcurrentRuns) throw new Error("DSH runtime capacity reached before session admission; no operation was submitted.");
+    if (active.size + unconfirmedOperations >= maxConcurrentRuns) {
+      const message = "DSH runtime capacity reached before session admission; no operation was submitted.";
+      if (uncertainBudgets) throw budgetError("DSH_BUDGET_UNCERTAIN", message);
+      throw new Error(message);
+    }
   };
   const trackUnconfirmed = (error: unknown): never => {
-    if (code(error) === "DSH_TERMINATION_UNCONFIRMED") unconfirmedOperations++;
+    if (code(error) === "DSH_BUDGET_UNCERTAIN") { unconfirmedOperations++; uncertainBudgets++; }
+    else if (code(error) === "DSH_TERMINATION_UNCONFIRMED") unconfirmedOperations++;
     throw error;
   };
   const compact = (input: DshCompactAttempt) => {
-    try { admit(); } catch (error) { return Promise.reject(error); }
+    let prepared: ReturnType<typeof snapshotAttempt<DshCompactAttempt>>;
+    try { prepared = snapshotAttempt(config, input); admit(); } catch (error) { return Promise.reject(error); }
     const controller = new AbortController();
+    const stopTimer = budgetTimer(prepared.budget, controller);
     active.add(controller);
     const result = compactChild(config, {
-      ...input, signal: AbortSignal.any([input.signal, controller.signal]),
-    }).catch(trackUnconfirmed).finally(() => { active.delete(controller); running.delete(result); });
+      ...prepared.input, signal: AbortSignal.any([prepared.input.signal, controller.signal]),
+    }, prepared.budget).catch(trackUnconfirmed).finally(() => {
+      stopTimer(); active.delete(controller); running.delete(result);
+    });
     running.add(result);
     return result;
   };
   return {
     run(input) {
-      try { admit(); } catch (error) { return Promise.reject(error); }
+      let prepared: ReturnType<typeof snapshotAttempt<DshAttempt>>;
+      try { prepared = snapshotAttempt(config, input); admit(); } catch (error) { return Promise.reject(error); }
       const controller = new AbortController();
+      const stopTimer = budgetTimer(prepared.budget, controller);
       active.add(controller);
       const result = runChild(config, {
-        ...input, signal: AbortSignal.any([input.signal, controller.signal]),
-      }).catch(trackUnconfirmed).finally(() => { active.delete(controller); running.delete(result); });
+        ...prepared.input, signal: AbortSignal.any([prepared.input.signal, controller.signal]),
+      }, prepared.budget).catch(trackUnconfirmed).finally(() => {
+        stopTimer(); active.delete(controller); running.delete(result);
+      });
       running.add(result);
       return result;
     },
@@ -302,13 +489,13 @@ export function createDshRuntime(config: DshConfig): DshRuntime {
       await Promise.allSettled([...running]);
       if (unconfirmedOperations) {
         throw Object.assign(new Error("DSH runtime disposal cannot confirm all prior operations stopped; inspect retained ownership locks."),
-          { code: "DSH_TERMINATION_UNCONFIRMED" });
+          { code: uncertainBudgets ? "DSH_BUDGET_UNCERTAIN" : "DSH_TERMINATION_UNCONFIRMED" });
       }
     },
   };
 }
 
-async function runChild(config: DshConfig, input: DshAttempt): Promise<BridgeResult> {
+async function runChild(config: DshConfig, input: DshAttempt, budget?: AttemptBudget): Promise<BridgeResult> {
   input.signal.throwIfAborted();
   input.assertActive();
   const baseUrl = normalizeBaseUrl(input.baseUrl);
@@ -368,6 +555,7 @@ async function runChild(config: DshConfig, input: DshAttempt): Promise<BridgeRes
   try { lock = await createDurableOwnership(lockPath, { runId: input.runId, operation: "run", stateKey: input.nativeStateId ?? input.sessionId }); }
   catch (error: unknown) {
     if (code(error) === "ELOCKED") {
+      await rejectLockedBudget(directory, budget);
       throw new Error("This DSH session already has an owner. A stale lock requires operator inspection; start a new session.");
     }
     throw error;
@@ -376,8 +564,13 @@ async function runChild(config: DshConfig, input: DshAttempt): Promise<BridgeRes
   let state: SessionState | undefined;
   let submitted = false;
   let releaseLock = true;
+  let ledger: BudgetLedger | undefined;
   try {
+    await assertBudgetSettled(directory);
     const previous = await loadState(statePath);
+    if (previous?.budgetFailure) {
+      throw budgetError(previous.budgetFailure, "Previous budget outcome blocks this session; start a new session.");
+    }
     if (previous && previous.status !== "ready") {
       throw new Error("Previous DSH outcome is uncertain; refusing to replay possible tool side effects. Start a new session.");
     }
@@ -416,6 +609,13 @@ async function runChild(config: DshConfig, input: DshAttempt): Promise<BridgeRes
       modelRoute,
     };
     state = currentState;
+    if (budget) {
+      ledger = ledgerFor(directory, input, budget, "main");
+      submitted = true;
+      await waitBudgetAdmission(saveState(statePath, currentState), input.signal);
+      input.signal.throwIfAborted();
+      await waitBudgetAdmission(ledger.initialize(), input.signal);
+    }
     for (const patch of [join(home, "cordis.patch.yml"), join(home, "profiles", "sdk-minimal", "cordis.patch.yml")]) {
       try {
         const content = await readFile(patch, "utf8");
@@ -432,6 +632,7 @@ async function runChild(config: DshConfig, input: DshAttempt): Promise<BridgeRes
       bridgePath, compactionPath, baseUrl, thinking: input.thinking, reasoningEffort: input.reasoningEffort,
       maxTokens: input.maxTokens, contextWindow: input.contextWindow,
       streamIdleTimeoutMs: config.streamIdleTimeoutMs,
+      ...(ledger ? { operationalBudget: true } : {}),
       ...(provider === "github-copilot" ? {
         provider, modelId: input.modelId, modelName: input.modelName, headers,
         reasoningEfforts: input.reasoningEfforts,
@@ -444,7 +645,15 @@ async function runChild(config: DshConfig, input: DshAttempt): Promise<BridgeRes
       Boolean(previous), async () => {
         await saveState(statePath, currentState);
         submitted = true;
-      }, taskPreparation);
+      }, taskPreparation, "run", ledger);
+    if (ledger) {
+      if (ledger.failure) throw ledger.failure;
+      if (input.signal.aborted || result.stopReason === "aborted") {
+        throw code(input.signal.reason) === "DSH_BUDGET_EXCEEDED" ? input.signal.reason
+          : budgetError("DSH_BUDGET_UNCERTAIN", "Budgeted attempt was interrupted.");
+      }
+      if (!ledger.hasRequests) throw budgetError("DSH_BUDGET_UNCERTAIN", "No provider settlement was observed.");
+    }
     if (taskPreparation && result.preparation && result.stopReason !== "aborted") {
       state.taskPreparation = {
         version: 1, policyFingerprint: preparationFingerprint!, state: result.preparation.state,
@@ -452,24 +661,36 @@ async function runChild(config: DshConfig, input: DshAttempt): Promise<BridgeRes
     }
     state.status = taskPreparation && (!result.preparation || result.stopReason === "aborted") ? "blocked" : "ready";
     await saveState(statePath, state);
+    if (ledger) {
+      const failure = await finishBudget(ledger, undefined, config.shutdownTimeoutMs);
+      if (failure) throw failure;
+    }
     return result;
   } catch (error: unknown) {
     if (error instanceof ChildTerminationError) releaseLock = false;
+    error = await finishBudget(ledger, error, config.shutdownTimeoutMs);
+    if (ledger?.retainOwnership || code(error) === "DSH_BUDGET_UNCERTAIN") releaseLock = false;
     let persistenceFailure: unknown;
     if (submitted && state) {
       state.status = "blocked";
+      if (ledger && code(error)?.startsWith("DSH_BUDGET_")) state.budgetFailure = code(error) as SessionState["budgetFailure"];
       try { await saveState(statePath, state); }
-      catch (failure) { persistenceFailure = failure; releaseLock = false; }
+      catch (failure) {
+        persistenceFailure = failure; releaseLock = false;
+        if (ledger) {
+          error = await finishBudget(ledger, budgetError("DSH_BUDGET_UNCERTAIN", "Binding persistence failed."),
+            config.shutdownTimeoutMs);
+        }
+      }
     }
-    const message = asError(error).message.replaceAll(input.apiKey, "[redacted]") +
-      (persistenceFailure ? `; failure state could not be persisted (${code(persistenceFailure) ?? "I/O error"}); ownership retained.` : "");
-    throw Object.assign(new Error(message), !releaseLock ? { code: "DSH_TERMINATION_UNCONFIRMED" } : {});
+    throw operationError(error, releaseLock, persistenceFailure, input.apiKey, ledger);
   } finally {
-    await finishOwnership(lock, releaseLock, input.apiKey);
+    await finishOwnership(lock, releaseLock, input.apiKey, ledger, config.shutdownTimeoutMs,
+      () => retainBudgetOwnership(directory, statePath, state, input, "run"));
   }
 }
 
-async function compactChild(config: DshConfig, input: DshCompactAttempt): Promise<BridgeCompactResult> {
+async function compactChild(config: DshConfig, input: DshCompactAttempt, budget?: AttemptBudget): Promise<BridgeCompactResult> {
   input.signal.throwIfAborted();
   input.assertActive();
   const baseUrl = normalizeBaseUrl(input.baseUrl);
@@ -506,6 +727,7 @@ async function compactChild(config: DshConfig, input: DshCompactAttempt): Promis
   try { lock = await createDurableOwnership(lockPath, { runId: input.runId, operation: "compact", stateKey: input.nativeStateId ?? input.sessionId }); }
   catch (error: unknown) {
     if (code(error) === "ELOCKED") {
+      await rejectLockedBudget(directory, budget);
       throw new Error("This DSH session already has an owner. A stale lock requires operator inspection; start a new session.");
     }
     throw error;
@@ -514,8 +736,17 @@ async function compactChild(config: DshConfig, input: DshCompactAttempt): Promis
   let state: SessionState | undefined;
   let submitted = false;
   let releaseLock = true;
+  let ledger: BudgetLedger | undefined;
   try {
+    await assertBudgetSettled(directory);
     const previous = await loadState(statePath);
+    if (previous?.budgetFailure) {
+      throw budgetError(previous.budgetFailure, "Previous budget outcome blocks compaction and recovery.");
+    }
+    if (previous?.pendingCompact && await hasBudgetHistory(directory, previous.pendingCompact.runId)) {
+      releaseLock = false;
+      throw budgetError("DSH_BUDGET_UNCERTAIN", "Budgeted compaction cannot be recovered by replay or receipt inspection.");
+    }
     if (input.recoverOnly && (!previous || previous.status === "ready" && !previous.pendingCompact)) {
       return { compacted: false, sessionId: previous?.sessionId ?? input.sessionId, details: { recovered: false } };
     }
@@ -526,6 +757,14 @@ async function compactChild(config: DshConfig, input: DshCompactAttempt): Promis
     if (previous.modelRoute !== modelRoute) {
       throw new Error("DSH model route or account changed. Native compaction must use the established model route.");
     }
+    if (budget && previous.status === "ready" && !input.recoverOnly) {
+      state = { ...previous, status: "running", pendingCompact: { runId: input.runId } };
+      ledger = ledgerFor(directory, input, budget, "compaction");
+      submitted = true;
+      await waitBudgetAdmission(saveState(statePath, state), input.signal);
+      input.signal.throwIfAborted();
+      await waitBudgetAdmission(ledger.initialize(), input.signal);
+    }
     const bridgePath = fileURLToPath(new URL("./bridge/index.js", import.meta.url));
     const compactionPath = fileURLToPath(new URL("./bridge/compaction.js", import.meta.url));
     const patchPath = join(directory, "bridge.patch.json");
@@ -533,6 +772,7 @@ async function compactChild(config: DshConfig, input: DshCompactAttempt): Promis
       bridgePath, compactionPath, baseUrl, thinking: input.thinking, reasoningEffort: input.reasoningEffort,
       maxTokens: input.maxTokens, contextWindow: input.contextWindow,
       streamIdleTimeoutMs: config.streamIdleTimeoutMs,
+      ...(ledger ? { operationalBudget: true } : {}),
       ...(provider === "github-copilot" ? {
         provider, modelId: input.modelId, modelName: input.modelName, headers,
         reasoningEfforts: input.reasoningEfforts,
@@ -565,26 +805,46 @@ async function compactChild(config: DshConfig, input: DshCompactAttempt): Promis
       true, async () => {
         await saveState(statePath, state!);
         submitted = true;
-      }, undefined, "compact");
+      }, undefined, "compact", ledger);
+    if (ledger?.failure) throw ledger.failure;
+    if (ledger && input.signal.aborted) {
+      throw code(input.signal.reason) === "DSH_BUDGET_EXCEEDED" ? input.signal.reason
+        : budgetError("DSH_BUDGET_UNCERTAIN", "Budgeted compaction was interrupted.");
+    }
+    if (ledger && result.compacted && !ledger.hasRequests) {
+      throw budgetError("DSH_BUDGET_UNCERTAIN", "No compaction provider settlement was observed.");
+    }
     state.status = "ready";
     delete state.pendingCompact;
     state.compactRunIds = [...(state.compactRunIds ?? []), input.runId];
     await saveState(statePath, state);
+    if (ledger) {
+      const failure = await finishBudget(ledger, undefined, config.shutdownTimeoutMs);
+      if (failure) throw failure;
+    }
     return result;
   } catch (error: unknown) {
     if (error instanceof ChildTerminationError) releaseLock = false;
+    error = await finishBudget(ledger, error, config.shutdownTimeoutMs);
+    if (ledger?.retainOwnership || code(error) === "DSH_BUDGET_UNCERTAIN") releaseLock = false;
     let persistenceFailure: unknown;
     if (submitted && state) {
-      state.status = "running";
+      state.status = ledger ? "blocked" : "running";
       state.pendingCompact ??= { runId: input.runId };
+      if (ledger && code(error)?.startsWith("DSH_BUDGET_")) state.budgetFailure = code(error) as SessionState["budgetFailure"];
       try { await saveState(statePath, state); }
-      catch (failure) { persistenceFailure = failure; releaseLock = false; }
+      catch (failure) {
+        persistenceFailure = failure; releaseLock = false;
+        if (ledger) {
+          error = await finishBudget(ledger, budgetError("DSH_BUDGET_UNCERTAIN", "Binding persistence failed."),
+            config.shutdownTimeoutMs);
+        }
+      }
     }
-    const message = asError(error).message.replaceAll(input.apiKey, "[redacted]") +
-      (persistenceFailure ? `; failure state could not be persisted (${code(persistenceFailure) ?? "I/O error"}); ownership retained.` : "");
-    throw Object.assign(new Error(message), !releaseLock ? { code: "DSH_TERMINATION_UNCONFIRMED" } : {});
+    throw operationError(error, releaseLock, persistenceFailure, input.apiKey, ledger);
   } finally {
-    await finishOwnership(lock, releaseLock, input.apiKey);
+    await finishOwnership(lock, releaseLock, input.apiKey, ledger, config.shutdownTimeoutMs,
+      () => retainBudgetOwnership(directory, statePath, state, input, "compact"));
   }
 }
 
@@ -593,13 +853,14 @@ type ChildArguments = [
   patchPath: string, state: SessionState, resume: boolean, beforeSubmit: () => Promise<void>,
   taskPreparation: PreparationRequest | undefined,
 ];
-function executeChild(...args: [...ChildArguments, operation: "compact" | "inspectCompact"]): Promise<BridgeCompactResult>;
-function executeChild(...args: [...ChildArguments, operation?: "run"]): Promise<BridgeResult>;
+function executeChild(...args: [...ChildArguments, operation: "compact" | "inspectCompact", ledger?: BudgetLedger]): Promise<BridgeCompactResult>;
+function executeChild(...args: [...ChildArguments, operation?: "run", ledger?: BudgetLedger]): Promise<BridgeResult>;
 async function executeChild(
   config: DshConfig, input: DshAttempt, cliPath: string, directory: string, home: string,
   patchPath: string, state: SessionState, resume: boolean, beforeSubmit: () => Promise<void>,
   taskPreparation?: PreparationRequest,
   operation: "run" | "compact" | "inspectCompact" = "run",
+  ledger?: BudgetLedger,
 ): Promise<BridgeResult | BridgeCompactResult> {
   input.signal.throwIfAborted();
   input.assertActive();
@@ -676,20 +937,33 @@ async function executeChild(
   const ready = new Promise<void>((resolve) => { readyResolve = resolve; });
   const toolControllers = new Map<string, AbortController>();
   const toolTasks = new Set<Promise<unknown>>();
+  const budgetTasks = new Set<Promise<unknown>>();
   const preparationTasks = new Set<Promise<void>>();
   const eventTasks = new Set<Promise<void>>();
   const seenCalls = new Set<string>();
   const hostToolNames = input.tools.map((tool) => tool.name);
   const onPreparationDecision = input.onPreparationDecision;
   let acceptingTools = false;
+  let acceptingBudget = false;
   let preparationRequested = false;
   let resolved: PreparationResolution | undefined;
   let dispatchedTools = 0;
   let preparationFailure: Error | undefined;
+  let hostFailure: Error | undefined;
   let abortTimer: NodeJS.Timeout | undefined;
   let rejectCancellation!: (error: Error) => void;
   const cancellationExpired = new Promise<never>((_resolve, reject) => { rejectCancellation = reject; });
   void cancellationExpired.catch(() => {});
+  let rejectBudgetFailure!: (error: Error) => void;
+  const budgetFailed = new Promise<never>((_resolve, reject) => { rejectBudgetFailure = reject; });
+  void budgetFailed.catch(() => {});
+  const failBudget = (error: Error): Error => {
+    acceptingTools = false;
+    acceptingBudget = false;
+    for (const controller of toolControllers.values()) controller.abort();
+    rejectBudgetFailure(error);
+    return error;
+  };
   const failPreparation = (error: unknown): Error => {
     preparationFailure ??= asError(error);
     acceptingTools = false;
@@ -719,6 +993,40 @@ async function executeChild(
       }
     },
     async onRequest(method, params) {
+      if (ledger && method.startsWith("budget.")) {
+        const task = Promise.resolve().then(async () => {
+          try {
+            if (method === "budget.reserve") {
+              if (!acceptingBudget) {
+                await ledger.fence();
+                throw ledger.failure!;
+              }
+              input.signal.throwIfAborted();
+              input.assertActive();
+              const grant = await ledger.reserve(params);
+              input.signal.throwIfAborted();
+              input.assertActive();
+              if (!acceptingBudget) {
+                await ledger.fence();
+                throw ledger.failure!;
+              }
+              return grant;
+            }
+            if (method === "budget.settle") return await ledger.settle(params);
+            if (method === "budget.uncertain") {
+              const result = await ledger.uncertain(params);
+              failBudget(ledger.failure!);
+              return result;
+            }
+            await ledger.fence();
+            throw ledger.failure!;
+          } catch (error) {
+            throw failBudget(ledger.failure ?? asError(error));
+          }
+        });
+        budgetTasks.add(task);
+        try { return await task; } finally { budgetTasks.delete(task); }
+      }
       if (method === "prepare" && taskPreparation) {
         try {
           if (!acceptingTools || preparationRequested || !isRecord(params) ||
@@ -772,23 +1080,44 @@ async function executeChild(
         callId: params.callId, name: params.name,
         arguments: JSON.parse(JSON.stringify(params.arguments)),
       };
-      let task: Promise<unknown> | undefined;
+      dispatchedTools++;
+      const task = Promise.resolve().then(async () => {
+        let started = false;
+        try {
+          if (ledger) {
+            await ledger.startTool(call.callId);
+            started = true;
+            input.signal.throwIfAborted();
+            input.assertActive();
+            if (!acceptingTools || ledger.failure) throw ledger.failure ?? new Error("DSH tool admission closed.");
+          }
+          return await input.executeTool(call, AbortSignal.any([input.signal, controller.signal]));
+        } finally {
+          if (started) await ledger!.settleTool(call.callId);
+        }
+      });
+      toolTasks.add(task);
       try {
-        // Reserve the budget synchronously before dispatch, including concurrent or failed calls.
-        dispatchedTools++;
-        task = input.executeTool(call, AbortSignal.any([input.signal, controller.signal]));
-        toolTasks.add(task);
         return await task;
+      } catch (error) {
+        if (ledger?.failure) throw failBudget(ledger.failure);
+        hostFailure ??= asError(error);
+        throw error;
       } finally {
-        if (task) toolTasks.delete(task);
+        toolTasks.delete(task);
         toolControllers.delete(call.callId);
       }
     },
   });
   const abort = (): void => {
     acceptingTools = false;
+    acceptingBudget = false;
     for (const controller of toolControllers.values()) controller.abort();
     void peer!.notify("cancel", {}).catch((error: unknown) => rejectCancellation(asError(error)));
+    if (ledger) {
+      rejectCancellation(code(input.signal.reason) === "DSH_BUDGET_EXCEEDED" ? input.signal.reason
+        : budgetError("DSH_BUDGET_UNCERTAIN", "Budgeted attempt was interrupted."));
+    }
     // Enter bounded finalization even if the worker ignores both cancel and TERM.
     abortTimer ??= setTimeout(() => {
       const error = new Error("DSH cancellation acknowledgement timed out.");
@@ -804,6 +1133,7 @@ async function executeChild(
       peer.closed.then(() => { throw preparationFailure ?? peer!.failureReason ?? childFailure ??
         new Error(diagnostic("DSH stopped before bridge initialization")); }),
       childFailed,
+      budgetFailed,
       cancellationExpired,
       childClosed.then((value) => { throw childFailure ?? new Error(diagnostic(`DSH startup exited (${value})`)); }),
     ]), config.startupTimeoutMs, () => diagnostic("DSH bridge startup timed out"));
@@ -814,6 +1144,7 @@ async function executeChild(
     input.assertActive();
     stage = "run";
     acceptingTools = operation === "run";
+    acceptingBudget = operation !== "inspectCompact";
     const rpcResult = await Promise.race([
       peer.request(operation, operation === "run" ? {
         ...(input.provider === "github-copilot" ? { provider: input.provider } : {}),
@@ -828,6 +1159,7 @@ async function executeChild(
         reasoningEffort: input.reasoningEffort, maxTokens: input.maxTokens,
       }),
       childFailed,
+      budgetFailed,
       cancellationExpired,
       childClosed.then((value) => { throw childFailure ?? peer!.failureReason ??
         new Error(diagnostic(`DSH exited during run (${value})`)); }),
@@ -836,6 +1168,8 @@ async function executeChild(
       ? parseResult(rpcResult, state.sessionId)
       : parseCompactResult(rpcResult, state.sessionId);
     acceptingTools = false;
+    acceptingBudget = false;
+    if (ledger?.failure) throw ledger.failure;
     if (preparationFailure) throw preparationFailure;
     if (operation === "run") {
       const runResult = result as BridgeResult;
@@ -868,8 +1202,11 @@ async function executeChild(
       throw new Error("DSH completed after cancellation without confirming an interrupted outcome.");
     }
     return result;
+  } catch (error) {
+    throw ledger?.failure ?? preparationFailure ?? hostFailure ?? error;
   } finally {
     acceptingTools = false;
+    acceptingBudget = false;
     input.signal.removeEventListener("abort", abort);
     clearTimeout(abortTimer);
     for (const controller of toolControllers.values()) controller.abort();
@@ -896,6 +1233,12 @@ async function executeChild(
     } catch (error: unknown) {
       throw new ChildTerminationError("Host tool cancellation is unconfirmed; retaining its session ownership lock.",
         { cause: error });
+    }
+    try {
+      await timeout(Promise.all([Promise.allSettled([...budgetTasks]), ledger?.drain()]), config.shutdownTimeoutMs,
+        "DSH budget callbacks did not settle.");
+    } catch (error) {
+      throw new ChildTerminationError("DSH budget persistence is unconfirmed; retaining its session ownership lock.", { cause: error });
     }
     try {
       await timeout(Promise.allSettled([...preparationTasks]), config.shutdownTimeoutMs,

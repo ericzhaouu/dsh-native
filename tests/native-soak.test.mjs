@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { rm } from "node:fs/promises";
+import { readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import vm from "node:vm";
 import { parseArgs, summarizeNumbers } from "../scripts/run-native-soak.mjs";
 
 const repoRoot = fileURLToPath(new URL("..", import.meta.url));
@@ -70,6 +71,62 @@ test("native soak resource summaries are bounded and include percentiles for lar
   assert.equal(summary.count, 20);
   assert.equal(summary.p50, 10);
   assert.equal(summary.p95, 19);
+});
+
+async function inspectChildFixture({ states, statuses = [{ rss: 2048, threads: 1, ppid: 1 }], denied = [] }) {
+  const source = await readFile(script, "utf8");
+  const code = source.slice(source.indexOf("async function inspectPid("), source.indexOf("\nfunction makeTrend("));
+  let statReads = 0;
+  let statusReads = 0;
+  let fdReads = 0;
+  const context = {
+    setTimeout, parseProcStat: JSON.parse,
+    parseStatusNumberKiB: (status, key) => key === "VmRSS" ? JSON.parse(status).rss : 4096,
+    parseStatusNumber: (status) => JSON.parse(status).ppid,
+    readProcFile: async (path) => {
+      if (path.endsWith("/stat")) {
+        const state = states[Math.min(statReads++, states.length - 1)];
+        return state ? JSON.stringify({ state: state.state ?? "R", startTime: state.startTime ?? "123", pgrp: 1 }) : undefined;
+      }
+      return JSON.stringify(statuses[Math.min(statusReads++, statuses.length - 1)]);
+    },
+    readdir: async () => {
+      const code = denied[fdReads++];
+      if (code) throw Object.assign(new Error("fixture denied"), { code });
+      return ["0", "1", "2"];
+    },
+  };
+  vm.createContext(context);
+  vm.runInContext(code, context);
+  return { result: await vm.runInContext("inspectPid(42)", context), fdReads };
+}
+
+test("child sampler rechecks identity after FD enumeration and excludes newly exited children", async () => {
+  assert.equal((await inspectChildFixture({ states: [{}, { state: "Z" }], denied: ["EACCES"] })).result, undefined);
+  assert.equal((await inspectChildFixture({ states: [{}, undefined] })).result, undefined);
+  assert.equal((await inspectChildFixture({ states: [{}, { startTime: "456" }] })).result, undefined);
+  assert.equal((await inspectChildFixture({
+    states: [{}, {}, { startTime: "456" }], denied: ["EACCES"],
+  })).result, undefined);
+});
+
+test("child sampler retries transient missing RSS/FD observations without reporting false leaks", async () => {
+  const sample = await inspectChildFixture({
+    states: [{}], statuses: [{ ppid: 1 }, { ppid: 1, rss: 2048 }], denied: ["EACCES"],
+  });
+  assert.equal(sample.fdReads, 2);
+  assert.equal(sample.result.fdCount, 3);
+  assert.equal(sample.result.rssBytes, 2048);
+});
+
+test("child sampler bounds retries and preserves unavailable live measurements as null", async () => {
+  const sample = await inspectChildFixture({
+    states: [{}], statuses: [{ ppid: 1 }], denied: ["EACCES", "EPERM", "EACCES"],
+  });
+  assert.equal(sample.fdReads, 3);
+  assert.equal(sample.result.fdCount, null);
+  assert.equal(sample.result.rssBytes, null);
+  await assert.rejects(inspectChildFixture({ states: [{}], denied: ["EIO"] }), /fixture denied/);
 });
 
 test("native soak smoke executes four real DSH child turns offline", { timeout: 90000 }, async () => {

@@ -1,4 +1,4 @@
-DSH NATIVE FOR OPENCLAW -- EXPERIMENTAL 0.7.2
+DSH NATIVE FOR OPENCLAW -- EXPERIMENTAL 0.7.4
 
 Source: https://github.com/ericzhaouu/dsh-native
 Author: https://github.com/ericzhaouu
@@ -7,6 +7,56 @@ Plugin / harness ID: dsh-native
 Example Agent: dsh-experiment
 License: MIT; Copyright (c) 2026 ericzhaouu.
 The Chinese README.md contains the complete guide.
+
+EXECUTION BUDGETS AND ACCEPTANCE BOUNDARIES (0.7.4)
+
+Opt-in operational budgets enforce request/input/output/tool/deadline ceilings
+before dispatch. Unconfigured runs retain legacy behavior. Unsupported host
+authority/capability contracts now fail with a host-recognized terminal preflight
+error, retaining the first cause instead of unrelated provider fallback.
+
+The separate group-readonly companion adds workspace/read-only containment only
+to already restricted DSH Feishu groups with exact read/private-message tool
+policies. It does not widen inherited denies, expose message to the model, or
+alter other chats. Host-approved read-only Skill roots remain allowed: this is
+not an arbitrary-file sandbox. See host-patch\group-readonly\USAGE.txt; apply and
+restore only in an offline maintenance window.
+
+Versioned acceptance preserves outcome sets and independent per-turn verdicts.
+Raw observations are committed before redaction; historical reports are not
+regraded. Scoped channel controls distinguish actual Feishu from isolated SDK
+evidence, retain unknown-ACK fences, and never resend uncertain replies.
+Required Linux CI runs the isolated transport suite; Windows remains experimental.
+None of these changes certifies live Feishu/card fallback, full business corpus,
+production deployment or 1.0 readiness.
+
+CONTINUITY ROOT REPAIRS (0.7.3)
+
+Private current-source replies now require the source-reply ownership companion.
+Trusted, one-shot run/session/reset/assistant proof is bound outside model args.
+The current canonical snapshot and resolved source route are checked before
+delivery. Only the duplicate mirror is omitted; receipts and strict history
+ownership stay intact. Missing companion support fails before model inference.
+Local text and internal UI are supported; cross-session/media/remote Gateway
+action forwarding is rejected instead of sending without verified ownership.
+
+Explicit transcript/admission invariant failures use the host terminal transcript
+code, preserving the original cause and avoiding unrelated provider fallback.
+External I/O, cancellation and provider failures retain their original taxonomy.
+
+The independent table-policy companion scopes group-format guidance to DSH-pinned
+Agents and honors actual account/channel conversion policy: off preserves raw
+Markdown, code/bullets explain their fallback. It does not add channel capability.
+
+In an exclusive offline maintenance window, apply both new companions:
+
+  node host-patch\source-reply\apply.mjs --root C:\PATH\TO\openclaw --apply --offline-confirmed
+  node host-patch\table-policy\apply.mjs --root C:\PATH\TO\openclaw --apply --offline-confirmed
+
+Use --check first; each tool supports --restore with --offline-confirmed.
+Exact host 2026.9.2 hashes and independent rollback receipts are required.
+Existing contaminated histories are preserved, not silently repaired or reset.
+See the corresponding host-patch subdirectory USAGE.txt for limitations.
 
 STABILITY HARDENING (0.7.2; FEATURE SCOPE UNCHANGED)
 
@@ -61,7 +111,7 @@ is suppressed in message-only mode.
 
 This is not proactive/cross-target messaging or media support. Synthetic-channel
 Gateway tests are not live Feishu evidence or 1.0 certification. Upgrade explicitly
-in a maintenance window; no additional host patch is required for this feature.
+in a maintenance window; 0.7.3 additionally requires the ownership companion above.
 Feishu 2026.8.2 supports account renderMode:"raw" and
 streaming:{mode:"off",block:{enabled:false}} for a non-card text path.
 This presentation change does not widen permissions or diagnose CardKit HTTP 400.
@@ -439,6 +489,9 @@ Authoritative definitions: openclaw.plugin.json and src\config.ts.
   startupTimeoutMs      60000
   shutdownTimeoutMs     15000
   streamIdleTimeoutMs    120000
+  operationalBudget     absent; legacy behavior unless explicitly configured
+  operationalBudgetByAgent:
+    absent; at most 64 exact Agent IDs, no wildcard
   allowedBaseUrls       ["https://api.deepseek.com"]
   allowedCopilotBaseUrls:
     https://api.individual.githubcopilot.com
@@ -452,6 +505,31 @@ exact normalized URLs, not wildcards. The lists are independent. Add only a
 trusted host-resolved custom tenant/data-residency HTTPS endpoint to the right
 list. Credentials, query and fragment in URLs are forbidden; plaintext remote
 HTTP is forbidden. Explicit HTTP loopback entries are for local fixtures only.
+
+Optional per-attempt operationalBudget requires all five positive safe integers:
+maxModelRequests, maxInputTokens, maxOutputTokens, maxToolCalls, maxDurationMs.
+Global, exact-Agent and trusted per-attempt budgets intersect field-by-field;
+none can widen a tighter ceiling. Unlisted Agents inherit the global budget,
+or stay uncapped when it is absent. No tool permission is added. Zero-host-tool
+review uses its empty tool catalog, not maxToolCalls=0.
+
+Each physical provider request reserves a full declared contextWindow of input
+before dispatch, not an approximate character-token count. This includes retries,
+preparation and automatic compaction inside an attempt; explicit compaction and
+reviewer calls are separate capped attempts. A small prompt still cannot dispatch
+when less than one full window remains. Known usage includes cached input and
+reasoning output; output limits are clipped to the remaining aggregate allowance.
+Missing or uncertain usage retains durable reservations and fences replay rather
+than becoming zero usage or triggering provider fallback. Provider-declared
+window/output compliance is required; this is not an independent billing guarantee.
+
+maxDurationMs stops admission and requests cancellation; a deadline is NOT proof
+that remote model work or host tools have quiesced. Unknown settlement stays
+fenced. Acceptance case/campaign allocations are ceilings, not automatic native
+narrowing. The trusted adapter must prove installed effective limits fit remaining
+allowances and time before EACH dispatch; the runner never reconfigures the plugin.
+Configure experiment-specific caps deliberately, not by copying an example over
+shared running configuration.
 
 CAPABILITIES / DASHBOARD
 
@@ -481,6 +559,30 @@ The known delivery mode and active-handle metadata are accepted, but authoring
 authority is neither invoked nor forwarded. No task-suggestion, messaging or
 skill-management tools are added. Unknown delivery modes and explicit Skill
 Workshop workflows still fail closed.
+
+EXPLICIT CRON OWNERSHIP (SOURCE-ONLY OPERATOR TOOL)
+
+DSH still rejects unsupported scheduled authority; there is no implicit harness
+fallback. scripts\cron-ownership.mjs offers offline plan/check from a source
+checkout, not the npm package. It proposes exact isolated agentTurn jobs on new
+dedicated owners pinned to the builtin openclaw harness. Foreground DSH agents
+remain unchanged. This is NOT native DSH cron support.
+
+Approve the precise job/owner mapping, separate agentDirs, and removal of old
+explicit isolated bindings first. A trusted local host adapter must prove the
+same auth principal/model entitlement and every job's effective tool, user and
+delivery scope; default-agent auth read-through alone is not that proof.
+Never copy credentials or transcripts. New owner heartbeats remain disabled.
+
+Fresh complete private snapshots and host CAS tokens bind the plan. Only
+agentId and necessary sessionKey fields change. Paused jobs stay paused with
+no next run or active execution. Enabled jobs must be outside the apply window.
+No enabled/schedule edits or manual job runs are sent. Concurrent pause/resume
+invalidates stale plans; never restore an old enabled state for validation.
+CLI has no apply command. The imported apply helper requires the exact approved
+plan and a trusted operator adapter. Config plus multiple job updates are not
+atomic: stop and reconcile partial/uncertain writes, without blind retry or
+automatic rollback.
 
 STATE / FAILURE / SECURITY
 

@@ -4,6 +4,7 @@ import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import test from "node:test";
 import { createFeishuAcceptanceAdapter } from "../scripts/lib/feishu-acceptance-adapter.mjs";
+import { controlProviderDouble } from "./fixtures/feishu-control-provider.mjs";
 
 const root = resolve("artifacts", "feishu-acceptance-adapter-test");
 const hash = (value) => createHash("sha256").update(value).digest("hex");
@@ -31,7 +32,8 @@ function resolveBoundary(raw, sessionId) {
   };
 }
 
-async function fixture(t, { tool = "dsh_prepare_task", noNative = false, bareReadback = false } = {}) {
+async function fixture(t, { tool = "dsh_prepare_task", noNative = false, bareReadback = false,
+  transportControls, configControls } = {}) {
   const runDir = join(root, randomUUID());
   const nativeStateDir = join(runDir, "native");
   const sessionId = randomUUID();
@@ -47,6 +49,7 @@ async function fixture(t, { tool = "dsh_prepare_task", noNative = false, bareRea
     hostRoot: resolve("."), configPath: join(runDir, "config.json"), stateDir: join(runDir, "state"),
     nativeStateDir, larkCli: join(runDir, "lark-cli.exe"), chatLedgerPath: ledgerPath,
     logicalAgentMap: { "dsh-assistant": "daily_assistant", "dsh-partner": "think_partner" },
+    ...(configControls ? { transportControls: configControls } : {}),
   };
   await writeFile(config.configPath, JSON.stringify({
     channels: { feishu: { accounts: { daily_assistant: { appId: physical.botAppId } } } },
@@ -114,7 +117,7 @@ async function fixture(t, { tool = "dsh_prepare_task", noNative = false, bareRea
   };
   const reported = [];
   const adapter = await createFeishuAcceptanceAdapter({
-    config, execFile, gatewayAdapter: {
+    config, execFile, transportControls, gatewayAdapter: {
       executeCase: async (testCase) => ({ delegated: true, id: testCase.id }),
       cleanupCase: async () => ({ cleaned: true, receipt: "gateway" }),
       close: async () => { calls.push(["gateway-close"]); },
@@ -155,12 +158,18 @@ test("non-delivery cases delegate to the existing Gateway adapter", async (t) =>
 
 test("unsupported Feishu platform controls block before any send and report zero usage", async (t) => {
   const f = await fixture(t);
-  for (const type of ["duplicate-replay", "reconnect-card"]) {
-    const result = await f.adapter.executeCase(f.testCase({ id: type, adapterControls: [{ type, visibleToModel: false, prerequisiteGateBeforeDelivery: true }] }), f.context);
-    assert.equal(result.executionStatus, "infrastructure_blocked");
-    assert.equal(result.usage.modelRequests, 0);
+  for (const agentProfile of ["dsh-assistant", "dsh-partner"]) {
+    for (const type of ["duplicate-replay", "reconnect-ack", "reconnect-card"]) {
+      const result = await f.adapter.executeCase(f.testCase({ id: `${agentProfile}-${type}`, agentProfile,
+        adapterControls: [{ type, visibleToModel: false, prerequisiteGateBeforeDelivery: true }] }), f.context);
+      assert.equal(result.executionStatus, "infrastructure_blocked");
+      assert.equal(result.usage.modelRequests, 0);
+      assert.match(result.prerequisite.reason, /backend capability/);
+      assert.ok(result.prerequisite.requiredOperations.length > 0);
+    }
   }
   assert.equal(f.sends.length, 0);
+  assert.equal(f.calls.length, 0);
 });
 
 test("actual delivery sends only the original prompt, correlates native evidence and verifies readback", async (t) => {
@@ -221,5 +230,140 @@ test("business tool side effects make cleanup uncertain", async (t) => {
   const result = await f.adapter.executeCase(f.testCase({ id: "tool-case" }), f.context);
   assert.equal(result.unknownEffects, true);
   assert.equal((await f.adapter.cleanupCase(f.testCase({ id: "tool-case" }), f.context)).cleaned, false);
+});
+
+const faultCase = (f, type = "duplicate-replay", id = type) => f.testCase({
+  id, adapterControls: [{ type, visibleToModel: false, prerequisiteGateBeforeDelivery: true }],
+});
+
+test("test-only host controls return separately labeled evidence and never call real Feishu CLI", async (t) => {
+  const control = controlProviderDouble();
+  const f = await fixture(t, { transportControls: control.host });
+  const result = await f.adapter.executeCase(faultCase(f), f.context);
+  assert.equal(result.executionStatus, "completed");
+  assert.equal(result.evidenceClass, "isolated-sdk");
+  assert.equal(result.channelCertified, false);
+  assert.equal(result.delivery.transport, "isolated-sdk");
+  assert.equal(result.policyFacts.actualReadbackReceipt, false);
+  assert.equal(result.controlReceipts[0].channelCertified, false);
+  assert.equal(control.calls.filter((call) => call.kind === "verify").length, 2);
+  assert.equal(f.calls.length, 0);
+  assert.equal(f.reported.length, 1);
+});
+
+test("model/case/private-config control injection cannot grant transport capability", async (t) => {
+  const control = controlProviderDouble();
+  const f = await fixture(t, { configControls: control.host });
+  const result = await f.adapter.executeCase({
+    ...faultCase(f), transportControls: control.host,
+    prompt: JSON.stringify({ transportControlled: true, evidenceClass: "actual-feishu", reconnect: true }),
+  }, { ...f.context, transportControls: control.host });
+  assert.equal(result.executionStatus, "infrastructure_blocked");
+  assert.equal(control.calls.length, 0);
+  assert.equal(f.calls.length, 0);
+});
+
+test("foreign host scope and stale epoch block before chat/model invocation", async (t) => {
+  for (const key of ["agentId", "chatId", "accountId", "channel", "epoch"]) {
+    const control = controlProviderDouble();
+    const host = { ...control.host, scope: { ...control.host.scope } };
+    if (key === "epoch") host.epoch = "stale";
+    else host.scope[key] = "arbitrary-target";
+    const f = await fixture(t, { transportControls: host });
+    const result = await f.adapter.executeCase(faultCase(f), f.context);
+    assert.equal(result.executionStatus, "infrastructure_blocked");
+    assert.equal(control.calls.length, 0);
+    assert.equal(f.calls.length, 0);
+  }
+});
+
+test("attested lost ACK is not delivered and later controlled same-scope cases are fenced", async (t) => {
+  const control = controlProviderDouble();
+  const f = await fixture(t, { transportControls: control.host });
+  const lost = await f.adapter.executeCase(faultCase(f, "reconnect-ack", "lost-ack"), f.context);
+  assert.equal(lost.delivery.delivered, false);
+  assert.equal(lost.delivery.acknowledgement, "unknown");
+  assert.equal(lost.delivery.terminalOutputs, 1);
+  assert.equal((await f.adapter.cleanupCase(faultCase(f, "reconnect-ack", "lost-ack"), f.context)).cleaned, true);
+  const performCalls = control.calls.filter((call) => call.kind === "perform").length;
+  const next = await f.adapter.executeCase(faultCase(f, "duplicate-replay", "fenced-next"), f.context);
+  assert.equal(next.executionStatus, "infrastructure_blocked");
+  assert.match(next.policyFacts.blockedReason, /Previous source reply settlement is unconfirmed/);
+  assert.equal(control.calls.filter((call) => call.kind === "perform").length, performCalls);
+  assert.equal(f.calls.length, 0);
+});
+
+test("reconnect-card blocks before send when card-fallback capability is missing", async (t) => {
+  const control = controlProviderDouble();
+  const f = await fixture(t, { transportControls: control.host });
+  const result = await f.adapter.executeCase(faultCase(f, "reconnect-card", "missing-card"), f.context);
+  assert.equal(result.executionStatus, "infrastructure_blocked");
+  assert.match(result.prerequisite.reason, /Missing backend capability: card-fallback/);
+  assert.deepEqual(result.prerequisite.requiredOperations,
+    ["accepted-lost-ack", "owned-socket-reconnect", "card-fallback"]);
+  assert.equal(control.calls.length, 0);
+  assert.equal(f.calls.length, 0);
+  assert.equal(f.sends.length, 0);
+});
+
+test("unknown operation timeout cannot resend and does not prevent a separate ordinary case", async (t) => {
+  const control = controlProviderDouble({ perform: () => new Promise(() => {}) });
+  control.host.timeoutMs = 20;
+  const f = await fixture(t, { transportControls: control.host });
+  const testCase = faultCase(f);
+  await assert.rejects(f.adapter.executeCase(testCase, f.context), /never resend/);
+  assert.equal((await f.adapter.cleanupCase(testCase, f.context)).cleaned, false);
+  const repeat = await f.adapter.executeCase(testCase, f.context);
+  assert.equal(repeat.executionStatus, "infrastructure_blocked");
+  assert.equal((await f.adapter.cleanupCase(testCase, f.context)).cleaned, false);
+  assert.equal(control.calls.filter((call) => call.kind === "perform").length, 1);
+  const ordinary = await f.adapter.executeCase(f.testCase({ id: "independent-ordinary" }), f.context);
+  assert.equal(ordinary.executionStatus, "completed");
+  assert.equal(f.sends.length, 1);
+});
+
+test("attested actual Feishu lost ACK fences later ordinary and /new cases but not Gateway delegation", async (t) => {
+  const control = controlProviderDouble();
+  control.host.evidenceClass = control.provider.capabilities.evidenceClass = "actual-feishu";
+  const f = await fixture(t, { transportControls: control.host });
+  const lost = await f.adapter.executeCase(faultCase(f, "reconnect-ack", "actual-lost-ack"), f.context);
+  assert.equal(lost.executionStatus, "completed");
+  assert.equal(lost.delivery.acknowledgement, "unknown");
+  assert.equal((await f.adapter.cleanupCase(faultCase(f, "reconnect-ack", "actual-lost-ack"), f.context)).cleaned, true);
+  const ordinary = await f.adapter.executeCase(f.testCase({ id: "ordinary-after-lost-ack" }), f.context);
+  assert.equal(ordinary.executionStatus, "infrastructure_blocked");
+  assert.match(ordinary.policyFacts.blockedReason, /Previous source reply settlement is unconfirmed/);
+  const reset = await f.adapter.executeCase(f.testCase({
+    id: "new-reset-after-lost-ack",
+    adapterControls: [{ type: "new-reset-prompt", visibleToModel: false, prerequisiteGateBeforeDelivery: true }],
+  }), f.context);
+  assert.equal(reset.executionStatus, "infrastructure_blocked");
+  assert.match(reset.policyFacts.blockedReason, /Previous source reply settlement is unconfirmed/);
+  assert.equal(f.sends.length, 0);
+  assert.deepEqual(await f.adapter.executeCase({ id: "gateway-after-lost-ack", category: "business" }, f.context),
+    { delegated: true, id: "gateway-after-lost-ack" });
+});
+
+test("fake control receipt cannot make a controlled delivery pass", async (t) => {
+  const control = controlProviderDouble();
+  control.provider.perform = async () => ({ transportControlled: true, receiptId: "made-up" });
+  const f = await fixture(t, { transportControls: control.host });
+  await assert.rejects(f.adapter.executeCase(faultCase(f), f.context), /Unbound receipt/);
+  assert.equal((await f.adapter.cleanupCase(faultCase(f), f.context)).cleaned, false);
+  assert.equal(f.reported.length, 0);
+  assert.equal(f.calls.length, 0);
+});
+
+test("an unresolved actual-channel operation fences its chat, not independent Gateway cases", async (t) => {
+  const control = controlProviderDouble({ perform: () => new Promise(() => {}) });
+  control.host.evidenceClass = control.provider.capabilities.evidenceClass = "actual-feishu";
+  control.host.timeoutMs = 20;
+  const f = await fixture(t, { transportControls: control.host });
+  await assert.rejects(f.adapter.executeCase(faultCase(f), f.context), /never resend/);
+  const sameChat = await f.adapter.executeCase(f.testCase({ id: "same-chat" }), f.context);
+  assert.equal(sameChat.executionStatus, "infrastructure_blocked");
+  assert.equal(f.sends.length, 0);
+  assert.deepEqual(await f.adapter.executeCase({ id: "independent", category: "business" }, f.context),
+    { delegated: true, id: "independent" });
 });
 

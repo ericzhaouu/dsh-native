@@ -180,6 +180,37 @@ test("accepts only the explicit reversible compaction companion patch modules", 
   }
 });
 
+for (const name of ["source-reply", "table-policy", "group-readonly"]) {
+  test(`allows only the complete ${name} companion and rejects extra files`, async () => {
+    const files = ["apply.mjs", "spec.mjs", "USAGE.txt"];
+    const allowed = goodEntries([
+      ["package/host-patch/engine.mjs", "export {};\n"],
+      ...files.map((file) => [`package/host-patch/${name}/${file}`, "fixture\n"]),
+    ]);
+    assert.equal((await checkPackage({ packagePath: await writeTgz(`${name}.tgz`, allowed) })).ok, true);
+    for (const file of files) {
+      const report = await checkPackage({ packagePath: await writeTgz(`${name}-missing-${file}.tgz`,
+        allowed.filter(([path]) => path !== `package/host-patch/${name}/${file}`)) });
+      assert.ok(report.findings.some((item) => item.code === "missing-entrypoint" &&
+        item.path === `package/host-patch/${name}/${file}`));
+    }
+    const extra = await checkPackage({ packagePath: await writeTgz(`${name}-extra.tgz`,
+      [...allowed, [`package/host-patch/${name}/unapproved.mjs`, "export {};\n"]]) });
+    assert.ok(extra.findings.some((item) => item.code === "unexpected-file"));
+  });
+}
+
+test("the native ownership module requires its complete companion even if all companion files are omitted", async () => {
+  const report = await checkPackage({ packagePath: await writeTgz("missing-required-ownership.tgz",
+    goodEntries([["package/dist/native/source-reply-ownership.js", "export {};\n"]])) });
+  for (const name of ["source-reply", "table-policy"]) {
+    for (const file of ["apply.mjs", "spec.mjs", "USAGE.txt"]) {
+      assert.ok(report.findings.some((item) => item.code === "missing-entrypoint" &&
+        item.path === `package/host-patch/${name}/${file}`));
+    }
+  }
+});
+
 test("requires explicit --package and gives clear CLI usage", async () => {
   const result = await runChecker([]);
   assert.notEqual(result.code, 0);

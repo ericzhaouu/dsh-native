@@ -10,6 +10,22 @@ export type ReasoningEfforts = Partial<Record<ReasoningLevel, string | null>>;
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 export type JsonObject = { [key: string]: Json };
 
+/**
+ * Trusted operator/host ceilings for ONE runtime attempt, not model-authored
+ * preparation arguments or a billing allowance. Retries, preparation and
+ * automatic compaction share the attempt. Explicit maintenance is a separately
+ * capped attempt. Input reserves the full host contextWindow (not an exact
+ * tokenizer); cache tokens count toward input. Output includes reasoning.
+ * Duration stops admission and requests cancellation, never proves remote stop.
+ */
+export interface OperationalBudget {
+  maxModelRequests: number;
+  maxInputTokens: number;
+  maxOutputTokens: number;
+  maxToolCalls: number;
+  maxDurationMs: number;
+}
+
 export interface BridgeTool {
   name: string;
   description: string;

@@ -1,9 +1,11 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import type { AgentHarnessV2 } from "openclaw/plugin-sdk/agent-harness";
 import type { BridgeContextUsage, BridgeEvent, BridgeResult, BridgeUsage, ModelProvider } from "../protocol.js";
 import type { DshAttempt, DshConfig, DshRuntime } from "../runtime-types.js";
+import { resolveOperationalBudget } from "../config.js";
+import { isBudgetFailure, rethrowBudgetFailure } from "../bridge/budget-terminal.js";
 
 type IsolatedRun = NonNullable<AgentHarnessV2["runIsolatedCompletionV2"]>;
 type IsolatedParams = Parameters<IsolatedRun>[0];
@@ -194,6 +196,7 @@ export function createIsolatedCompletion(
     const requestBytes = new TextEncoder().encode(`${p.systemPrompt}\n${p.prompt}`).byteLength;
     if (requestBytes > maxRequestBytes) fail("prompt payload exceeds the isolated completion request limit");
     p.assertCurrent();
+    const operationalBudget = resolveOperationalBudget(config, p.agentId);
     const apiKey = resolvedApiKey(p);
     p.assertCurrent();
     const controller = new AbortController();
@@ -204,6 +207,7 @@ export function createIsolatedCompletion(
     let privateStateDir: string | undefined;
     let timer: NodeJS.Timeout | undefined;
     let runtime: DshRuntime | undefined;
+    let primaryFailure: unknown;
     const operation = (async (): Promise<IsolatedResult> => {
       try {
         timer = setTimeout(() => controller.abort(new Error("isolated completion deadline exceeded")), p.timeoutMs);
@@ -234,12 +238,17 @@ export function createIsolatedCompletion(
           : await createDefaultRuntime(privateConfig);
         p.assertCurrent();
         signal.throwIfAborted();
-        const output = await runtime.run({
-          ...route,
-          provider: p.provider,
+        const identity = {
           sessionId: `isolated-${randomUUID()}`,
           nativeStateId: `isolated-state-${randomUUID()}`,
           runId: `isolated-run-${randomUUID()}`,
+        };
+        const output = await runtime.run({
+          ...route,
+          provider: p.provider,
+          ...identity,
+          agentId: p.agentId,
+          ...(operationalBudget ? { operationalBudget } : {}),
           workspaceDir: p.workspaceDir,
           systemPrompt: p.systemPrompt,
           prompt: p.prompt,
@@ -264,19 +273,33 @@ export function createIsolatedCompletion(
         signal.throwIfAborted();
         if (forbiddenToolAttempt) fail("runtime attempted to use tools during isolated completion");
         p.assertCurrent();
-        const result = { assistant: createAssistant(p, output, options.now?.() ?? Date.now()) };
+        const result = {
+          assistant: createAssistant(p, output, options.now?.() ?? Date.now()),
+          ...(operationalBudget ? { budgetReceipt: {
+            directory: join(privateStateDir, createHash("sha256").update(identity.nativeStateId).digest("hex")),
+            runId: identity.runId, sessionKey: identity.sessionId, agentId: p.agentId,
+          } } : {}),
+        };
         succeeded = true;
         return result;
+      } catch (error) {
+        primaryFailure = error;
+        throw error;
       } finally {
         if (timer) clearTimeout(timer);
         try {
           if (runtime) await runtime.dispose();
-          if (succeeded && privateStateDir) await rm(privateStateDir, { recursive: true, force: true });
+          // Budget receipts remain durable evidence; legacy disposable state stays disposable.
+          if (succeeded && privateStateDir && !operationalBudget) await rm(privateStateDir, { recursive: true, force: true });
+        } catch (error) {
+          // Cleanup cannot replace a budget fence with a provider-fallback-eligible error.
+          if (isBudgetFailure(primaryFailure) && !isBudgetFailure(error)) throw primaryFailure;
+          throw error;
         } finally {
           activeControllers.delete(controller);
         }
       }
-    })();
+    })().catch(rethrowBudgetFailure);
     const drain = operation.then(() => undefined, () => undefined);
     pending.add(drain);
     drain.finally(() => pending.delete(drain));

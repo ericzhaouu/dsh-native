@@ -251,7 +251,7 @@ export async function startDashboardGateway(responder, {
       catch (error) { failFixture(error); throw error; }
     });
     const originalHost = join(packageRoot, "node_modules", "openclaw");
-    const fixture = agentPinned ? await createPatchedHostFixture(root, { compactionAuth: compactionAuthPatch })
+    const fixture = agentPinned || sourceReplyFixture ? await createPatchedHostFixture(root, { compactionAuth: compactionAuthPatch })
       : { host: originalHost, plugin: await createPluginFixture(root, originalHost) };
     if (copilotAuthFixture) {
       // Replace the copied provider, not the installed SDK or its ownership checks.

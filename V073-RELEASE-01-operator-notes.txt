@@ -1,0 +1,283 @@
+V073-RELEASE-01: CI reproducibility and publication handoff
+Evidence checked 2026-09-21 UTC. This file is preparation, not publication.
+
+MAIN FOLLOW-UP: OFFICIAL DOWNLOAD SOURCE NOW BYTE-VERIFIED
+The main session downloaded the exact official public npm tarball through WSL
+curl with ordinary TLS verification (no insecure flags). Its SHA-256 equals
+3431f4cd2d8dbd6b936def2694ac27e19fa0256295cf4ada0f652ecf1c9ee520.
+Only that exact registry.npmjs.org version/path is now allowlisted; CI defaults
+to it and still checks the same approved hash before installation. No API token
+is sent to npm. Windows TLS failure is retained below as historical evidence,
+not a current source-availability blocker. No SDK bytes were redistributed.
+Remote CI still needs an actual run after the reviewed source is committed.
+
+AUTHORITY AND CURRENT STATUS
+Main owns the reviewed 0.7.3 source, version, commit, push, tag and publication.
+This task has not committed/pushed/tagged, created a release, dispatched CI,
+changed GitHub secrets/variables, or uploaded any SDK bytes. Concurrent changes
+outside the release files were preserved. Do not interpret "handle8" here as
+an instruction to publish automatically.
+
+At inspection, HEAD was d8bf9868eb6467c6c6af5775d3485f86eaa4a9e8 and the
+working tree contained uncommitted 0.7.3 changes. A local manifest MUST say
+source.clean=false and source.releaseReady=false for that tree. Main can
+build and audit before committing; release mode deliberately refuses it.
+Any concurrent edit or commit invalidates prior snapshot evidence: rebuild
+and regenerate after main has finished reviewing/committing everything.
+
+SDK: WHAT IS ACTUALLY KNOWN
+Required SDK: openclaw-2026.9.2.tgz
+Required SHA-256:
+3431f4cd2d8dbd6b936def2694ac27e19fa0256295cf4ada0f652ecf1c9ee520
+Official source commit:
+3928bad9badfcb6c7d140530435e806fb8092190
+Official release:
+https://github.com/openclaw/openclaw/releases/tag/v2026.9.2
+
+Official public manifest names the same SDK package and required digest:
+https://github.com/openclaw/openclaw/releases/download/v2026.9.2/openclaw-2026.9.2-release-manifest.json
+GitHub asset SHA-256 of that JSON (NOT the SDK):
+9bfbf9f7e52ea24d94730c562278b9e202cf910f57d9f473df6fe1d5cf83a7e6
+
+Public postpublish evidence names this npm tarball:
+https://registry.npmjs.org/openclaw/-/openclaw-2026.9.2.tgz
+Evidence source:
+https://github.com/openclaw/openclaw/releases/download/v2026.9.2/openclaw-2026.9.2-postpublish-evidence.json
+GitHub asset SHA-256 of the evidence JSON (NOT the SDK):
+1a466660e08a22e66677a191e3676e0f97fc305542f8624dc270930df7486ed5
+
+The exact official GitHub release has NO .tgz asset. Do not invent a
+releases/download URL. Direct unauthenticated requests to both
+https://registry.npmjs.org/openclaw/2026.9.2 and the above tarball failed
+during TLS handshake in this environment, before any HTTP response/body.
+An npm CLI query also returned E404 with a different visible version list;
+that is not sufficient to conclude the direct public registry lacks this
+version. At that earlier inspection, public metadata supported the intended
+source/pin, but the tarball bytes had not yet been independently verified.
+The main-session follow-up above subsequently verified the exact bytes.
+
+At the earlier subagent inspection the npm URL was a discovery candidate, not an approved CI
+download source. The workflow then retained official GitHub release/Actions-only
+inputs. The reviewed follow-up now permits the exact npm URL with the SAME
+required pin. Do not substitute latest, a different digest, or a local rebuild
+at the same source commit.
+
+Official Actions metadata was accessible through existing gh REST auth:
+https://api.github.com/repos/openclaw/openclaw/actions/runs/33974487049/artifacts
+https://api.github.com/repos/openclaw/openclaw/actions/runs/34004548698/artifacts
+Examples:
+9973293543 full-release-validation-33974487049
+  ZIP digest 7ef514583ca0d86b6e801f6497f5d186de150db66c0338eb386fc3cf0afb367a
+  expires 2026-12-04T16:55:01Z
+9980754815 openclaw-release-postpublish-evidence-v2026.9.2
+  ZIP digest 1250e3c8624d77b6d5991c49e23c7ed804f9d1bffef829b6fd18c68d2fc10dca
+  expires 2026-12-05T01:53:05Z
+9980696120 openclaw-release-children-34004548698-2
+  ZIP digest 9944199314e25b207db04a9fbc54679eeffdc469ebe3f82439e73ebd6ce703d9
+  expires 2026-10-06T01:56:23Z
+
+These artifacts were not expired at inspection, but their public metadata
+does NOT prove they contain the SDK. Unauthenticated artifact download
+returned HTTP 401. No authenticated ZIP was downloaded for this research.
+An outer Actions ZIP digest is NOT the approved inner .tgz digest. Do not
+configure any of these examples as the SDK unless an authorized owner
+verifies that it contains exactly one .tgz with the approved SDK hash.
+
+HISTORICAL SOURCE BLOCKER
+Historical blocker (resolved by the main follow-up above):
+No usable public, approved, byte-verified SDK download had been established.
+The local cached official SDK remains suitable only for authorized local
+validation after checking its hash; possession is NOT redistribution
+permission. NEVER attach that SDK, its ZIP, node_modules, credentials, or
+host state to ericzhaouu/dsh-native, including Actions artifacts.
+Main cannot publish assets to the upstream OpenClaw repository unless
+separately authorized by that project's maintainers. Ask the upstream owner
+for a legitimate source if registry connectivity/access cannot be resolved.
+
+REMOTE CI OBSERVATION (READ-ONLY)
+ericzhaouu/dsh-native test.yml was active; Actions runs=0, artifacts=0 at
+inspection. There is no remote full-SDK success to cite. Local test results
+or the user's earlier Linux 1146 / dual-CLI checks do not establish remote
+CI success. No remote CI was executed by this task.
+
+Repeat metadata inspections without GraphQL/SSO workarounds or token output:
+  gh api repos/openclaw/openclaw/releases/tags/v2026.9.2
+  gh api repos/openclaw/openclaw/git/ref/tags/v2026.9.2
+  gh api repos/openclaw/openclaw/commits/3928bad9badfcb6c7d140530435e806fb8092190
+  gh api repos/openclaw/openclaw/actions/runs/33974487049/artifacts
+  gh api repos/openclaw/openclaw/actions/runs/34004548698/artifacts
+  gh api repos/ericzhaouu/dsh-native/actions/workflows
+  gh api "repos/ericzhaouu/dsh-native/actions/runs?per_page=20"
+  gh api "repos/ericzhaouu/dsh-native/actions/artifacts?per_page=100"
+
+WORKFLOW CONTRACT
+Required Linux: ubuntu-24.04, Node 22.23.1 and 24.15.0.
+Experimental Windows: windows-2022, the same Node versions; separate jobs
+and continue-on-error. Windows jobs are NOT dependencies of the Linux gate.
+Action revisions are full commit pins resolved via gh REST from v4 tags.
+Hosted runner images are not immutable; the OS label alone is not a fully
+hermetic build environment.
+
+PR runs execute generated package/release fixtures only, with no npm
+dependency installation, SDK, provider accounts, or artifact token.
+Manual workflow_dispatch additionally requires both Linux SDK matrix jobs.
+The always-running Linux aggregate depends on BOTH required matrix jobs
+and rejects failed/cancelled/skipped/missing required results. Its PR report
+explicitly says fixtures-only and sdkAcceptance=false. A green PR is not
+full SDK acceptance. This workflow never publishes a release.
+
+Full SDK jobs validate the URL and pin before downloading. The token exists
+only in the download step and is sent only to the initial official API
+request, never redirects, installation, tests, or uploaded evidence.
+Downloads/installations use artifacts\release-private (ignored, NOT
+uploaded). Each job uses npm ci --ignore-scripts, installs the exact SDK
+without lifecycle scripts, checks stock companion state, typechecks,
+builds, runs npm test, rebuilds, packs twice into NEW unique directories,
+compares archive hashes, then creates and verifies a clean-source manifest.
+Linux full jobs explicitly set DSH_RUN_ISOLATED_SDK_TRANSPORT=1; the full driver
+refuses a Linux run without it, rather than accepting a skipped transport gate.
+This covers genuine SDK ingress/dedupe with private loopback model/text transport,
+not actual Feishu or card fallback certification. Experimental Windows retains
+the explicit Linux-only skips without relaxing its subprocess safety guard.
+
+Uploads use an explicit filename allowlist. Only generated-suite summary,
+manifest, verification, repeat-pack comparison, SHA256SUMS and gate decision
+are eligible. No raw test logs, fixture transcripts/auth files, SDK archive,
+product archive, broad directory/glob, or live account output is uploaded.
+Artifacts last 14 days. Inspect an artifact's successful run/commit as well
+as its contents; the summaries are unsigned evidence, not an attestation.
+
+MANIFEST AND REPRODUCIBILITY CONTRACT
+scripts\release-manifest.mjs create/verify require explicit --root,
+--package and --expected-sha. No historic ignored .tgz is selected.
+The manifest binds product hash/size/version, HEAD commit/tree, deterministic
+nonignored source-byte snapshot, index/flag hashes, source status counts,
+and four baseline patch bundles: agent-harness, compact-auth, source-reply,
+table-policy (including their shared engine/imported spec). If the separately
+reviewed group-readonly companion is present, it is also required in the
+archive and gets its own hash binding. No source contents/diffs, arbitrary
+paths, account state, environment dump or test secret is included.
+
+Local mode allows dirty and nonignored untracked packaged source. Release
+mode requires clean tracked source. Ignored non-dist package source,
+unsafe links/submodules/output paths, hidden index flags, missing companions,
+wrong pins, source/archive drift and manifest tampering fail closed.
+Outputs inside the repo must be ignored/untracked, not source/input aliases.
+
+source.releaseReady means SOURCE cleanliness only, not approval to publish.
+The SDK hash in the manifest is a declared requirement, not proof of SDK
+download/install; full-sdk-results adds the local pinned-SDK test outcome.
+verify re-audits against the actual checkout/build/artifact. Its snapshot
+is byte-sensitive: another checkout with CRLF/LF differences can differ.
+reproducibility.json compares two fresh npm packs of ONE built workspace;
+it does NOT claim independent rebuilds or cross-platform identical archives.
+No compiler provenance, digital signature or real-account success is claimed.
+
+LOCAL COMMANDS NOW (DIRTY SOURCE ALLOWED; NO COMMIT REQUIRED)
+Use an installed supported Node and already-authorized matching local SDK.
+Do not copy the private SDK into public release assets. npm.cmd avoids
+Windows PowerShell execution-policy errors from npm.ps1.
+
+  Set-Location 'C:\Users\zhaojian\Downloads\GH_Projects\ai_ideas\dsh-native'
+  node scripts\release-ci.mjs fixtures
+  if ($LASTEXITCODE -ne 0) { throw 'Fixture checks failed' }
+  npm.cmd run typecheck
+  if ($LASTEXITCODE -ne 0) { throw 'Typecheck failed' }
+  node scripts\release-ci.mjs pack
+  if ($LASTEXITCODE -ne 0) { throw 'Local build/pack/audit failed' }
+
+pack explicitly builds, then runs npm pack --ignore-scripts twice into new
+artifacts\release-candidate\pack-* directories and checks exact hashes.
+artifacts\release-candidate\candidate.json is the LOCAL pointer to the
+fresh archive; it is not uploaded. Evidence is in artifacts\release-evidence.
+Do not reuse old evidence if any command fails or source changes.
+
+EXACT VALIDATION COMMANDS AFTER MAIN'S CLEAN COMMIT
+Main must finish its separate reviewed baseline and CI commits first. No
+commit/version/tag is made by the commands below. Preserve a matching SDK
+installation for local build/full tests; no local npm ci is suggested here
+because it would remove the existing optional SDK link.
+
+  Set-Location 'C:\Users\zhaojian\Downloads\GH_Projects\ai_ideas\dsh-native'
+  if (git status --porcelain --untracked-files=all) { throw 'Source is not clean' }
+  $Commit = (git rev-parse HEAD).Trim()
+  node scripts\release-ci.mjs fixtures
+  if ($LASTEXITCODE -ne 0) { throw 'Fixture checks failed' }
+  npm.cmd run typecheck
+  if ($LASTEXITCODE -ne 0) { throw 'Typecheck failed' }
+  npm.cmd run build
+  if ($LASTEXITCODE -ne 0) { throw 'Build failed' }
+  npm.cmd test
+  if ($LASTEXITCODE -ne 0) { throw 'Full local tests failed; do not claim acceptance' }
+  node scripts\release-ci.mjs pack --release
+  if ($LASTEXITCODE -ne 0) { throw 'Clean release evidence failed' }
+  $Candidate = Get-Content artifacts\release-candidate\candidate.json -Raw | ConvertFrom-Json
+  node scripts\release-manifest.mjs verify --root . --package $Candidate.packagePath --expected-sha $Candidate.expectedSha --manifest $Candidate.manifestPath --output artifacts\release-evidence\verification.json
+  if ($LASTEXITCODE -ne 0) { throw 'Verification failed' }
+  if ((git rev-parse HEAD).Trim() -ne $Commit) { throw 'Commit changed; rebuild' }
+
+Windows is experimental: a Windows full-test failure is evidence to report,
+not permission to conceal it or call Linux remote acceptance successful.
+The required Linux matrix remains an unrun release gate, not a source-access
+blocker. Main should build from the exact reviewed commit on Linux.
+
+FUTURE MANUAL CI: MAIN-ONLY DECISION, NOT EXECUTED HERE
+First ensure these reviewed workflow changes are on the remote ref main
+chooses, and the workflow exists on the default branch. The exact public npm
+URL below has been byte-verified and requires no artifact token. Official
+GitHub artifacts remain an alternative only when their inner SDK hash matches
+the approved pin. Do not use a signed redirect URL or a URL containing a token.
+
+The following template is intentionally guarded and must NOT be run until
+main completes integration and selects its reviewed remote ref:
+
+  $ApprovedOfficialSdkUrl = 'https://registry.npmjs.org/openclaw/-/openclaw-2026.9.2.tgz'
+  if (-not $ApprovedOfficialSdkUrl -or -not $ReviewedRemoteRef) { throw 'Verified source and reviewed ref required' }
+  $Body = @{
+    ref = $ReviewedRemoteRef
+    inputs = @{
+      openclaw_artifact_url = $ApprovedOfficialSdkUrl
+      openclaw_artifact_sha256 = '3431f4cd2d8dbd6b936def2694ac27e19fa0256295cf4ada0f652ecf1c9ee520'
+    }
+  } | ConvertTo-Json -Depth 3 -Compress
+  $Body | gh api --method POST repos/ericzhaouu/dsh-native/actions/workflows/test.yml/dispatches --input -
+
+This changes remote state; it is NOT a read-only inspection command. Any
+token/variable provisioning remains main's separate authorized decision.
+After dispatch, inspect the exact run's head_sha and each required matrix
+result using REST; do not rely on a green fixtures-only run:
+  gh api "repos/ericzhaouu/dsh-native/actions/runs?event=workflow_dispatch&per_page=20"
+  gh api "repos/ericzhaouu/dsh-native/actions/runs/$RunId/jobs?per_page=100"
+  gh api "repos/ericzhaouu/dsh-native/actions/runs/$RunId/artifacts?per_page=100"
+
+PUBLICATION BOUNDARY
+Main may later publish its own reviewed plugin product and sanitized
+evidence after choosing the exact clean commit/tag and satisfying the
+release policy. The plugin archive is scanned against the package allowlist
+and compared with the built workspace. That does not authorize publishing
+upstream private SDK material. No publication command is run here. Keep
+the absent remote validation explicit in any handoff until it actually runs.
+
+LOCAL VALIDATION OBSERVED DURING THIS TASK
+Node v24.16.0 / npm 11.13.0 on Windows:
+  Generated package + release tests: 40 total, 39 passed, 0 failed, 1 skipped.
+  The existing symlink test skipped on Windows EPERM; junction tests passed.
+  Existing typecheck and build: passed.
+  Workflow YAML: parsed with already-installed PyYAML; structural/gate/
+    action-pin/upload-allowlist assertions passed in node:test.
+  Fresh local npm pack audit + manifest create/verify: passed while dirty,
+    correctly recording clean=false/releaseReady=false.
+  Two fresh packs of the same build matched:
+    97548fcb836283713fe35a299c343031def08904ccd527c9ff22424d0bcfbfd5
+  Explicit --release against that dirty source: correctly refused.
+  One repeated run hit a transient Git subprocess read failure while other
+    work was active. Git audit subprocesses now run sequentially with optional
+    index-refresh locks disabled; all 20 release-only tests subsequently
+    passed in three consecutive runs. Failure remains fail-closed, not a skip.
+  This package digest describes the concurrent working snapshot tested,
+    NOT the user's earlier 37078a81... candidate or a final release pin.
+
+The exact pinned Node 22.23.1/24.15.0 remote matrix was NOT executed here.
+The full SDK suite was not rerun by this task; prior Linux full-suite results
+are main's separate evidence. Re-run clean-source validation after all
+concurrent reviewed edits. Test fixtures clean up their generated repositories.

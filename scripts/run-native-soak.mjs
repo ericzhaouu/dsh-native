@@ -223,28 +223,43 @@ async function directChildPids() {
 }
 
 async function inspectPid(pid) {
-  const [status, stat, fdEntries] = await Promise.all([
-    readProcFile(`/proc/${pid}/status`),
-    readProcFile(`/proc/${pid}/stat`),
-    readdir(`/proc/${pid}/fd`).catch((error) => {
-      if (["ENOENT", "ESRCH", "EACCES", "EPERM"].includes(error.code)) return undefined;
-      throw error;
-    }),
-  ]);
-  if (!status || !stat) return undefined;
-  const identity = parseProcStat(stat);
-  const statusState = status.match(/^State:\s+([A-Z])/m)?.[1];
-  if (["Z", "X"].includes(identity.state) || ["Z", "X"].includes(statusState)) return undefined;
-  const rssBytes = parseStatusNumberKiB(status, "VmRSS");
-  if (!identity.startTime || !/^\d+$/.test(identity.startTime)) throw new Error("Owned child process identity could not be measured");
-  return {
-    pid,
-    ppid: parseStatusNumber(status, "PPid"),
-    rssBytes: Number.isFinite(rssBytes) ? rssBytes : null,
-    highWaterRssBytes: parseStatusNumberKiB(status, "VmHWM") ?? 0,
-    fdCount: fdEntries?.length ?? null,
-    ...identity,
-  };
+  let firstStartTime;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const [status, stat, fdEntries] = await Promise.all([
+      readProcFile(`/proc/${pid}/status`),
+      readProcFile(`/proc/${pid}/stat`),
+      readdir(`/proc/${pid}/fd`).catch((error) => {
+        if (["ENOENT", "ESRCH", "EACCES", "EPERM"].includes(error.code)) return undefined;
+        throw error;
+      }),
+    ]);
+    if (!status || !stat) return undefined;
+    const identity = parseProcStat(stat);
+    if (!identity.startTime || !/^\d+$/.test(identity.startTime)) throw new Error("Owned child process identity could not be measured");
+    firstStartTime ??= identity.startTime;
+    const afterStat = await readProcFile(`/proc/${pid}/stat`);
+    if (!afterStat) return undefined;
+    const after = parseProcStat(afterStat);
+    if (!after.startTime || !/^\d+$/.test(after.startTime)) throw new Error("Owned child process identity could not be measured");
+    if (identity.startTime !== firstStartTime || after.startTime !== firstStartTime) return undefined;
+    const statusState = status.match(/^State:\s+([A-Z])/m)?.[1];
+    if ([identity.state, after.state, statusState].some((state) => ["Z", "X"].includes(state))) return undefined;
+    const rssBytes = parseStatusNumberKiB(status, "VmRSS");
+    // A child can lose its mm/procfs access between reads while exiting.
+    // Retry boundedly, but retain null for genuinely unavailable live measurements.
+    if ((!Number.isFinite(rssBytes) || fdEntries === undefined) && attempt < 2) {
+      await new Promise((done) => setTimeout(done, 1));
+      continue;
+    }
+    return {
+      pid,
+      ppid: parseStatusNumber(status, "PPid"),
+      rssBytes: Number.isFinite(rssBytes) ? rssBytes : null,
+      highWaterRssBytes: parseStatusNumberKiB(status, "VmHWM") ?? 0,
+      fdCount: fdEntries?.length ?? null,
+      ...after,
+    };
+  }
 }
 
 function makeTrend(values) {

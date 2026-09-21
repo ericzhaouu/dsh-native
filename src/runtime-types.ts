@@ -6,6 +6,7 @@ import type {
   BridgeToolCall,
   BridgeToolResult,
   ModelProvider,
+  OperationalBudget,
   ReasoningEfforts,
 } from "./protocol.js";
 import type { PreparationPolicy, PreparationResolution, TaskPreparationConfig } from "./preparation.js";
@@ -20,9 +21,14 @@ export interface DshConfig {
   allowedCopilotBaseUrls?: string[];
   taskPreparation?: TaskPreparationConfig;
   toolAllowlist?: string[];
+  operationalBudget?: OperationalBudget;
+  operationalBudgetByAgent?: Record<string, OperationalBudget>;
 }
 
 export interface DshAttempt {
+  agentId?: string;
+  /** Trusted host cap; intersects configured ceilings, never read from tool arguments. */
+  operationalBudget?: OperationalBudget;
   provider?: ModelProvider;
   sessionId: string;
   nativeStateId?: string;
@@ -50,6 +56,8 @@ export interface DshAttempt {
 }
 
 export interface DshCompactAttempt {
+  agentId?: string;
+  operationalBudget?: OperationalBudget;
   recoverOnly?: boolean;
   provider?: ModelProvider;
   sessionId: string;

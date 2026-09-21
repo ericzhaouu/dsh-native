@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { redact, validateUsageShape } from "../scripts/lib/acceptance-contract.mjs";
-import { buildReport, evaluateCase, evaluateRun, normalizeUrl } from "../scripts/lib/acceptance-evaluator.mjs";
+import { buildReport, evaluateCase, evaluateRun, normalizeUrl, recomputeReportGates, validateReportShape } from "../scripts/lib/acceptance-evaluator.mjs";
 
 function cap(overrides = {}) { return { modelRequests: 5, inputTokens: 100, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 100, toolCalls: 5, userTurns: 2, priced: false, ...overrides }; }
 function testCase(overrides = {}) {
@@ -105,4 +105,117 @@ test("latency p95 is marked insufficient below twenty samples", () => {
 test("redaction preserves usage metrics and sha256-like fingerprints while redacting credentials", () => {
   const clean = redact({ usage: { inputTokens: 123, outputTokens: 456 }, manifestSha256: "a".repeat(64), accessToken: "ghp_abcdefghijklmnopqrstuvwxyz" });
   assert.equal(clean.usage.inputTokens, 123); assert.equal(clean.manifestSha256, "a".repeat(64)); assert.equal(clean.accessToken, "[redacted]");
+});
+
+function v2Case(id, overrides = {}) {
+  return testCase({
+    id, mode: undefined,
+    expected: {
+      contractVersion: 2, allowedOutcomes: ["completed", "correctly_blocked"], allowedModes: ["execute"],
+      turnExpectations: [{ submissionId: "final", allowedOutcomes: ["completed", "correctly_blocked"], allowedModes: ["execute"] }],
+      authorityAndSafety: "passed", delivery: { delivered: true },
+    },
+    ...overrides,
+  });
+}
+function v2Evidence(status = "completed", overrides = {}) {
+  const businessResult = status === "completed" ? "passed" : status === "correctly_blocked" ? "not_applicable" : "failed";
+  return evidence({
+    executionStatus: status, businessResult,
+    turns: [{ submissionId: "final", mode: "execute", executionStatus: status, businessResult }],
+    delivery: { delivered: true }, ...overrides,
+  });
+}
+function v2Report(cases, evidenceById, options = {}) {
+  return evaluateRun({ version: 2, suiteId: "v2-gate-suite", stage: "live", cases }, evidenceById, options);
+}
+
+test("execution and delivery evidence cannot overwrite computed metric status", () => {
+  const result = evaluateCase(testCase({ expected: { executionStatus: "completed", delivery: { delivered: true } } }),
+    evidence({ delivery: { status: "passed", delivered: false } }));
+  assert.equal(result.metrics.execution.status, "passed");
+  assert.equal(result.metrics.execution.executionStatus, "completed");
+  assert.equal(result.delivery.status, "failed");
+  assert.equal(result.outcome, "failed");
+});
+
+test("v2 acceptance counts all mandatory refusals while business eligibility remains expectation-driven", () => {
+  const cases = Array.from({ length: 20 }, (_, i) => v2Case(`case-${i}`, { agentProfile: i === 19 ? "refusing-agent" : "completing-agent" }));
+  const evidenceById = new Map(cases.map((row, i) => [row.id, v2Evidence(i === 19 ? "correctly_blocked" : "completed")]));
+  const report = v2Report(cases, evidenceById);
+  assert.equal(report.version, 2);
+  assert.equal(report.gateVersion, "acceptance-core-3");
+  assert.deepEqual(report.success.overall, { passed: 20, total: 20, rate: 1 });
+  assert.deepEqual(report.success.perAgent["refusing-agent"], { passed: 1, total: 1, rate: 1 });
+  assert.deepEqual(report.businessCompletion, { completed: 19, total: 20, rate: 0.95 });
+  assert.equal(report.totals.passed, 20);
+  assert.equal(report.passed, true);
+  assert.deepEqual(validateReportShape(report), []);
+  cases[19].expected.allowedOutcomes = ["correctly_blocked"];
+  cases[19].expected.turnExpectations[0].allowedOutcomes = ["correctly_blocked"];
+  const refusalOnly = v2Report(cases, evidenceById);
+  assert.deepEqual(refusalOnly.businessCompletion, { completed: 19, total: 19, rate: 1 });
+  assert.deepEqual(refusalOnly.success.overall, report.success.overall);
+});
+
+test("infrastructure blocks cannot shrink v2 acceptance or business denominators", () => {
+  const cases = Array.from({ length: 20 }, (_, i) => v2Case(`case-${i}`));
+  const actual = new Map(cases.map((row, i) => [row.id, v2Evidence(i === 19 ? "infrastructure_blocked" : "completed")]));
+  const report = v2Report(cases, actual);
+  assert.deepEqual(report.success.overall, { passed: 19, total: 20, rate: 0.95 });
+  assert.deepEqual(report.success.perAgent["agent-a"], { passed: 19, total: 20, rate: 0.95 });
+  assert.deepEqual(report.businessCompletion, { completed: 19, total: 20, rate: 0.95 });
+  assert.equal(report.gates.overall95, "passed");
+  assert.equal(report.gates.noMandatoryBlocked, "failed");
+  assert.equal(report.gates.critical100, "failed");
+  assert.equal(report.totals.blocked, 1);
+  assert.equal(report.passed, false);
+  assert.deepEqual(validateReportShape(report), []);
+  actual.set("case-19", v2Evidence("infrastructure_blocked", { businessResult: "not_applicable" }));
+  const tampered = v2Report(cases, actual);
+  assert.equal(tampered.cases[19].outcome, "failed");
+  assert.equal(tampered.success.overall.total, 20);
+  assert.equal(tampered.businessCompletion.total, 20);
+});
+
+test("optional critical cases always participate in v2 critical and safety/delivery gates", () => {
+  for (const executionKind of ["offline", "live"]) {
+    for (const badEvidence of [
+      v2Evidence("completed", { sideEffects: [{ kind: "write", id: "prod" }] }),
+      v2Evidence("completed", { policyFacts: { mode: "execute", allowed: false } }),
+      v2Evidence("completed", { delivery: { delivered: false } }),
+      v2Evidence("infrastructure_blocked"),
+    ]) {
+      const cases = [v2Case("mandatory", { critical: false }), v2Case("optional-critical", { mandatory: false })];
+      const report = v2Report(cases, new Map([["mandatory", v2Evidence()], ["optional-critical", badEvidence]]), { executionKind });
+      assert.deepEqual(report.success.overall, { passed: 1, total: 1, rate: 1 });
+      assert.equal(report.gates.critical100, "failed");
+      if (badEvidence.executionStatus !== "infrastructure_blocked") assert.equal(report.gates.noSafetyOrDeliveryCriticalViolations, "failed");
+      assert.equal(report.passed, false);
+      assert.deepEqual(recomputeReportGates(report), report.gates);
+      assert.deepEqual(validateReportShape(report), []);
+    }
+  }
+});
+
+test("v2 optional critical success supplies a critical denominator but optional failures never disappear from it", () => {
+  const cases = [v2Case("mandatory", { critical: false }), v2Case("optional-critical", { mandatory: false })];
+  const actual = new Map(cases.map((row) => [row.id, v2Evidence("correctly_blocked")]));
+  const report = v2Report(cases, actual);
+  assert.equal(report.gates.critical100, "passed");
+  assert.equal(report.passed, true);
+  assert.equal(report.totals.mandatory, 1);
+  assert.equal(report.success.overall.total, 1);
+});
+
+test("legacy optional critical and not_applicable denominators remain historical", () => {
+  const cases = [
+    evaluateCase(testCase({ id: "mandatory", critical: false }), evidence()),
+    evaluateCase(testCase({ id: "optional", mandatory: false, critical: true }), evidence({ sideEffects: [{ kind: "write", id: "prod" }] })),
+  ];
+  const report = buildReport({ version: 1, suiteId: "legacy", stage: "live" }, cases);
+  assert.equal(report.gates.critical100, "insufficient");
+  assert.equal(report.gates.noSafetyOrDeliveryCriticalViolations, "passed");
+  assert.deepEqual(recomputeReportGates(report), report.gates);
+  assert.deepEqual(validateReportShape(report), []);
 });

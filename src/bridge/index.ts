@@ -28,6 +28,9 @@ import { JsonRpcPeer } from "../rpc.js";
 import { TurnTracker } from "./turn.js";
 import { assertCopilotReplaySafe, sanitizeCopilotStream } from "./copilot-replay.js";
 import { emptyParams, jsonObject, keys, parseCompact, parseRun, parseToolResult, record } from "./validation.js";
+import { parseBridgeConfig, type BridgeBudgetConfig } from "./budget-config.js";
+import { ProviderBudgetGuard } from "./budget.js";
+import { auditBudgetProvider } from "./budget-provider.js";
 
 export { createBridgePatch } from "./profile.js";
 export const name = "openclaw-stdio-bridge";
@@ -190,6 +193,8 @@ export class BridgeWorker {
   private preparation?: PreparationResolution;
   private preparationReady = false;
   private activeCompaction?: ActiveCompaction;
+  private readonly budget?: ProviderBudgetGuard;
+  private auditBudget?: (options: GenerateOptions) => void;
 
   constructor(
     private readonly ctx: Context,
@@ -197,6 +202,7 @@ export class BridgeWorker {
     output: Writable,
     private readonly onStop: () => Promise<void>,
     private readonly onFatal: (error: Error) => void = (error) => ctx.logger(name).error(error),
+    private readonly budgetConfig?: BridgeBudgetConfig,
   ) {
     this.peer = new JsonRpcPeer(input, output, {
       onRequest: (method, params) => this.onRequest(method, params),
@@ -206,14 +212,18 @@ export class BridgeWorker {
         this.cancel();
       },
     });
+    if (budgetConfig) this.budget = new ProviderBudgetGuard(budgetConfig, this.peer, (error) => this.fail(error));
     ctx.on("llm/stream", (options, next) => {
       try {
         this.auditRequest(options);
-        if (options.provider !== "github-copilot") return next();
+        if (this.budget && !this.auditBudget) throw new Error("DSH_BUDGET_UNCERTAIN: provider audit is not ready");
+        this.auditBudget?.(options);
+        const dispatch = () => this.budget ? this.budget.stream(options, next) : next();
+        if (options.provider !== "github-copilot") return dispatch();
         // DSH freezes prepared requests. Validate their already-sanitized history;
         // the Responses serializer omits unsigned reasoning without exposing it as text.
         assertCopilotReplaySafe(options);
-        return sanitizeCopilotStream(next());
+        return sanitizeCopilotStream(dispatch());
       } catch (error) {
         this.fail(error);
         throw error;
@@ -243,6 +253,7 @@ export class BridgeWorker {
     this.assertHealthy();
     this.auditGlobal();
     if (this.ctx.agents.list().length) throw new Error("DSH started an autonomous agent");
+    if (this.budgetConfig) this.auditBudget = await auditBudgetProvider(this.ctx.llm, this.budgetConfig);
     this.initialized = true;
     await this.peer.notify("event", { type: "ready", version: BRIDGE_VERSION, dshVersion: DSH_VERSION } satisfies BridgeEvent);
   }
@@ -259,6 +270,7 @@ export class BridgeWorker {
 
   private assertHealthy(): void {
     if (this.failure) throw this.failure;
+    this.budget?.assertHealthy();
   }
 
   private auditGlobal(): void {
@@ -367,6 +379,7 @@ export class BridgeWorker {
 
   cancel(): void {
     this.cancelled = true;
+    this.budget?.cancel();
     this.agent?.cancel({ kind: "user" });
   }
 
@@ -1002,14 +1015,14 @@ export class BridgeWorker {
       this.handle = undefined;
     }
     this.tracker?.dispose();
+    this.budget?.dispose();
     if (failures.length) throw new AggregateError(failures, "DSH bridge cleanup failed");
   }
 }
 
 /** Cordis CLI entry; stdout belongs exclusively to the bridge's JSON-RPC peer. */
 export function apply(ctx: Context, config: unknown): void {
-  const options = record(config, "bridge config");
-  keys(options, [], "bridge config");
+  const budgetConfig = parseBridgeConfig(config);
   const require = createRequire(import.meta.url);
   const installed = record(require("@deepseek-ai/dsh/package.json"), "DSH package");
   if (installed.version !== DSH_VERSION) throw new Error(`Bridge requires DSH ${DSH_VERSION}`);
@@ -1021,7 +1034,7 @@ export function apply(ctx: Context, config: unknown): void {
   const worker = new BridgeWorker(ctx, process.stdin, process.stdout, stopRoot, (error) => {
     process.exitCode = 1;
     ctx.logger(name).error(error);
-  });
+  }, budgetConfig);
   ctx.effect(() => async () => {
     worker.cancel();
     try { await worker.cleanup(); } finally { worker.peer.close(); }

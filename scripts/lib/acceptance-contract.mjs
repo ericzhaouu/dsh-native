@@ -4,6 +4,7 @@ import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { createHash, randomUUID } from "node:crypto";
 import Ajv from "ajv";
+import { assertCaseExpectation } from "./acceptance-expectations.mjs";
 
 export const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
 export const packageRootReal = realpathSync.native(packageRoot);
@@ -45,6 +46,7 @@ export async function loadManifest(path) {
   for (const testCase of manifest.cases) {
     if (ids.has(testCase.id)) throw new TypeError(`Duplicate case id: ${testCase.id}`);
     ids.add(testCase.id);
+    if (manifest.version === 2) assertCaseExpectation(testCase);
   }
   return { manifest, manifestPath: absolute, manifestSha256: await sha256File(absolute) };
 }

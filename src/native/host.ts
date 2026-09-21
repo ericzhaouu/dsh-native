@@ -1,6 +1,7 @@
 import { Ajv, type ValidateFunction } from "ajv";
 import { isAbsolute, relative, resolve } from "node:path";
 import type { AgentHarnessV2, AnyAgentTool } from "openclaw/plugin-sdk/agent-harness";
+import * as agentHarnessRuntime from "openclaw/plugin-sdk/agent-harness-runtime";
 import { resolveAgentConfig } from "openclaw/plugin-sdk/agent-scope-runtime";
 import type { BridgeTool, BridgeToolCall, BridgeToolResult } from "../protocol.js";
 import { renderPreparationInstructions, type PreparationPolicy } from "../preparation.js";
@@ -13,6 +14,7 @@ import {
   assertPrivateSourceReplyArgs, buildSourceReplyDeliveryEvidence, createPrivateSourceReplyArgs,
   type NativeSourceReplyDelivery, type NativeSourceReplyReceiptState, SourceReplyDeliveryError,
 } from "./source-reply.js";
+import type { NativeSourceReplyOwnership } from "./source-reply-ownership.js";
 
 type Attempt = Parameters<AgentHarnessV2["runAttempt"]>[0];
 type Runtime = typeof import("openclaw/plugin-sdk/agent-harness-runtime");
@@ -24,7 +26,8 @@ export interface NativeHost {
   tools: BridgeTool[];
   toolNotices?: readonly HostToolNotice[];
   executeTool(call: BridgeToolCall, signal: AbortSignal): Promise<BridgeToolResult>;
-  deliverSourceReply?: (text: string, signal: AbortSignal) => Promise<NativeSourceReplyDelivery>;
+  sourceReplyOwnershipRequired?: boolean;
+  deliverSourceReply?: (text: string, signal: AbortSignal, ownership?: NativeSourceReplyOwnership) => Promise<NativeSourceReplyDelivery>;
   getReplayState(): { hadPotentialSideEffects: boolean; replaySafe: boolean };
   getToolCounts(): { startedCount: number; completedCount: number; activeCount: number };
   getUnsettledOperationCount(): number;
@@ -38,7 +41,9 @@ function record(value: unknown): value is Record<string, unknown> {
 
 export function assertNativeHostSupported(p: Attempt): void {
   const unsupported = (reason: string): never => {
-    throw new Error(`DSH native host does not support ${reason}`);
+    const cause = new Error(`DSH native host does not support ${reason}`);
+    // Unscoped preflight stops model fallback; scope: "harness" permits an ownership change.
+    throw new agentHarnessRuntime.AgentHarnessPreflightError(cause.message, { cause });
   };
   if (!p.hostCapabilities?.bindToolSurface) unsupported("runs without a host-bound tool capability");
   if (p.clientTools?.length) unsupported("clientTools");
@@ -177,6 +182,7 @@ export interface NativeToolHostOptions {
   preparationGate?: PreparationGate;
   privateSourceReplyTool?: AnyAgentTool;
   privateSourceReplyAttempt?: Attempt;
+  requireSourceReplyOwnership?: boolean;
   cleanupTimeoutMs?: number;
 }
 
@@ -471,7 +477,8 @@ export function createNativeToolHost(options: NativeToolHostOptions): Omit<Nativ
       void work.then(() => pending.delete(work), () => pending.delete(work));
       return work;
     },
-    deliverSourceReply: privateSourceReplyEntry ? (text, signal) => {
+    sourceReplyOwnershipRequired: options.requireSourceReplyOwnership,
+    deliverSourceReply: privateSourceReplyEntry ? (text, signal, ownership) => {
       const args = createPrivateSourceReplyArgs(text);
       const call: BridgeToolCall = { name: "message", callId: `dsh-source-reply:${options.runId}`, arguments: args };
       try {
@@ -480,6 +487,13 @@ export function createNativeToolHost(options: NativeToolHostOptions): Omit<Nativ
         sources.get("message")!.assertUnchanged();
         validate("message", args);
         assertPrivateSourceReplyArgs(args, text);
+        if (options.requireSourceReplyOwnership) {
+          const bind: unknown = Reflect.get(privateSourceReplyEntry.tool, "bindNativeSourceReplyOwnership");
+          if (typeof bind !== "function" || !ownership || ownership.text !== text) {
+            throw new Error("Missing committed native source reply ownership capability");
+          }
+          bind(ownership);
+        }
       } catch (error) {
         return Promise.reject(sourceReplyError("Private source reply was not dispatched",
           "confirmed-not-delivered", "pre-dispatch", undefined, error));
@@ -664,6 +678,9 @@ export async function prepareNativeHost(p: Parameters<AgentHarnessV2["runAttempt
     const privateSourceReplyTool = privateSourceReplyTools[0];
     if (requiresPrivateSourceReply) {
       if (!privateSourceReplyTool) throw new Error("DSH native host requires an authorized private message tool current-source route");
+      if (typeof Reflect.get(privateSourceReplyTool, "bindNativeSourceReplyOwnership") !== "function") {
+        throw new Error("DSH native source replies require the source-reply ownership host companion patch");
+      }
       if (p.toolExecutionAllow && !p.toolExecutionAllow.includes("message")) {
         throw new Error("DSH native host private message tool execution is denied");
       }
@@ -725,6 +742,7 @@ export async function prepareNativeHost(p: Parameters<AgentHarnessV2["runAttempt
       preparationGate: preparation?.gate,
       toolAllowlist: requested, toolSources, toolNotices,
       privateSourceReplyTool, privateSourceReplyAttempt: requiresPrivateSourceReply ? p : undefined,
+      requireSourceReplyOwnership: requiresPrivateSourceReply,
       cleanupTimeoutMs: lifecycle?.cleanupTimeoutMs,
     });
     const preparedHost = host;

@@ -1,6 +1,6 @@
 # DSH Native for OpenClaw
 
-**实验性版本 0.7.2**：把官方 DeepSeek Harness（DSH）的模型／工具循环接入 OpenClaw 的原生 `AgentHarnessV2`，并保留 OpenClaw 对模型、认证、工具授权与会话入口的控制。
+**实验性版本 0.7.4**：把官方 DeepSeek Harness（DSH）的模型／工具循环接入 OpenClaw 的原生 `AgentHarnessV2`，并保留 OpenClaw 对模型、认证、工具授权与会话入口的控制。
 
 - 源码仓库：[ericzhaouu/dsh-native](https://github.com/ericzhaouu/dsh-native)
 - 作者：[ericzhaouu](https://github.com/ericzhaouu)
@@ -16,6 +16,8 @@
 
 ## 目录
 
+- [0.7.4 执行预算与验收边界](#074-执行预算与验收边界)
+- [0.7.3 会话连续性根因修复](#073-会话连续性根因修复)
 - [0.7.2 稳定性加固](#072-稳定性加固)
 - [0.7.0 当前会话私有回复](#070-当前会话私有回复)
 - [0.6.1 Copilot 压缩认证交接补丁](#061-copilot-压缩认证交接补丁)
@@ -41,6 +43,40 @@
 - [仓库结构](#仓库结构)
 - [排错](#排错)
 - [致谢与许可证](#致谢与许可证)
+
+## 0.7.4 执行预算与验收边界
+
+本轮提供选择性执行预算、专用测试群的只读补丁，以及定时归属和验收基础设施修复；**不是 1.0 就绪声明，也不表示已经部署到运行中的宿主**。未配置预算的既有任务保持原行为。
+
+- **派发前预算**：可信配置的请求数、输入／输出 token、宿主工具次数和时限在运行时执行。准备、自动压缩及实际重试请求计入同一次尝试；独立压缩和 reviewer 是另一次受限尝试。使用方式见下文，不可用提示词代替限制。
+- **保留第一原因**：不受支持的宿主 authority／能力契约使用宿主识别的终止型 preflight 错误，不进入不能解决该权限问题的模型 fallback。原有定时权限保护不删除。
+- **专用只读群**：新增独立 `host-patch\group-readonly`，只在 DSH 绑定的真实飞书群、宿主已解析为仅 `read`／私有 `message` 的策略下，附加只读工作区约束；允许的只读 Skill 根仍遵循宿主规则，不是任意文件沙箱。它不改全局权限或其他聊天，配置规划器会保留继承的 deny，按最新配置哈希处理变更／恢复。应用或撤销必须停止对应 Gateway，详见该目录 `USAGE.txt`。
+- **验收与发布证据**：新版语料保留允许结果集合及逐轮独立判定，原始观察先绑定再脱敏，旧版语料和历史报告不重判。通道控制严格区分真实飞书与隔离 SDK；重投增量、未知 ACK 和不可重发状态单独记录。Linux CI 要求显式运行隔离 SDK 用例，Windows 仍为实验性；绿灯不代表真实账号、卡片回退或完整业务语料已通过。
+
+定时任务的替代路径是经过批准的**显式独立内置 owner**，不是原生 DSH cron 兼容；保持暂停状态、不运行任务、不复制认证或转录，见“定时任务的显式归属修复”。资源观测保留冷／暖基线和 FD 身份，不通过放宽阈值掩盖资源增长。
+
+## 0.7.3 会话连续性根因修复
+
+本轮修复真实渠道连续会话暴露的三个产品边界问题，不新增模型工具或性能调优。
+
+- **单一历史所有者**：DSH 提交最终助手记录后，通过模型参数之外的一次性可信能力，绑定当前 Agent、会话、run、reset 和助手记录身份。宿主发送前再次核对权威历史和实际目标会话，只省略同一答复的重复投递镜像；不再靠原文与渠道规范化文本碰巧相等来去重。保留原有授权、投递回执与未知结果隔离。
+- **终止型历史错误**：显式历史／准入不变量错误携带宿主识别的 `openclaw_transcript_not_continuable` 标记，保留原始错误和 cause，不再进入无法修复历史的模型 fallback。普通 I/O、取消和提供商错误不被一概改成终止型。
+- **格式策略一致性**：独立宿主补丁仅调整明确绑定 `dsh-native` 的群聊 Agent，读取实际 account／channel 表格转换策略。`off` 表示不转换，可按用户要求输出原始 Markdown 表格；`code`／`bullets` 则明确说明对应替代，不谎称支持原生表格渲染。其他 Agent 的提示保持原状。
+
+**私有 `message_tool_only` 回复现在需要新增的所有权宿主补丁**；缺失时在模型推理前明确拒绝，不退回已知有缺陷的旧发送方式。当前可信归属交接支持本地当前来源纯文本和内部 UI 回复；跨会话、媒体、远程 Gateway action 转发拒绝执行。它不承诺平台端恰好一次送达。
+
+两个新补丁均要求精确 OpenClaw 2026.9.2 文件哈希、独立回执，并可单独回滚。须先在独占维护窗口停止／排空该 Gateway，再执行：
+
+```powershell
+node .\host-patch\source-reply\apply.mjs --root C:\PATH\TO\openclaw --check
+node .\host-patch\table-policy\apply.mjs --root C:\PATH\TO\openclaw --check
+node .\host-patch\source-reply\apply.mjs --root C:\PATH\TO\openclaw --apply --offline-confirmed
+node .\host-patch\table-policy\apply.mjs --root C:\PATH\TO\openclaw --apply --offline-confirmed
+```
+
+升级插件与补丁后再启动 Gateway。撤销使用相应工具的 `--restore --offline-confirmed`，并协调插件版本，避免新插件在没有所有权能力时无法回复。现有 Agent-pin 和 compaction-auth 补丁不变；不会自动改写渠道配置。
+
+**不自动修复已污染的旧历史**：不删记录、不把外来助手重新标为 DSH、不移除锁，也不自动 `/new`。保留旧现场，只有在明确授权后使用新会话阶段。新的连续性回归不覆盖或改判原始失败记录。
 
 ## 0.7.2 稳定性加固
 
@@ -70,7 +106,7 @@ node .\scripts\inspect-state.mjs --state-dir C:\PATH\TO\private-dsh-state
 
 仅 SDK 确认的当前来源回执算送达；缺失回执或失败不能宣布成功，也不自动重跑模型／重复发送。发送后取消或 hook 失败保留已确认的送达事实。静默正文和 memory 维护不发送；message-only 轮次不推送未经提交的 partial／reasoning 文本。
 
-这不是主动消息、跨群投递、多媒体或所有渠道的兼容承诺。Linux 隔离 Gateway 的合成通道测试不等于真实飞书验收；1.0 仍需真实渠道、完整行为语料、稳定性及同制品回退门禁。已部署旧版需在维护窗口显式升级；本次不增加或修改宿主补丁。
+这不是主动消息、跨群投递、多媒体或所有渠道的兼容承诺。Linux 隔离 Gateway 的合成通道测试不等于真实飞书验收；1.0 仍需真实渠道、完整行为语料、稳定性及同制品回退门禁。0.7.0 本身没有新增宿主补丁；升级到 0.7.3 时须同时应用上节的所有权兼容补丁。
 
 飞书适配器 `@openclaw/feishu@2026.8.2` 可在对应 account 下设置 `renderMode:"raw"` 与 `streaming:{mode:"off",block:{enabled:false}}`，使用非卡片文本路径。该设置影响该 account 的展示方式，不扩大群／发送人权限，也不代表查明了旧 CardKit HTTP 400 的根因。
 
@@ -514,6 +550,8 @@ Agent 级 pin 是可选项。原始 2026.9.2 宿主仍可使用显式的**逐模
 | `streamIdleTimeoutMs` | `120000` | 桥接事件流空闲等待；同上，不是整个任务的总时限 |
 | `allowedBaseUrls` | `["https://api.deepseek.com"]` | DeepSeek 精确端点列表，非空 |
 | `allowedCopilotBaseUrls` | 下列四个端点 | 与 DeepSeek 分开校验的 Copilot 精确账号端点列表，非空 |
+| `operationalBudget` | 未设置 | 可选的每次尝试预算，五项正安全整数必须全部配置 |
+| `operationalBudgetByAgent` | 未设置 | 至多 64 个精确 Agent ID；与全局预算及可信尝试预算逐项取较小值 |
 
 Copilot 默认列表：
 
@@ -529,6 +567,30 @@ Copilot 默认列表：
 如宿主解析出其他经批准的企业／数据驻留端点，只把该**精确 HTTPS URL**加入对应列表；不是域名通配、路径前缀或任意代理授权。URL 会规范化并去除尾部 `/`，不能含用户名／密码、query 或 fragment。只允许明确列出的 HTTP loopback 开发 fixture，不接受任意明文远程端点。
 
 这些选项不改变模型选择、认证、全局默认或工具策略。启动慢时可调整启动超时，但不要用更长超时掩盖路由、权限或会话连续性错误。
+
+### 可选执行预算
+
+以下是放入 `plugins.entries.dsh-native.config` 的**示意片段**，不是直接覆盖运行配置或推荐的成本额度。先按实际宿主模型窗口和测试活动调整，再在维护窗口启用：
+
+```json
+{
+  "operationalBudgetByAgent": {
+    "dsh-experiment": {
+      "maxModelRequests": 8,
+      "maxInputTokens": 4000000,
+      "maxOutputTokens": 16000,
+      "maxToolCalls": 16,
+      "maxDurationMs": 120000
+    }
+  }
+}
+```
+
+五个字段都必须是大于零的安全整数。它们不授予工具；零工具任务通过宿主／隔离工具目录控制，不是把 `maxToolCalls` 写成零。未列出的 Agent 只继承全局预算；全局也未配置时不启用预算。任何更具体的可信上限都只能收窄，不能放宽。
+
+每次**物理模型请求**前保守预留完整 `contextWindow` 的输入额度，而不是按字符猜测 token；剩余额度小于窗口时，即使提示很短也会拒绝派发。已知 usage 包含缓存输入和 reasoning 输出；输出上限按累计剩余额度收窄。缺失或不确定 usage 保留持久化预留并隔离后续重放，不当作零消耗，也不改用其他提供商重试。这依赖受支持提供商遵守声明的模型窗口和输出上限，不是独立的账单担保。
+
+`maxDurationMs` 到期停止准入并请求取消，**不等于远端模型／宿主工具已停止**；实际未确认收敛时保留隔离，不把等待超时当作清理成功。验收 runner 的 case／campaign 分配仅是上限；适配器必须在每次派发前证明已安装的运行时预算能容纳剩余额度与剩余时间，runner 不会自行改插件配置。额度过小、未知消耗或缺少证明都明确阻断。
 
 ## 能力边界与 Dashboard
 
@@ -560,6 +622,14 @@ sessions_list  sessions_history  sessions_send  session_status
 使用 `legacy` context engine、普通前台轮次和符合既有策略的本地 Gateway 工作区。取消可以终止活动尝试，但恢复不是重启中断的操作系统进程或命令栈。
 
 **Dashboard 0.3 兼容性**：普通用户 `chat.send` 可以带 `taskSuggestionDeliveryMode="gateway"` 和可选 `skillLibraryAuthoring` authority。插件接受这个已知 delivery mode、保留 active-handle 元数据，但不会调用或转交 authoring authority，也不添加 suggestion、messaging 或 skill-management 工具。未知 delivery mode 和显式 Skill Workshop 工作流仍失败关闭；这不是对内部系统轮次的普遍兼容承诺。
+
+### 定时任务的显式归属修复
+
+DSH 的定时权限限制仍然保留，不会因异常自动换用其他 harness。源码中的 `scripts\cron-ownership.mjs` 提供离线 `plan`／`check`，用于审阅将指定 isolated `agentTurn` 任务交给独立、显式绑定 `openclaw` 的定时 Agent；**这不是 DSH 新增 cron 支持，也不会迁移前台 Agent**。该操作者脚本不随 npm 插件包分发。
+
+必须先批准具体任务、新 Agent 和独立 `agentDir`，并由可信宿主适配器逐项证明认证主体、模型授权、工具／用户权限及实际投递范围不变。不能复制凭据、借用默认 Agent 的认证来冒充等价授权，或复用旧会话转录。新定时 Agent 的 heartbeat 保持关闭；旧显式 isolated 绑定需要单独确认清除。
+
+计划绑定最新完整私有快照及宿主 CAS 标识，仅修改任务的 `agentId` 和必要的 `sessionKey`。已暂停任务保持暂停，不能有待运行时间或活动执行；启用任务必须处于安全空闲窗口。不会修改 `enabled`、时间表或手动运行任务。并发暂停／恢复会使旧计划失效；不能恢复旧备份来重新启用任务。CLI 不提供 `apply`；可导入的 apply 帮助函数仍需可信操作者适配器和准确计划批准。跨配置与多任务更新不是原子事务，发生部分写入或结果不明时停止并对账，不盲目重试或自动回滚。
 
 ## 原生状态、锁与恢复
 

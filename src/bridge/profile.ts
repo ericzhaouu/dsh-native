@@ -5,6 +5,7 @@ import type { Config as SpineConfig } from "@deepseek-ai/dsh-agent-spine-demo";
 import type { Config as DeepSeekConfig } from "@deepseek-ai/dsh-llm-deepseek";
 import { copilotHeaders } from "../copilot-policy.js";
 import type { ModelProvider, ReasoningEfforts, ReasoningLevel } from "../protocol.js";
+import { parseBridgeConfig } from "./budget-config.js";
 
 // These are sdk-minimal row IDs, not tool names. It does not include dsh-base.
 const disabledRows = [
@@ -83,6 +84,7 @@ export function createBridgePatch(options: {
   modelName?: string;
   headers?: Record<string, string>;
   reasoningEfforts?: ReasoningEfforts | false;
+  operationalBudget?: boolean;
 }): object[] {
   if (!isAbsolute(options.bridgePath)) {
     throw new TypeError("bridgePath must be an absolute filesystem path");
@@ -112,6 +114,12 @@ export function createBridgePatch(options: {
   }
   positiveInteger(options.contextWindow, "contextWindow");
   if (options.maxTokens !== undefined) positiveInteger(options.maxTokens, "maxTokens");
+  if (options.operationalBudget !== undefined && typeof options.operationalBudget !== "boolean") {
+    throw new TypeError("operationalBudget must be boolean");
+  }
+  const bridgeConfig = options.operationalBudget === true ? parseBridgeConfig({
+    operationalBudget: true, budgetBaseUrl: options.baseUrl, budgetMaxTokens: options.maxTokens,
+  })! : {};
   if (
     !Number.isFinite(options.streamIdleTimeoutMs) ||
     options.streamIdleTimeoutMs <= 0 ||
@@ -162,7 +170,7 @@ export function createBridgePatch(options: {
            id: "openclaw-bridge",
            // Native Windows paths are not ESM specifiers; encode spaces/#/% as well.
            name: pathToFileURL(options.bridgePath).href,
-           config: {},
+           config: bridgeConfig,
         }],
       },
     ] satisfies PatchOptions[];
@@ -217,7 +225,7 @@ export function createBridgePatch(options: {
           id: "openclaw-bridge",
           // Native Windows paths are not ESM specifiers; encode spaces/#/% as well.
           name: pathToFileURL(options.bridgePath).href,
-          config: {},
+          config: bridgeConfig,
         },
       ],
     },

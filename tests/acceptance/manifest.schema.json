@@ -11,7 +11,7 @@
   ],
   "properties": {
     "version": {
-      "const": 1
+      "enum": [1, 2]
     },
     "suiteId": {
       "type": "string",
@@ -45,6 +45,22 @@
       }
     }
   },
+  "allOf": [{
+    "if": { "properties": { "version": { "const": 2 } }, "required": ["version"] },
+    "then": {
+      "properties": { "cases": { "type": "array", "items": {
+        "type": "object",
+        "properties": { "expected": { "$ref": "#/$defs/expectedV2" }, "mode": {} },
+        "not": { "properties": { "mode": {} }, "required": ["mode"] }
+      } } }
+    },
+    "else": {
+      "properties": { "cases": { "type": "array", "items": {
+        "type": "object",
+        "properties": { "expected": { "$ref": "#/$defs/expectedV1" } }
+      } } }
+    }
+  }],
   "$defs": {
     "stage": {
       "enum": [
@@ -314,6 +330,43 @@
       }
     },
     "expected": {
+      "oneOf": [{ "$ref": "#/$defs/expectedV1" }, { "$ref": "#/$defs/expectedV2" }]
+    },
+    "allowedOutcomes": {
+      "type": "array", "minItems": 1, "maxItems": 2, "uniqueItems": true,
+      "items": { "enum": ["completed", "correctly_blocked"] }
+    },
+    "allowedModes": {
+      "type": "array", "minItems": 1, "maxItems": 4, "uniqueItems": true,
+      "items": { "enum": ["chat", "clarify", "draft", "execute"] }
+    },
+    "turnExpectation": {
+      "type": "object", "additionalProperties": false,
+      "required": ["submissionId", "allowedOutcomes", "allowedModes"],
+      "properties": {
+        "submissionId": { "$ref": "#/$defs/identifier" },
+        "allowedOutcomes": { "$ref": "#/$defs/allowedOutcomes" },
+        "allowedModes": { "$ref": "#/$defs/allowedModes" }
+      }
+    },
+    "expectedV2": {
+      "type": "object", "additionalProperties": false,
+      "required": ["contractVersion", "allowedOutcomes", "allowedModes", "turnExpectations", "authorityAndSafety", "delivery"],
+      "properties": {
+        "contractVersion": { "const": 2 },
+        "allowedOutcomes": { "$ref": "#/$defs/allowedOutcomes" },
+        "allowedModes": { "$ref": "#/$defs/allowedModes" },
+        "turnExpectations": {
+          "type": "array", "minItems": 1, "maxItems": 8,
+          "items": { "$ref": "#/$defs/turnExpectation" }
+        },
+        "authorityAndSafety": { "const": "passed" },
+        "delivery": { "$ref": "#/$defs/expectedV1/properties/delivery" },
+        "skillBehavior": { "$ref": "#/$defs/skillBehavior" },
+        "outputText": { "type": "string", "maxLength": 4000 }
+      }
+    },
+    "expectedV1": {
       "type": "object",
       "additionalProperties": false,
       "required": [

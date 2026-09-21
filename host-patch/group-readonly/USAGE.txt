@@ -1,0 +1,36 @@
+SCOPED READ-ONLY FEISHU GROUPS -- EXACT OPENCLAW 2026.9.2
+
+This independently reversible companion adds filesystem containment to an
+ALREADY restricted host group tool policy. It does not add a grant or rewrite
+the model's prompt to claim safety.
+
+Only a configured embedded dsh-native Agent, a trusted Feishu group identity,
+and an existing resolved group allowlist containing exclusively read/message
+activate the additional read-only workspace guard. Other groups, DMs, providers,
+Agents and broader tool policies retain existing behavior.
+
+Configure only the explicitly authorized dedicated group's tools.allow through
+the host's supported config API:
+  channels.feishu.groups.<exact-private-chat-id>.tools.allow = ["read","message"]
+The inspected Feishu 2026.8.2 tool resolver reads the channel-level groups table.
+Account group entries alone must not be assumed to enforce this ceiling.
+
+The host still intersects all policy layers and deny rules. DSH's message tool
+remains private and source-bound. This companion does not expose it to the model.
+Core filesystem tools cannot mutate in this group; reads use the host workspace
+guard, including the host's explicitly approved read-only skill roots. It is not
+an OS sandbox or an exact-file allowlist. Use only synthetic data in dedicated
+test workspaces, and retain task-specific read-path checks as additional evidence.
+
+Do not change agent-global permissions or wildcard groups to enable testing.
+Back up the exact prior group entry and guard config writes by the current hash;
+restore only the owned field if its value remains unchanged.
+
+  node host-patch\group-readonly\apply.mjs --root C:\PATH\TO\openclaw --check
+Apply/restore only with the selected Gateway confirmed offline:
+  node host-patch\group-readonly\apply.mjs --root C:\PATH\TO\openclaw --apply --offline-confirmed
+  node host-patch\group-readonly\apply.mjs --root C:\PATH\TO\openclaw --restore --offline-confirmed
+
+Exact original hash, unique anchors, independent receipt and original backup are
+required. Unknown versions or modified files fail closed. Never edit hash pins
+to bypass a mismatch. This does not itself restart or change configuration.
