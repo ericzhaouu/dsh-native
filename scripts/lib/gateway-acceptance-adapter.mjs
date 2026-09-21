@@ -406,7 +406,9 @@ export function nativeTurnEvidence(rows, assistant, budgetProof) {
   if (errors.length || usage.modelRequests < 1) throw new Error(`Incomplete actual usage: ${errors.join("; ")}`);
   if (budgetProof) {
     assert.equal(budgetProof.hardLimitsVerified, true, "Native operational budget is unproven");
-    assert.ok(usage.toolCalls >= calls.length, "Runtime ledger omitted native tool admissions");
+    // The runtime ledger counts host dispatches, not DSH's internal preparation control.
+    const hostCalls = calls.filter((call) => call.name !== "dsh_prepare_task");
+    assert.ok(usage.toolCalls >= hostCalls.length, "Runtime ledger omitted native tool admissions");
     assert.ok(usage.modelRequests >= current.filter((row) => row.type === "step/start").length,
       "Runtime ledger omitted native model steps");
   }

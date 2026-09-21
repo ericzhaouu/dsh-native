@@ -182,6 +182,54 @@ function proofFixture() {
     ] } };
 }
 
+test("runtime host-tool accounting excludes the internal preparation control but preserves its evidence", () => {
+  const proof = validateRuntimeBudgetProof(proofFixture(), { settled: true });
+  const rows = nativeRows("dsh_prepare_task");
+  const result = nativeTurnEvidence(rows, { usage }, proof);
+  assert.equal(result.usage.toolCalls, 0);
+  assert.equal(result.calls.length, 1);
+  assert.equal(result.calls[0].name, "dsh_prepare_task");
+  assert.throws(() => nativeTurnEvidence(rows.filter((row) => row.type !== "tool/result"), { usage }, proof),
+    /terminal result/);
+});
+
+test("internal preparation never exempts a real or similarly named host tool from ledger admission", () => {
+  const proof = validateRuntimeBudgetProof(proofFixture(), { settled: true });
+  for (const tool of ["read", "write", "dsh_prepare_task_spoof"]) {
+    assert.throws(() => nativeTurnEvidence(nativeRows(tool), { usage }, proof), /omitted native tool admissions/);
+  }
+  const rows = nativeRows("dsh_prepare_task");
+  const business = nativeRows("read").filter((row) => ["tool/call", "tool/result"].includes(row.type));
+  business[0].data.callId = "business-call";
+  business[1].data.message.content[0].toolCallId = "business-call";
+  rows.splice(-1, 0, ...business);
+  assert.throws(() => nativeTurnEvidence(rows, { usage }, proof), /omitted native tool admissions/);
+  const withTool = proofFixture();
+  const at = withTool.ledger.entries[0].at;
+  withTool.ledger.entries.splice(-1, 1,
+    { seq: 3, at: at + 3, type: "tool_started", callId: "business-call" },
+    { seq: 4, at: at + 4, type: "tool_settled", callId: "business-call" },
+    { seq: 5, at: at + 5, type: "settled", providerSettled: true, toolsSettled: true });
+  const result = nativeTurnEvidence(rows, { usage }, validateRuntimeBudgetProof(withTool, { settled: true }));
+  assert.equal(result.usage.toolCalls, 1);
+  assert.deepEqual(result.calls.map((call) => call.name), ["dsh_prepare_task", "read"]);
+});
+
+test("configured prepared Gateway turn settles with zero host-tool ledger admissions", async (t) => {
+  const f = await fixture(t, { configured: true, runtimeCap: configuredCap, tool: "dsh_prepare_task", mode: "draft",
+    mutateProof({ ledger }) {
+      ledger.entries = ledger.entries.filter((entry) => !["tool_started", "tool_settled"].includes(entry.type))
+        .map((entry, seq) => ({ ...entry, seq }));
+    } });
+  t.after(() => f.adapter.close());
+  const result = await f.adapter.executeCase(item(), f.context);
+  assert.equal(result.budgetAttestation.status, "verified");
+  assert.equal(result.usage.toolCalls, 0);
+  assert.equal(result.budgetAttestation.proofs[0].usage.toolCalls, 0);
+  assert.deepEqual(result.sideEffects, []);
+  assert.equal((await f.adapter.cleanupCase(item(), f.context)).quiescent, true);
+});
+
 test("operationalBudget requires exactly all five positive integer root limits", () => {
   for (const field of Object.keys(operationalBudget)) {
     const missing = { ...operationalBudget }; delete missing[field];
