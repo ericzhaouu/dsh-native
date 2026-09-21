@@ -51,6 +51,13 @@ Required external wiring (runner/reviewer/adapters are owned by other agents)
    Missing/unknown verdicts fail closed. Keep exact coverage of the new v2
    fixture-scope safety assertion as well as all original assertions.
 
+   Native traces retain the exact reserved dsh_prepare_task internal control.
+   Runtime budget toolCalls counts host dispatches, not this mode-selection
+   control. Reviewer instructions explain that distinction for HOST-tool
+   assertions without removing raw calls/results or changing the assertions.
+   Other tools, lookalike names and any observed side effects remain subject to
+   the original rules; zero aggregate usage cannot erase an observed host call.
+
 2. Adapters retain actual per-turn prompt, mode, executionStatus, tool/skill,
    usage and delivery observations. prompt must equal the original input for
    that position (resource context is separate). Optional observed submissionId
