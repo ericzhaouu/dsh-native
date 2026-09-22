@@ -72,6 +72,105 @@ test("legacy compile is byte-reproducible and v1 source corpus hashes remain imm
   await assert.rejects(compileCorpus({ contractVersion: 3 }), /Unsupported/);
 });
 
+test("default and explicit source v1 retain every historical subset and the 12-case pilot payload", async () => {
+  const hashes = {
+    all: [
+      ["edb16464f1d2955cb180c80a3a3198c1e8ecbc0da410fdbc46667b9c03e6d0cb", "a7999c57b00e6788d5959efba761f01eab4d4eec6ae1b262e98f5e7a69aeaf17"],
+      ["993731dbd4fda8fef3b8a01e486f3e0f27ef6995bd23e6303ace6faf9863705e", "78c5a492e13847f0df779d437f44b17f4b25448b521e451d2d87e758f3714e04"],
+    ],
+    single: [
+      ["1002163af3c2b77f9254d7cc20099bce923612764a0ef8af71e7f06fd04662c4", "a6a3c3d2d5b50510197f44c94f005d5f0bc95c0edf4b5ccc7b71d84a97bfe825"],
+      ["516f646f8142e907443966c6932f881895dd63c03455cc32af85f0357d3fc24f", "49d7bb55f1409cad2d63da9b097a98e7c19366443f8a5a749acc0c44388a6a0f"],
+    ],
+    multi: [
+      ["3f19c7b61f83c6f72f584a334980b8b00da6d8512f8d0ad9b870a9e03b33b128", "7eca2a9693e3160986bf7d06a9f0d61dd2ffd48b535000141af28be988758ac2"],
+      ["d686500df1b9eda4ed79525f81c3b82e16ad679fc652c228fcd0fc26231cd764", "009a143a6fd861152d9f64b48930d4dcab3c4c6dec9c6975393e3fba7e0b9bed"],
+    ],
+    canary: [
+      ["550f4976cdef1a6db7cbe455b5c90fedbffd104258b2a4bfda132d8e2c58c2e2", "9febc72a2aa6f87cb64c3b40e96b1e25891e1c3a54a03ee4a6923cf5ef3d2d40"],
+      ["3e92c350e5b8affd642256a62a0a10d394363777e24a495d9b6933fff5abf623", "1daafbe14926173a307271aa64016ec3435b9db5035f49eb9ba85004175f0551"],
+    ],
+  };
+  const pilotHashes = [
+    "18fc92efde6865ace1e577ffaee0f180a5cdeedb0c3215e8157f876752911fa7",
+    "8d1fac7bf58d7985899cfa0378d7f3cb14aed581c4496fc9d884f2a415c58b66",
+  ];
+  const hash = (value) => createHash("sha256").update(`${JSON.stringify(value, null, 2)}\n`).digest("hex");
+  for (const subset of Object.keys(hashes)) {
+    for (const contractVersion of [1, 2]) {
+      const historical = await compileCorpus({ subset, contractVersion });
+      const explicit = await compileCorpus({ subset, contractVersion, sourceCorpusVersion: 1 });
+      assert.deepEqual(explicit, historical);
+      assert.equal(hash(historical.manifest), hashes[subset][contractVersion - 1][0]);
+      assert.equal(hash(historical.oracles), hashes[subset][contractVersion - 1][1]);
+      if (subset === "all") {
+        const cases = historical.manifest.cases.filter((item) =>
+          /^st-dsh-(assistant|partner)-(02|05|06|08|14|15)-.*-v1$/.test(item.id));
+        assert.equal(cases.length, 12);
+        assert.equal(hash({
+          cases, oracles: Object.fromEntries(cases.map((item) => [item.id, historical.oracles.cases[item.id]])),
+        }), pilotHashes[contractVersion - 1]);
+      }
+    }
+  }
+});
+
+test("CLI help separates source selection from the expectation contract and rejects unsupported combinations", async () => {
+  const help = await compileAcceptance(["--help"]);
+  assert.match(help.usage, /--source-corpus-version 1\|2/);
+  assert.match(help.usage, /--contract-version 1\|2/);
+  assert.deepEqual(help.defaults, { sourceCorpusVersion: 1, contractVersion: 2 });
+  assert.equal(help.sourceVersions[2], "approved-v2");
+  assert.deepEqual(await compileAcceptance(["-h"]), help);
+  for (const sourceCorpusVersion of [0, 3, "2", NaN, null]) {
+    await assert.rejects(compileCorpus({ sourceCorpusVersion }), /Unsupported source corpus version/);
+  }
+  await assert.rejects(compileCorpus({ sourceCorpusVersion: 2, contractVersion: 1 }),
+    /approved-v2 requires expectation contract version 2/);
+  const unused = resolve("artifacts", `invalid-source-${randomUUID()}`);
+  for (const value of ["0", "3", "unknown", undefined]) {
+    await assert.rejects(compileAcceptance([
+      "--output-root", unused, "--source-corpus-version", ...(value === undefined ? [] : [value]),
+    ]), /Unsupported source corpus version/);
+  }
+});
+
+test("explicit source v2 CLI plans distinct SHA-bound artifacts for every subset without overwriting source v1", async (t) => {
+  const root = resolve("artifacts", `source-v2-compiler-${randomUUID()}`);
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const oldOutput = resolve(root, "historical-default");
+  const old = await compileAcceptance(["--output-root", oldOutput]);
+  const oldManifest = await readFile(old.manifestPath);
+  const oldOracles = await readFile(old.oraclePath);
+  assert.equal(old.sourceCorpusVersion, "approved1.0testplan.acceptanceCorpus.v1");
+  for (const [subset, cases, submissions] of [["all", 200, 224], ["single", 180, 180], ["multi", 8, 32], ["canary", 12, 12]]) {
+    const result = await compileAcceptance([
+      "--output-root", resolve(root, subset), "--subset", subset, "--source-corpus-version", "2",
+    ]);
+    assert.equal(result.status, "planned");
+    assert.equal(result.cases, cases);
+    assert.equal(result.submissions, submissions);
+    assert.equal(result.sourceCorpusVersion, "approved-v2");
+    assert.equal(result.contractVersion, 2);
+    assert.equal(result.suiteId, `dsh-v2-approved-v2-${subset}`);
+    const { manifest } = await loadManifest(result.manifestPath);
+    const sidecar = await loadCorpusOracles(result.oraclePath, manifest);
+    assert.equal(sidecar.sourceCorpusVersion, "approved-v2");
+    assert.equal(manifest.version, 2);
+    assert.equal(sidecar.version, 2);
+    for (const [name, sha256] of Object.entries(sidecar.corpusHashes)) {
+      const bytes = await readFile(new URL(`./acceptance/cases/${name}`, import.meta.url));
+      assert.equal(createHash("sha256").update(bytes).digest("hex"), sha256);
+    }
+    manifest.cases.forEach(assertCaseExpectation);
+  }
+  await assert.rejects(compileAcceptance([
+    "--output-root", oldOutput, "--source-corpus-version", "2",
+  ]), /EEXIST/);
+  assert.deepEqual(await readFile(old.manifestPath), oldManifest);
+  assert.deepEqual(await readFile(old.oraclePath), oldOracles);
+});
+
 test("strict schema rejects mixed versions, empty/unknown/duplicate outcomes and scalar collapse", async () => {
   const { manifest } = await compileCorpus({ subset: "canary" });
   const validate = await compileManifestValidator();

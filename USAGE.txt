@@ -1,4 +1,4 @@
-DSH NATIVE FOR OPENCLAW -- EXPERIMENTAL 0.7.4
+DSH NATIVE FOR OPENCLAW -- RELEASE CANDIDATE 1.0.0-rc.1 (NOT STABLE)
 
 Source: https://github.com/ericzhaouu/dsh-native
 Author: https://github.com/ericzhaouu
@@ -7,6 +7,23 @@ Plugin / harness ID: dsh-native
 Example Agent: dsh-experiment
 License: MIT; Copyright (c) 2026 ericzhaouu.
 The Chinese README.md contains the complete guide.
+
+IMMEDIATE REQUEST PRECEDENCE (1.0.0-rc.1)
+
+This candidate is not a stable 1.0 release or an automatic production upgrade.
+Complete an explicitly requested explanation/checklist/text draft without
+pretending the underlying verification or action completed. If verification or
+execution itself is requested but required material/authority is missing,
+clarify instead. No keyword/case routing or additional permissions are introduced.
+Tool gates, operational ceilings, state binding and non-execution isolation remain.
+
+Source acceptance explicitly selects the approved new corpus with
+--source-corpus-version 2: 200 cases / 224 inputs, including blocked-goal
+contrasts. The default source corpus and historical hashes/reports stay intact.
+Source corpus version is separate from the expectation/evidence contract version.
+Internal dsh_prepare_task observations remain visible but are not HOST dispatches;
+no actual host call or side effect is excused by that distinction.
+Real acceptance and publication gates still require evidence for this candidate.
 
 EXECUTION BUDGETS AND ACCEPTANCE BOUNDARIES (0.7.4)
 
@@ -184,6 +201,15 @@ ADAPTIVE TASK PREPARATION (0.4.0, DEFAULT OFF)
 Optional taskPreparation configuration applies only to exact agentIds.
 Chat/clarify/draft modes have no host tools; execute gets the intersection of
 executionTools and current host permissions. No model decision grants new authority.
+Choose by the immediate authorized output, not an underlying or hypothetical operation:
+chat answers a straightforward explanation without a requested written artifact;
+draft produces a requested artifact such as a proposal, checklist, text draft or prompt.
+An unavailable external tool not needed for that output is no reason to clarify or refuse.
+Actual requested verification/action blocked by missing material or authority needs
+clarify: one key question, or an unresolved draft at the existing clarification cap.
+Explain genuine tool limitations without repeatedly asking for unavailable capability.
+Never present explanation/draft as completed reading, verification or action; never
+network when forbidden or let policy/tool availability authorize an unrequested operation.
 Skill catalog descriptions are not loaded full instructions. Non-execution modes
 cannot read missing Skill bodies or claim full method adherence unless those
 instructions are already in approved context.

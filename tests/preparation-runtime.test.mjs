@@ -5,7 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { parseDshConfig } from "../dist/config.js";
-import { PREPARATION_TOOL_NAME, createPreparationTool } from "../dist/preparation.js";
+import { PREPARATION_TOOL_NAME, createPreparationTool, renderPreparationInstructions } from "../dist/preparation.js";
 import { createDshRuntime } from "../dist/runtime.js";
 import { startModelServer } from "./fixtures/model-server.mjs";
 
@@ -178,6 +178,47 @@ test("real preparation persists clarification and resumes into a revised bounded
     await assert.rejects(runtime.run({ ...input, runId: "corrupt" }), /\/new/);
     assert.equal(model.requests.length, 5, "incompatible or corrupt bindings must not invoke a model");
   });
+});
+
+test("scripted explanation and artifact decisions complete with zero host dispatches", { timeout: 60000 }, async () => {
+  for (const mode of ["chat", "draft"]) {
+    const prompt = mode === "chat"
+      ? "Explain why evidence is insufficient; do not verify the claim or use the network."
+      : "Write a source checklist for later verification; do not verify the claim or use the network.";
+    const reply = mode === "chat"
+      ? "The source material is missing, so the claim has not been verified."
+      : "Source checklist: original material and corroborating evidence. Verification remains pending.";
+    let calls = 0;
+    await fixture(async ({ body, send, finish, index }) => {
+      if (index === 0) {
+        assert.deepEqual(toolNames(body), [PREPARATION_TOOL_NAME]);
+        assert.match(JSON.stringify(body.messages), /Prioritize the user's immediate authorized output/);
+        toolCall(send, finish, PREPARATION_TOOL_NAME, decision({
+          mode, task: mode === "chat" ? "none" : "new", goal: prompt,
+          deliverables: mode === "draft" ? ["A source checklist"] : [],
+          constraints: ["No network or verification."], enhancedPrompt: prompt,
+          evidence: { source: "current", quote: prompt },
+        }), `${mode}-control`);
+        return;
+      }
+      assert.equal(index, 1);
+      assert.deepEqual(toolNames(body), []);
+      send({ role: "assistant", content: reply });
+      finish();
+    }, async ({ runtime, model, input }) => {
+      input.prompt = prompt;
+      input.taskPreparation.userText = prompt;
+      input.systemPrompt += `\n\n${renderPreparationInstructions(policy)}`;
+      input.executeTool = async () => { calls++; return { text: "unexpected", isError: false }; };
+      const result = await runtime.run(input);
+      assert.equal(result.text, reply);
+      assert.equal(result.preparation.decision.mode, mode);
+      assert.deepEqual(result.preparation.allowedTools, []);
+      assert.equal(result.toolCalls, 0, "the preparation control is not a host call");
+      assert.equal(calls, 0);
+      assert.equal(model.requests.length, 2);
+    });
+  }
 });
 
 test("real child rejects malformed preparation and failed parent callbacks without host execution", { timeout: 180000 }, async (t) => {

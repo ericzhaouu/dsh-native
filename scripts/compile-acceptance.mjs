@@ -9,6 +9,8 @@ import { assertCaseExpectation, compileExpectationContract, compileFixtureScope,
 const corpusRoot = new URL("../tests/acceptance/cases/", import.meta.url);
 const fixtureRoot = new URL("../tests/fixtures/acceptance/", import.meta.url);
 const CORPUS_VERSION = "approved1.0testplan.acceptanceCorpus.v1";
+const sourceCorpusVersions = { 1: CORPUS_VERSION, 2: "approved-v2" };
+const usage = "Usage: node scripts\\compile-acceptance.mjs --output-root <new-absolute-dir> [--subset all|single|multi|canary] [--contract-version 1|2] [--source-corpus-version 1|2]";
 const modes = new Set(["chat", "clarify", "draft", "execute"]);
 
 function category(taskClass = "") {
@@ -36,14 +38,16 @@ function limits(turns, maxHostCalls) {
   };
 }
 
-export async function compileCorpus({ subset = "all", contractVersion = 2 } = {}) {
+export async function compileCorpus({ subset = "all", contractVersion = 2, sourceCorpusVersion = 1 } = {}) {
   if (!["all", "single", "multi", "canary"].includes(subset)) throw new Error("Unknown corpus subset");
   if (![1, 2].includes(contractVersion)) throw new Error("Unsupported expectation contract version");
+  if (![1, 2].includes(sourceCorpusVersion)) throw new Error("Unsupported source corpus version");
+  if (sourceCorpusVersion === 2 && contractVersion !== 2) throw new Error("Source corpus approved-v2 requires expectation contract version 2");
   const selected = [
     ["single", "single-turn.json"], ["multi", "multi-turn.json"], ["canary", "feishu-canary.json"],
   ].filter(([kind]) => subset === "all" || kind === subset);
   const manifest = {
-    version: contractVersion, suiteId: `dsh-v${contractVersion}-${subset}`, stage: "live",
+    version: contractVersion, suiteId: `dsh-v${contractVersion}${sourceCorpusVersion === 2 ? "-approved-v2" : ""}-${subset}`, stage: "live",
     description: "Planned real-model cases; execution requires private resource authorization and a trusted adapter.",
     limits: {
       concurrency: 1, perAgentConcurrency: 1, userTurns: 240, modelRequests: 1500,
@@ -53,9 +57,10 @@ export async function compileCorpus({ subset = "all", contractVersion = 2 } = {}
     cases: [],
   };
   const oracles = { version: contractVersion, suiteId: manifest.suiteId, corpusHashes: {}, fixtureHashes: {}, fixtures: {}, cases: {} };
-  if (contractVersion === 2) oracles.sourceCorpusVersion = CORPUS_VERSION;
+  if (contractVersion === 2) oracles.sourceCorpusVersion = sourceCorpusVersions[sourceCorpusVersion];
+  if (sourceCorpusVersion === 2) oracles.sourceFiles = {};
   let submissions = 0;
-  function add(item, id, prompt, turns, script) {
+  function add(item, id, prompt, turns, script, source) {
     const expected = script ? script.turns.at(-1).expected : item.expected;
     const approvedModes = expected.modes.filter((mode) => modes.has(mode));
     const executionStatus = contractVersion === 1 ? expectedOutcome(expected) : undefined;
@@ -109,24 +114,39 @@ export async function compileCorpus({ subset = "all", contractVersion = 2 } = {}
       agentProfile: item.agentProfile, fixtureRefs: fixtureNames, reviews: boundReviews,
       ...(contract ? { expectationContract: contract, fixtureScope } : {}),
       ...(script ? { script: { id: script.scriptId, turns: script.turns } } : {}),
+      ...(source ? { source } : {}),
     };
     submissions += count;
   }
   for (const [kind, name] of selected) {
-    const bytes = await readFile(new URL(name, corpusRoot));
+    const sourceName = sourceCorpusVersion === 2 && kind === "single" ? `v2/${name}` : name;
+    const bytes = await readFile(new URL(sourceName, corpusRoot));
     const doc = JSON.parse(bytes);
-    if (doc.schemaVersion !== CORPUS_VERSION) throw new Error(`Unsupported corpus version in ${name}`);
-    oracles.corpusHashes[name] = createHash("sha256").update(bytes).digest("hex");
+    const expectedVersion = sourceCorpusVersion === 2 && kind === "single" ? sourceCorpusVersions[2] : CORPUS_VERSION;
+    if (doc.schemaVersion !== expectedVersion) throw new Error(`Unsupported corpus version in ${sourceName}`);
+    oracles.corpusHashes[sourceName] = createHash("sha256").update(bytes).digest("hex");
+    if (sourceCorpusVersion === 2) {
+      oracles.sourceFiles[sourceName] = {
+        schemaVersion: doc.schemaVersion, ...(doc.sourceReview ? { review: doc.sourceReview } : {}),
+      };
+    }
+    const provenance = (item, variant) => sourceCorpusVersion === 2 ? {
+      path: sourceName, schemaVersion: item.schemaVersion,
+      caseId: item.caseId ?? item.scriptId,
+      ...(variant ? { variant } : {}),
+      ...(item.sourceRevision ? { revision: item.sourceRevision } : {}),
+    } : undefined;
     if (kind === "multi") {
       for (const script of doc.scripts) {
         const turns = script.turns.map((turn) => turn.modelVisible.text);
-        add(script, script.scriptId, turns[0], turns, script);
+        add(script, script.scriptId, turns[0], turns, script, provenance(script));
       }
     } else {
       for (const item of doc.cases) {
         const prompts = kind === "single" ? item.modelVisible.variants : [item.modelVisible.text];
         prompts.forEach((prompt, index) => add(item,
-          kind === "single" ? `${item.caseId}-v${index + 1}` : item.caseId, prompt));
+          kind === "single" ? `${item.caseId}-v${index + 1}` : item.caseId, prompt,
+          undefined, undefined, provenance(item, kind === "single" ? index + 1 : undefined)));
       }
     }
   }
@@ -156,18 +176,26 @@ export async function compileCorpus({ subset = "all", contractVersion = 2 } = {}
 }
 
 export async function compileAcceptance(argv = process.argv.slice(2)) {
+  if (argv.length === 1 && ["--help", "-h"].includes(argv[0])) return {
+    usage,
+    defaults: { sourceCorpusVersion: 1, contractVersion: 2 },
+    sourceVersions: sourceCorpusVersions,
+    compatibility: "Source 1 supports contracts 1 and 2; approved-v2 requires contract 2. Compilation plans a new run only; it never regrades historical evidence.",
+  };
   let outputRoot;
   let subset = "all";
   let contractVersion = 2;
+  let sourceCorpusVersion = 1;
   for (let index = 0; index < argv.length; index++) {
     if (argv[index] === "--output-root") outputRoot = argv[++index];
     else if (argv[index] === "--subset") subset = argv[++index];
     else if (argv[index] === "--contract-version") contractVersion = Number(argv[++index]);
-    else throw new Error("Usage: node scripts\\compile-acceptance.mjs --output-root <new-absolute-dir> [--subset all|single|multi|canary] [--contract-version 1|2]");
+    else if (argv[index] === "--source-corpus-version") sourceCorpusVersion = Number(argv[++index]);
+    else throw new Error(usage);
   }
   if (!outputRoot || !isAbsolute(outputRoot)) throw new Error("--output-root must be an absolute new directory");
   outputRoot = ensureAbsoluteRunRoot(outputRoot);
-  const result = await compileCorpus({ subset, contractVersion });
+  const result = await compileCorpus({ subset, contractVersion, sourceCorpusVersion });
   await ensureSafeRunRoot(outputRoot);
   await mkdir(dirname(outputRoot), { recursive: true, mode: 0o700 });
   await mkdir(outputRoot, { recursive: false, mode: 0o700 });
@@ -176,6 +204,7 @@ export async function compileAcceptance(argv = process.argv.slice(2)) {
   await writeFile(resolve(outputRoot, "oracles.json"), `${JSON.stringify(result.oracles, null, 2)}\n`,
     { flag: "wx", mode: 0o600 });
   return { status: "planned", cases: result.manifest.cases.length, submissions: result.submissions,
+    sourceCorpusVersion: sourceCorpusVersions[sourceCorpusVersion], contractVersion, suiteId: result.manifest.suiteId,
     manifestPath: resolve(outputRoot, "manifest.json"), oraclePath: resolve(outputRoot, "oracles.json") };
 }
 

@@ -484,6 +484,59 @@ test("a quoted prompt selected as draft cannot expose tools or execute embedded 
   assert.deepEqual(result.allowedTools, []);
 });
 
+test("supplied explanation and artifact decisions stay tool-free despite underlying evidence gaps", () => {
+  // These are supplied decisions, not a deterministic classifier or proof of model semantics.
+  for (const [userText, mode] of [
+    ["本轮不要联网，请说明需要粘贴正文或另行授权", "chat"],
+    ["请诚实说明证据不足并列出所需来源", "chat"],
+    ["Write a source checklist for a later verification; do not verify or contact anyone now.", "draft"],
+  ]) {
+    for (const executionTools of [[], codingTools]) {
+      const result = resolve(request({ userText, policy: policy({ executionTools }) }), decision({
+        mode, task: mode === "chat" ? "none" : "new",
+        goal: "Describe the evidence needed for later verification.",
+        deliverables: mode === "draft" ? ["A source checklist"] : [],
+        constraints: ["Do not perform the underlying verification."],
+        unresolved: ["Evidence for later verification is not supplied."],
+        enhancedPrompt: "Describe missing evidence without claiming to have verified it.",
+        evidence: { source: "current", quote: userText },
+      }));
+      assert.equal(result.decision.mode, mode);
+      assert.equal(result.state.clarificationTurns, 0);
+      assert.deepEqual(result.allowedTools, []);
+      assert.throws(() => parsePreparationResolution({ ...result, allowedTools: ["exec"] }), /only execute/);
+    }
+  }
+});
+
+test("supplied blocked verification and action decisions clarify then cap without minting authority", () => {
+  for (const [userText, gap, question] of [
+    ["Verify the report against its sources.", "Source material is missing.", "Can you provide the source material?"],
+    ["Perform the restricted update.", "Required approval is missing.", "Can you provide the required approval?"],
+  ]) {
+    const input = request({ userText, policy: policy({ maxClarificationTurns: 1 }) });
+    const blocked = decision({
+      mode: "clarify", goal: userText, deliverables: ["The requested verified result or action"],
+      unresolved: [gap], question, enhancedPrompt: `Do not claim completion: ${gap}`,
+      evidence: { source: "current", quote: userText },
+    });
+    const first = resolve(input, blocked);
+    assert.equal(first.decision.mode, "clarify");
+    assert.equal(first.state.clarificationTurns, 1);
+    assert.deepEqual(first.allowedTools, []);
+    assert.throws(() => resolve(input, { ...blocked, mode: "execute", question: "" }), /unresolved/);
+    const capped = resolve({ ...input, previous: first.state }, {
+      ...blocked, revision: first.state.revision, task: "continue",
+    });
+    assert.equal(capped.decision.mode, "draft");
+    assert.deepEqual(capped.decision.unresolved, [gap]);
+    assert.match(capped.decision.enhancedPrompt, /Draft only; unresolved items remain unconfirmed/);
+    assert.ok(capped.decision.enhancedPrompt.includes(question));
+    assert.deepEqual(capped.allowedTools, []);
+    assert.throws(() => parsePreparationResolution({ ...capped, allowedTools: ["exec"] }), /only execute/);
+  }
+});
+
 test("continuation requires a previous nonempty goal and the exact latest revision", () => {
   assert.throws(() => resolve(request(), decision({ task: "continue" })), /previous task/);
   assert.throws(() => resolve(request(), decision({
@@ -774,4 +827,27 @@ test("rendered instructions guide adaptive local execution without claiming sema
     assert.match(instructions, expected);
   }
   assert.throws(() => renderPreparationInstructions(policy({ authorized: true })));
+});
+
+test("mode instructions prioritize the immediate output without case-specific routing or new authority", () => {
+  for (const executionTools of [[], codingTools]) {
+    const instructions = renderPreparationInstructions(policy({ executionTools }));
+    const priority = instructions.indexOf("Prioritize the user's immediate authorized output");
+    assert.ok(priority >= 0 && priority < instructions.indexOf("- chat:"));
+    for (const expected of [
+      /underlying or hypothetical execution goal/,
+      /explanation, checklist, or text draft may be complete even when the operation it discusses cannot proceed/,
+      /- chat:.*straightforward explanation, without a requested written artifact/,
+      /- draft: produce a requested written artifact/,
+      /- clarify:.*actual requested verification or execution is blocked by missing material or authority/,
+      /unnecessary for the requested explanation or draft is not a reason to clarify or refuse/,
+      /Never present an explanation or draft as completed reading, verification, or action/,
+      /Do not perform an unrequested underlying business operation merely because policy or tools permit it/,
+      /Never access the network when forbidden/,
+      /At the cap, draft with unresolved gaps explicit/,
+      /chat, clarify, and draft do not use execution tools/,
+    ]) assert.match(instructions, expected);
+    assert.doesNotMatch(instructions, /normal conversational answer, not a task|requires clarify or draft/);
+    assert.doesNotMatch(instructions, /本轮不要联网|请诚实说明|02no-network|05partner|https?:\/\//);
+  }
 });
