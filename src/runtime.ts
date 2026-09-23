@@ -3,6 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
+import { performance } from "node:perf_hooks";
 import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 import { normalizeBaseUrl, parseOperationalBudget, resolveOperationalBudget } from "./config.js";
@@ -42,9 +43,37 @@ interface SessionState {
   modelRoute?: string;
   budgetFailure?: "DSH_BUDGET_EXCEEDED" | "DSH_BUDGET_UNCERTAIN";
   taskPreparation?: SessionPreparation;
+  failureDiagnostic?: RuntimeFailureDiagnostic;
 }
 
 class ChildTerminationError extends Error {}
+
+interface RuntimeFailureDiagnostic {
+  version: 1;
+  operation: "run" | "compact" | "inspectCompact";
+  phase: ChildLifecycleStage | "admission" | "persistence";
+  reason: "budget-exceeded" | "budget-uncertain" | "preparation-failed" | "host-tool-failed" |
+    "cancelled" | "child-failed" | "state-persistence-failed" | "termination-unconfirmed";
+  childPid?: number;
+  preparation?: {
+    requested: boolean;
+    resolved: boolean;
+    failed: boolean;
+    phase: "not-requested" | "validation" | "callback" | "resolved";
+  };
+}
+
+const failureDiagnostics = new WeakMap<Error, RuntimeFailureDiagnostic>();
+
+function withDiagnostic(error: unknown, diagnostic: RuntimeFailureDiagnostic): Error {
+  const result = asError(error);
+  failureDiagnostics.set(result, diagnostic);
+  return result;
+}
+
+function diagnosticOf(error: unknown): RuntimeFailureDiagnostic | undefined {
+  return error instanceof Error ? failureDiagnostics.get(error) : undefined;
+}
 
 function code(error: unknown): string | undefined {
   return isRecord(error) && typeof error.code === "string" ? error.code : undefined;
@@ -274,6 +303,7 @@ function timeout<T>(promise: Promise<T>, ms: number, message: string | (() => st
 interface AttemptBudget {
   cap: OperationalBudget;
   admittedAt: number;
+  admittedAtMonotonic: number;
 }
 
 function snapshotAttempt<T extends DshAttempt | DshCompactAttempt>(config: DshConfig, input: T): {
@@ -295,13 +325,13 @@ function snapshotAttempt<T extends DshAttempt | DshCompactAttempt>(config: DshCo
   if (snapshot.contextWindow > cap.maxInputTokens) {
     throw budgetError("DSH_BUDGET_EXCEEDED", "Input budget cannot reserve a full contextWindow.");
   }
-  return { input: snapshot, budget: { cap, admittedAt: Date.now() } };
+  return { input: snapshot, budget: { cap, admittedAt: Date.now(), admittedAtMonotonic: performance.now() } };
 }
 
 function budgetTimer(budget: AttemptBudget | undefined, controller: AbortController): () => void {
   let timer: NodeJS.Timeout | undefined;
   const tick = () => {
-    const remaining = budget!.cap.maxDurationMs - (Date.now() - budget!.admittedAt);
+    const remaining = budget!.cap.maxDurationMs - (performance.now() - budget!.admittedAtMonotonic);
     if (remaining <= 0) controller.abort(budgetError("DSH_BUDGET_EXCEEDED", "Operational duration budget exhausted."));
     else timer = setTimeout(tick, Math.min(remaining, 2_147_483_647));
   };
@@ -674,6 +704,10 @@ async function runChild(config: DshConfig, input: DshAttempt, budget?: AttemptBu
     if (submitted && state) {
       state.status = "blocked";
       if (ledger && code(error)?.startsWith("DSH_BUDGET_")) state.budgetFailure = code(error) as SessionState["budgetFailure"];
+      state.failureDiagnostic = diagnosticOf(error) ?? {
+        version: 1, operation: "run", phase: error instanceof ChildTerminationError ? "shutdown" : "persistence",
+        reason: error instanceof ChildTerminationError ? "termination-unconfirmed" : "state-persistence-failed",
+      };
       try { await saveState(statePath, state); }
       catch (failure) {
         persistenceFailure = failure; releaseLock = false;
@@ -832,6 +866,11 @@ async function compactChild(config: DshConfig, input: DshCompactAttempt, budget?
       state.status = ledger ? "blocked" : "running";
       state.pendingCompact ??= { runId: input.runId };
       if (ledger && code(error)?.startsWith("DSH_BUDGET_")) state.budgetFailure = code(error) as SessionState["budgetFailure"];
+      state.failureDiagnostic = diagnosticOf(error) ?? {
+        version: 1, operation: input.recoverOnly ? "inspectCompact" : "compact",
+        phase: error instanceof ChildTerminationError ? "shutdown" : "persistence",
+        reason: error instanceof ChildTerminationError ? "termination-unconfirmed" : "state-persistence-failed",
+      };
       try { await saveState(statePath, state); }
       catch (failure) {
         persistenceFailure = failure; releaseLock = false;
@@ -881,9 +920,9 @@ async function executeChild(
     catch (error) { if (code(error) === "ESRCH") return false; throw error; }
   };
   const waitGroupClosed = async (ms: number) => {
-    const deadline = Date.now() + ms;
+    const deadline = performance.now() + ms;
     while (groupActive()) {
-      if (Date.now() >= deadline) throw new Error("DSH process group termination is unconfirmed.");
+      if (performance.now() >= deadline) throw new Error("DSH process group termination is unconfirmed.");
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
   };
@@ -946,10 +985,19 @@ async function executeChild(
   let acceptingTools = false;
   let acceptingBudget = false;
   let preparationRequested = false;
+  let preparationPhase: NonNullable<RuntimeFailureDiagnostic["preparation"]>["phase"] = "not-requested";
   let resolved: PreparationResolution | undefined;
   let dispatchedTools = 0;
   let preparationFailure: Error | undefined;
   let hostFailure: Error | undefined;
+  const failureDetails = (reason: RuntimeFailureDiagnostic["reason"], phase = stage): RuntimeFailureDiagnostic => ({
+    version: 1, operation, phase, reason,
+    ...(child.pid === undefined ? {} : { childPid: child.pid }),
+    ...(taskPreparation ? { preparation: {
+      requested: preparationRequested, resolved: Boolean(resolved),
+      failed: Boolean(preparationFailure), phase: preparationPhase,
+    } } : {}),
+  });
   let abortTimer: NodeJS.Timeout | undefined;
   let rejectCancellation!: (error: Error) => void;
   const cancellationExpired = new Promise<never>((_resolve, reject) => { rejectCancellation = reject; });
@@ -1034,6 +1082,7 @@ async function executeChild(
             throw new Error("Invalid, duplicate or out-of-turn DSH preparation request.");
           }
           preparationRequested = true;
+          preparationPhase = "validation";
           input.signal.throwIfAborted();
           input.assertActive();
           const resolution = resolvePreparationDecision(taskPreparation, params.decision, input.runId, hostToolNames);
@@ -1042,6 +1091,7 @@ async function executeChild(
             throw new Error("Invalid DSH preparation resolution source or revision.");
           }
           if (!onPreparationDecision) throw new Error("Missing DSH preparation host gate callback.");
+          preparationPhase = "callback";
           const preparationTask = Promise.resolve().then(() => onPreparationDecision(structuredClone(resolution)));
           preparationTasks.add(preparationTask);
           try { await preparationTask; }
@@ -1050,6 +1100,7 @@ async function executeChild(
           input.assertActive();
           if (!acceptingTools || preparationFailure) throw new Error("DSH preparation completed outside the active turn.");
           resolved = resolution;
+          preparationPhase = "resolved";
           return structuredClone(resolution);
         } catch (error: unknown) {
           throw failPreparation(error);
@@ -1203,7 +1254,12 @@ async function executeChild(
     }
     return result;
   } catch (error) {
-    throw ledger?.failure ?? preparationFailure ?? hostFailure ?? error;
+    const finalError = ledger?.failure ?? preparationFailure ?? hostFailure ?? error;
+    throw withDiagnostic(finalError, failureDetails(
+      code(finalError) === "DSH_BUDGET_EXCEEDED" ? "budget-exceeded" :
+        code(finalError) === "DSH_BUDGET_UNCERTAIN" ? "budget-uncertain" :
+        input.signal.aborted ? "cancelled" :
+        preparationFailure ? "preparation-failed" : hostFailure ? "host-tool-failed" : "child-failed"));
   } finally {
     acceptingTools = false;
     acceptingBudget = false;
@@ -1244,8 +1300,8 @@ async function executeChild(
       await timeout(Promise.allSettled([...preparationTasks]), config.shutdownTimeoutMs,
         "DSH preparation callback cancellation is unconfirmed.");
     } catch (error: unknown) {
-      throw new ChildTerminationError("DSH preparation callback did not settle; retaining its session ownership lock.",
-        { cause: error });
+      throw withDiagnostic(new ChildTerminationError("DSH preparation callback did not settle; retaining its session ownership lock.",
+        { cause: error }), failureDetails("termination-unconfirmed", "shutdown"));
     }
     try {
       await timeout(Promise.allSettled([...eventTasks]), config.shutdownTimeoutMs, "DSH event callback did not settle.");

@@ -7,6 +7,12 @@ import { compileAcceptance, compileCorpus } from "../scripts/compile-acceptance.
 import { compileManifestValidator, loadManifest } from "../scripts/lib/acceptance-contract.mjs";
 import { assertCaseExpectation } from "../scripts/lib/acceptance-expectations.mjs";
 import { loadCorpusOracles } from "../scripts/lib/acceptance-oracles.mjs";
+import {
+  acceptanceByteContract,
+  materializeAcceptanceCorpusBytes,
+  materializeAcceptanceFixtureBytes,
+  readAcceptanceCorpusBytes,
+} from "../scripts/lib/acceptance-source-bytes.mjs";
 
 test("complete corpus compiles to gated runner cases with a separate oracle sidecar", async () => {
   const { manifest, oracles, submissions } = await compileCorpus();
@@ -72,6 +78,27 @@ test("legacy compile is byte-reproducible and v1 source corpus hashes remain imm
   await assert.rejects(compileCorpus({ contractVersion: 3 }), /Unsupported/);
 });
 
+test("reviewed acceptance byte contract preserves v1 CRLF corpus and LF fixtures", async () => {
+  for (const [name, contract] of Object.entries(acceptanceByteContract.v1Corpus)) {
+    const raw = await readFile(new URL(`./acceptance/cases/${name}`, import.meta.url));
+    const materialized = materializeAcceptanceCorpusBytes(name, raw);
+    assert.equal(createHash("sha256").update(materialized).digest("hex"), contract.materialized);
+    assert.equal(createHash("sha256").update(materializeAcceptanceCorpusBytes(name,
+      Buffer.from(raw.toString("utf8").replace(/\r\n/g, "\n"), "utf8"))).digest("hex"), contract.materialized);
+    assert.throws(() => materializeAcceptanceCorpusBytes(name, Buffer.concat([raw, Buffer.from(" ")])),
+      /Acceptance byte contract mismatch/);
+  }
+  for (const [name, contract] of Object.entries(acceptanceByteContract.fixtures)) {
+    const raw = await readFile(new URL(`./fixtures/acceptance/${name}`, import.meta.url));
+    const materialized = materializeAcceptanceFixtureBytes(name, raw);
+    assert.equal(createHash("sha256").update(materialized).digest("hex"), contract.materialized);
+    assert.equal(createHash("sha256").update(materializeAcceptanceFixtureBytes(name,
+      Buffer.from(raw.toString("utf8").replace(/\r?\n/g, "\r\n"), "utf8"))).digest("hex"), contract.materialized);
+    assert.throws(() => materializeAcceptanceFixtureBytes(name, Buffer.concat([raw, Buffer.from(" ")])),
+      /Acceptance byte contract mismatch/);
+  }
+});
+
 test("default and explicit source v1 retain every historical subset and the 12-case pilot payload", async () => {
   const hashes = {
     all: [
@@ -117,18 +144,19 @@ test("default and explicit source v1 retain every historical subset and the 12-c
 
 test("CLI help separates source selection from the expectation contract and rejects unsupported combinations", async () => {
   const help = await compileAcceptance(["--help"]);
-  assert.match(help.usage, /--source-corpus-version 1\|2/);
+  assert.match(help.usage, /--source-corpus-version 1\|2\|3/);
   assert.match(help.usage, /--contract-version 1\|2/);
   assert.deepEqual(help.defaults, { sourceCorpusVersion: 1, contractVersion: 2 });
   assert.equal(help.sourceVersions[2], "approved-v2");
+  assert.equal(help.sourceVersions[3], "approved-v3");
   assert.deepEqual(await compileAcceptance(["-h"]), help);
-  for (const sourceCorpusVersion of [0, 3, "2", NaN, null]) {
+  for (const sourceCorpusVersion of [0, 4, "2", NaN, null]) {
     await assert.rejects(compileCorpus({ sourceCorpusVersion }), /Unsupported source corpus version/);
   }
   await assert.rejects(compileCorpus({ sourceCorpusVersion: 2, contractVersion: 1 }),
     /approved-v2 requires expectation contract version 2/);
   const unused = resolve("artifacts", `invalid-source-${randomUUID()}`);
-  for (const value of ["0", "3", "unknown", undefined]) {
+  for (const value of ["0", "4", "unknown", undefined]) {
     await assert.rejects(compileAcceptance([
       "--output-root", unused, "--source-corpus-version", ...(value === undefined ? [] : [value]),
     ]), /Unsupported source corpus version/);
@@ -159,7 +187,7 @@ test("explicit source v2 CLI plans distinct SHA-bound artifacts for every subset
     assert.equal(manifest.version, 2);
     assert.equal(sidecar.version, 2);
     for (const [name, sha256] of Object.entries(sidecar.corpusHashes)) {
-      const bytes = await readFile(new URL(`./acceptance/cases/${name}`, import.meta.url));
+      const bytes = await readAcceptanceCorpusBytes(new URL(`./acceptance/cases/${name}`, import.meta.url), name);
       assert.equal(createHash("sha256").update(bytes).digest("hex"), sha256);
     }
     manifest.cases.forEach(assertCaseExpectation);

@@ -27,6 +27,30 @@ function ownerSummary(value) {
   };
 }
 
+function failureSummary(value) {
+  if (!value || typeof value !== "object" || value.version !== 1) return undefined;
+  const reason = ["budget-exceeded", "budget-uncertain", "preparation-failed", "host-tool-failed",
+    "cancelled", "child-failed", "state-persistence-failed", "termination-unconfirmed"].includes(value.reason)
+    ? value.reason : "unrecognized";
+  const preparation = value.preparation;
+  return {
+    version: 1,
+    operation: ["run", "compact", "inspectCompact"].includes(value.operation) ? value.operation : undefined,
+    phase: ["spawn", "handshake", "run", "shutdown", "admission", "persistence"].includes(value.phase) ? value.phase : undefined,
+    reason,
+    childPid: Number.isSafeInteger(value.childPid) && value.childPid > 0 ? value.childPid : undefined,
+    ...(preparation && typeof preparation === "object" ? {
+      preparation: {
+        requested: typeof preparation.requested === "boolean" ? preparation.requested : undefined,
+        resolved: typeof preparation.resolved === "boolean" ? preparation.resolved : undefined,
+        failed: typeof preparation.failed === "boolean" ? preparation.failed : undefined,
+        phase: ["not-requested", "validation", "callback", "resolved"].includes(preparation.phase)
+          ? preparation.phase : undefined,
+      },
+    } : {}),
+  };
+}
+
 export async function inspectState(stateDir) {
   if (!stateDir || !isAbsolute(stateDir)) throw new Error("--state-dir must be an explicit absolute path");
   const records = [];
@@ -47,6 +71,7 @@ export async function inspectState(stateDir) {
     records.push({
       stateKey: entry.name, status: binding.value?.status, lastRunId: binding.value?.lastRunId,
       pendingCompactRunId: binding.value?.pendingCompact?.runId,
+      failureDiagnostic: failureSummary(binding.value?.failureDiagnostic),
       owner: ownerSummary(owner.value), sourceReplyOwner: ownerSummary(deliveryOwner.value),
       sourceReply: delivery.value ? { state: delivery.value.state, runId: delivery.value.runId,
         privateCallId: delivery.value.privateCallId, updatedAt: delivery.value.updatedAt } : undefined,

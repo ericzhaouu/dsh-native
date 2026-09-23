@@ -24,3 +24,31 @@ test("recovery inspection preserves locks and omits credentials, message bodies 
   assert.doesNotMatch(JSON.stringify(result), /PRIVATE_ROUTE|PRIVATE_MESSAGE|PRIVATE_KEY/);
   assert.equal(await readFile(join(directory, "source-reply.lock"), "utf8"), owner);
 });
+
+test("recovery inspection projects only bounded failure phase codes without changing the binding", async (t) => {
+  const root = resolve("artifacts", `inspect-state-${randomUUID()}`);
+  const directory = join(root, createHash("sha256").update("blocked-preparation").digest("hex"));
+  await mkdir(directory, { recursive: true });
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const path = join(directory, "binding.json");
+  for (const reason of ["preparation-failed", "PRIVATE_CALLBACK_TEXT"]) {
+    const value = JSON.stringify({
+      status: "blocked", lastRunId: "failed-run",
+      failureDiagnostic: { version: 1, operation: "run", phase: "run", reason,
+        detail: "PRIVATE_KEY", preparation: {
+          requested: true, resolved: false, failed: true, phase: "callback",
+          arguments: "PRIVATE_MESSAGE",
+        } },
+    });
+    await writeFile(path, value);
+    const result = await inspectState(root);
+    assert.equal(result.records[0].disposition, "operator-inspection-required");
+    assert.deepEqual(result.records[0].failureDiagnostic.preparation, {
+      requested: true, resolved: false, failed: true, phase: "callback",
+    });
+    assert.equal(result.records[0].failureDiagnostic.reason,
+      reason === "preparation-failed" ? reason : "unrecognized");
+    assert.doesNotMatch(JSON.stringify(result), /PRIVATE_CALLBACK_TEXT|PRIVATE_KEY|PRIVATE_MESSAGE/);
+    assert.equal(await readFile(path, "utf8"), value);
+  }
+});

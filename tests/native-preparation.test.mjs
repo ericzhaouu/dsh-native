@@ -60,4 +60,5 @@ test("preparation skill catalog is explicit, exact-name scoped and empty by defa
   assert.match(filtered, /<name>local-helper<\/name>/);
   assert.doesNotMatch(filtered, /web-helper|Unfiltered catalog/);
   assert.match(filtered, /guidance, not permission/);
+  assert.match(filtered, /does not require skill loading or execute mode for an explanation or draft/);
 });

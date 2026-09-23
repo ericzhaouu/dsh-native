@@ -43,13 +43,13 @@ function toolNames(body) {
   return (body.tools ?? []).map((tool) => tool.function.name);
 }
 
-async function fixture(responder, run) {
+async function fixture(responder, run, { shutdownTimeoutMs = 10000, expectUnconfirmed = false } = {}) {
   const root = join(fileURLToPath(new URL(".", import.meta.url)), `.preparation-runtime-${randomUUID()}`);
   await mkdir(root);
   const model = await startModelServer(responder);
   const runtime = createDshRuntime(parseDshConfig({
     stateDir: root, allowedBaseUrls: [model.baseUrl],
-    startupTimeoutMs: 30000, shutdownTimeoutMs: 10000, streamIdleTimeoutMs: 3000,
+    startupTimeoutMs: 30000, shutdownTimeoutMs, streamIdleTimeoutMs: 3000,
   }));
   const events = [];
   const input = {
@@ -68,7 +68,9 @@ async function fixture(responder, run) {
   const statePath = join(root, createHash("sha256").update(input.sessionId).digest("hex"), "binding.json");
   try { await run({ root, runtime, model, input, events, statePath }); }
   finally {
-    await runtime.dispose();
+    if (expectUnconfirmed) {
+      await assert.rejects(runtime.dispose(), (error) => error.code === "DSH_TERMINATION_UNCONFIRMED");
+    } else await runtime.dispose();
     await model.close();
     await rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
   }
@@ -242,11 +244,104 @@ test("real child rejects malformed preparation and failed parent callbacks witho
         assert.equal(model.requests.length, 1);
         const binding = JSON.parse(await readFile(statePath, "utf8"));
         assert.equal(binding.status, "blocked");
+        assert.equal(binding.failureDiagnostic?.version, 1);
+        assert.equal(binding.failureDiagnostic?.operation, "run");
+        assert.equal(binding.failureDiagnostic?.preparation?.requested, name === "forged quote" || Boolean(callbackFailure));
+        assert.equal(binding.failureDiagnostic?.preparation?.resolved, false);
+        assert.equal(JSON.stringify(binding.failureDiagnostic).includes(input.apiKey), false);
         await assert.rejects(runtime.run({ ...input, runId: "retry-invalid" }), /uncertain/);
         assert.equal(model.requests.length, 1);
       });
     });
   }
+});
+
+test("delayed preparation callback cancellation blocks with bounded diagnostics", { timeout: 60000 }, async () => {
+  let callbackStarted;
+  const started = new Promise((resolve) => { callbackStarted = resolve; });
+  let releaseCallback;
+  const release = new Promise((resolve) => { releaseCallback = resolve; });
+  await fixture(async ({ send, finish, index }) => {
+    assert.equal(index, 0);
+    toolCall(send, finish, PREPARATION_TOOL_NAME, decision({ mode: "chat", task: "none" }), "delayed-control");
+  }, async ({ runtime, model, input, statePath }) => {
+    const controller = new AbortController();
+    input.signal = controller.signal;
+    input.onPreparationDecision = async () => {
+      callbackStarted();
+      await release;
+    };
+    const run = runtime.run(input);
+    await started;
+    controller.abort(new Error("synthetic preparation cancellation"));
+    releaseCallback();
+    await assert.rejects(run, /preparation|cancel|aborted|interrupted/i);
+    assert.equal(model.requests.length, 1);
+    const binding = JSON.parse(await readFile(statePath, "utf8"));
+    assert.equal(binding.status, "blocked");
+    assert.equal(Object.hasOwn(binding, "taskPreparation"), false);
+    assert.deepEqual(binding.failureDiagnostic.preparation, {
+      requested: true, resolved: false, failed: true, phase: "callback",
+    });
+    assert.equal(JSON.stringify(binding).includes(input.apiKey), false);
+  });
+});
+
+test("frozen preparation errors are not masked and do not persist callback text", { timeout: 60000 }, async () => {
+  const failure = Object.freeze(new Error("parent preparation callback failed: PRIVATE_CALLBACK_CONTENT"));
+  await fixture(async ({ send, finish, index }) => {
+    assert.equal(index, 0);
+    toolCall(send, finish, PREPARATION_TOOL_NAME, decision(), "frozen-callback");
+  }, async ({ runtime, input, statePath }) => {
+    input.onPreparationDecision = () => { throw failure; };
+    await assert.rejects(runtime.run(input), (error) => {
+      assert.equal(error.message, failure.message);
+      assert.equal(error.name, failure.name);
+      return true;
+    });
+    const binding = JSON.parse(await readFile(statePath, "utf8"));
+    assert.equal(binding.status, "blocked");
+    assert.equal(binding.failureDiagnostic.reason, "preparation-failed");
+    assert.equal(binding.failureDiagnostic.preparation.phase, "callback");
+    assert.equal(JSON.stringify(binding).includes("PRIVATE_CALLBACK_CONTENT"), false);
+  });
+});
+
+test("unsettled preparation cancellation retains a lock and a callback-phase diagnostic", { timeout: 30000 }, async () => {
+  let callbackStarted;
+  let releaseCallback;
+  const started = new Promise((resolve) => { callbackStarted = resolve; });
+  const release = new Promise((resolve) => { releaseCallback = resolve; });
+  await fixture(async ({ send, finish, index }) => {
+    assert.equal(index, 0);
+    toolCall(send, finish, PREPARATION_TOOL_NAME, decision({ mode: "chat", task: "none" }), "unsettled-control");
+  }, async ({ runtime, model, input, statePath, root }) => {
+    const controller = new AbortController();
+    input.signal = controller.signal;
+    input.onPreparationDecision = async () => { callbackStarted(); await release; };
+    const run = runtime.run(input);
+    const rejected = assert.rejects(run, (error) => error.code === "DSH_TERMINATION_UNCONFIRMED");
+    try {
+      await started;
+      controller.abort(new Error("PRIVATE_CANCELLATION_DETAIL"));
+      await rejected;
+      const binding = JSON.parse(await readFile(statePath, "utf8"));
+      assert.equal(binding.status, "blocked");
+      assert.equal(binding.failureDiagnostic.reason, "termination-unconfirmed");
+      assert.equal(binding.failureDiagnostic.phase, "shutdown");
+      assert.equal(binding.failureDiagnostic.preparation.phase, "callback");
+      assert.equal(binding.failureDiagnostic.preparation.requested, true);
+      assert.equal(binding.failureDiagnostic.preparation.resolved, false);
+      assert.doesNotMatch(JSON.stringify(binding), /PRIVATE_CANCELLATION_DETAIL/);
+      const key = createHash("sha256").update(input.sessionId).digest("hex");
+      assert.ok(await readFile(join(root, key, "owner.lock"), "utf8"));
+      await assert.rejects(runtime.run({ ...input, signal: new AbortController().signal, runId: "do-not-replay" }),
+        /already has an owner|unconfirmed|uncertain/i);
+      assert.equal(model.requests.length, 1, "retained ownership must prevent another model request");
+    } finally {
+      releaseCallback();
+    }
+  }, { shutdownTimeoutMs: 500, expectUnconfirmed: true });
 });
 
 test("real execution cannot exceed the one-dispatch preparation budget", { timeout: 60000 }, async () => {

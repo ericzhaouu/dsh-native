@@ -38,12 +38,17 @@ async function fixture(t, { finalText = "ok", tool = "read", dropFinal = false, 
   const config = { hostRoot: resolve("node_modules", "openclaw"), configPath: join(runDir, "config.json"),
     stateDir: join(runDir, "state"), nativeStateDir, gatewayUrl: "ws://127.0.0.1:18789",
     agentMap: { scout: "agent-a" }, allowedAgentIds: ["agent-a"], ownedSessionPrefix: "acceptance-unit" };
-  const directory = join(nativeStateDir, hash(sessionId));
+  let activeStateId = sessionId;
+  let directory = join(nativeStateDir, hash(activeStateId));
+  let assistantKeyPrefix = "dsh-native:";
+  let resetCount = 0;
+  let nativeSessionId = "native-session";
   await mkdir(directory, { recursive: true });
   t.after(() => rm(runDir, { recursive: true, force: true }));
   const events = [];
   const calls = [];
   const raw = [];
+  const completedRuns = new Set();
   const hostConfig = { plugins: { entries: { "dsh-native": { config: { taskPreparation: { skillAllowlist: [] },
     ...(runtimeBudget || configured ? { operationalBudget: runtimeCap } : {}),
     ...(byAgent ? { operationalBudgetByAgent: byAgent } : {}) } } } } };
@@ -72,7 +77,8 @@ async function fixture(t, { finalText = "ok", tool = "read", dropFinal = false, 
         return { ok: true, key: params.key, entry: { sessionId, permissionMode: "read-only" } };
       }
       if (method === "chat.send") {
-        if (onSend) await onSend();
+        if (onSend) await onSend(params);
+        if (completedRuns.has(params.idempotencyKey)) return { status: "started", runId: params.idempotencyKey };
         if (configured && !missingProof) await initializeProof({ runId: params.idempotencyKey,
           agentId: params.agentId, operationalBudget: resolveConfiguredOperationalBudget(hostConfig, params.agentId) });
         if (runtimeLedgerClass) {
@@ -104,10 +110,10 @@ async function fixture(t, { finalText = "ok", tool = "read", dropFinal = false, 
           await writeProof();
         }
         assistant = { role: "assistant", content: [{ type: "text", text: "ok" }],
-          idempotencyKey: `dsh-native:${params.idempotencyKey}:assistant`, usage: providerUsage, ...assistantObservation };
+          idempotencyKey: `${assistantKeyPrefix}${params.idempotencyKey}:assistant`, usage: providerUsage, ...assistantObservation };
         raw.push({ id: randomUUID(), parentId: raw.at(-1)?.id ?? null, type: "message", message: assistant });
         await writeFile(join(directory, "binding.json"), JSON.stringify({
-          status: "ready", lastRunId: params.idempotencyKey, sessionId: "native-session",
+          status: "ready", lastRunId: params.idempotencyKey, sessionId: nativeSessionId,
           taskPreparation: { state: { mode } },
         }));
         for (const event of extraEvents) {
@@ -115,9 +121,20 @@ async function fixture(t, { finalText = "ok", tool = "read", dropFinal = false, 
         }
         if (!dropFinal) events.push({ event: "chat", payload: { sessionKey: params.sessionKey,
           runId: params.idempotencyKey, state: "final", message: { ...assistant, content: finalText } } });
+        completedRuns.add(params.idempotencyKey);
         return { status: "started", runId: params.idempotencyKey };
       }
       if (method === "chat.history") return { sessionId, messages: [assistant], inFlightRun: false };
+      if (method === "sessions.reset") {
+        const resetId = `reset-${++resetCount}`;
+        raw.push({ id: resetId, parentId: raw.at(-1)?.id ?? null, type: "reset", context: "clear", reason: params.reason });
+        activeStateId = `${sessionId}\0reset\0${resetId}`;
+        assistantKeyPrefix = `dsh-native:reset:${resetId}:`;
+        nativeSessionId = `native-${resetId}`;
+        directory = join(nativeStateDir, hash(activeStateId));
+        await mkdir(directory, { recursive: true });
+        return { ok: true, key: params.key, entry: { sessionId, permissionMode: "read-only" } };
+      }
       if (method === "chat.abort") return { ok: true };
       throw new Error(`Unexpected method ${method}`);
     },
@@ -703,6 +720,98 @@ test("compiled multi-turn strings remain distinct, rather than repeating the fir
   const result = await f.adapter.executeCase(item({ turns: ["First request", "Second request"] }), f.context);
   assert.deepEqual(result.turns.map((turn) => turn.prompt), ["First request", "Second request"]);
   assert.equal(result.usage.userTurns, 2);
+});
+
+test("legacy duplicate inbound delivery remains a current-turn idempotency replay", async (t) => {
+  const f = await fixture(t);
+  const result = await f.adapter.executeCase(item({ turns: ["First request", "Second request"],
+    adapterControls: [{ type: "duplicate_inbound_delivery", appliesToTurn: 2, visibleToModel: false }] }), f.context);
+  const sends = f.calls.filter((call) => call.method === "chat.send").map((call) => call.params);
+  assert.equal(sends.length, 3);
+  assert.match(sends[1].message, /Second request/);
+  assert.doesNotMatch(sends[1].message, /First request/);
+  assert.equal(sends[2].message, sends[1].message);
+  assert.equal(sends[2].idempotencyKey, sends[1].idempotencyKey);
+  assert.deepEqual(result.turns.map((turn) => turn.prompt), ["First request", "Second request"]);
+  assert.equal(result.controlReceipts[0].replaySourceTurn, undefined);
+});
+
+test("versioned duplicate inbound delivery can replay captured earlier prompt bytes without exposing control text", async (t) => {
+  const f = await fixture(t);
+  const result = await f.adapter.executeCase(item({ turns: ["Captured A/B payload", "ADAPTER CONTROL TEXT MUST NOT REACH MODEL"],
+    adapterControls: [{ type: "duplicate_inbound_delivery", appliesToTurn: 2, visibleToModel: false,
+      controlVersion: 1, replaySourceTurn: 1 }] }), f.context);
+  const sends = f.calls.filter((call) => call.method === "chat.send").map((call) => call.params);
+  assert.equal(sends.length, 3);
+  assert.match(sends[1].message, /Captured A\/B payload/);
+  assert.doesNotMatch(sends[1].message, /ADAPTER CONTROL TEXT/);
+  assert.equal(sends[2].message, sends[1].message);
+  assert.equal(sends[2].idempotencyKey, sends[1].idempotencyKey);
+  assert.deepEqual(result.turns.map((turn) => turn.prompt), ["Captured A/B payload", "Captured A/B payload"]);
+  const receipt = result.controlReceipts[0];
+  assert.equal(receipt.controlVersion, 1);
+  assert.equal(receipt.replaySourceTurn, 1);
+  assert.equal(receipt.sourceReceiptId, result.turns[0].runId);
+  assert.equal(receipt.sourcePromptSha256, hash("Captured A/B payload"));
+  assert.equal(receipt.dispatchedPromptSha256, hash("Captured A/B payload"));
+  assert.equal(receipt.targetManifestPromptSha256, hash("ADAPTER CONTROL TEXT MUST NOT REACH MODEL"));
+});
+
+test("legacy current-turn duplication after reset remains valid regardless of control ordering", async (t) => {
+  for (const reverse of [false, true]) {
+    const f = await fixture(t);
+    const controls = [
+      { type: "new_context", appliesAfterTurn: 1, visibleToModel: false },
+      { type: "duplicate_inbound_delivery", appliesToTurn: 2, visibleToModel: false },
+    ];
+    const result = await f.adapter.executeCase(item({ turns: ["source", "new request after reset"],
+      adapterControls: reverse ? controls.reverse() : controls }), f.context);
+    const sends = f.calls.filter((call) => call.method === "chat.send").map((call) => call.params);
+    assert.equal(result.executionStatus, "completed");
+    assert.equal(sends.length, 3);
+    assert.equal(sends[1].message, `new request after reset\n\n${f.context.resources.modelVisibleContext}`);
+    assert.deepEqual(sends[2], sends[1]);
+    assert.notEqual(result.turns[0].nativeSessionId, result.turns[1].nativeSessionId);
+  }
+});
+
+test("captured replay retains exact original resource-context bytes", async (t) => {
+  let context;
+  let sendsObserved = 0;
+  const f = await fixture(t, { onSend() {
+    if (++sendsObserved === 1) context.resources.modelVisibleContext = "changed reference after capture";
+  } });
+  context = f.context;
+  f.context.resources = { modelVisibleContext: "resource reference at capture" };
+  const result = await f.adapter.executeCase(item({ turns: ["Captured payload", "CONTROL CARRIER"],
+    adapterControls: [{ type: "duplicate_inbound_delivery", appliesToTurn: 2, visibleToModel: false,
+      controlVersion: 1, replaySourceTurn: 1 }] }), f.context);
+  const sends = f.calls.filter((call) => call.method === "chat.send").map((call) => call.params);
+  assert.equal(sends[0].message, "Captured payload\n\nresource reference at capture");
+  assert.equal(sends[1].message, sends[0].message);
+  assert.deepEqual(sends[2], sends[1]);
+  const receipt = result.controlReceipts[0];
+  assert.equal(receipt.sourceMessageSha256, hash(sends[0].message));
+  assert.equal(receipt.dispatchedMessageSha256, receipt.sourceMessageSha256);
+});
+
+test("versioned replay can cross an explicit reset using captured adapter-owned bytes", async (t) => {
+  const f = await fixture(t);
+  const result = await f.adapter.executeCase(item({ turns: ["Captured before reset", "CONTROL CARRIER AFTER RESET"],
+    adapterControls: [
+      { type: "new_context", appliesAfterTurn: 1, visibleToModel: false },
+      { type: "duplicate_inbound_delivery", appliesToTurn: 2, visibleToModel: false,
+        controlVersion: 1, replaySourceTurn: 1 },
+    ] }), f.context);
+  const sends = f.calls.filter((call) => call.method === "chat.send").map((call) => call.params);
+  assert.equal(sends.length, 3);
+  assert.match(sends[1].message, /Captured before reset/);
+  assert.doesNotMatch(sends[1].message, /CONTROL CARRIER/);
+  assert.notEqual(result.turns[0].nativeSessionId, result.turns[1].nativeSessionId);
+  assert.equal(result.controlReceipts.find((receipt) => receipt.type === "new_context").transportControlled, true);
+  const replay = result.controlReceipts.find((receipt) => receipt.type === "duplicate_inbound_delivery");
+  assert.equal(replay.replayCrossesReset, true);
+  assert.equal(replay.replaySourceTurn, 1);
 });
 
 test("turn objects preserve raw prompts and optional observed submission IDs", async (t) => {

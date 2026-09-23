@@ -133,6 +133,54 @@ test("file fixtures are read-only references with root and hash checks", async (
   }, { agentProfile: "dsh-assistant", fixtureNames: ["scoped-file"] }), /sha256 mismatch/);
 });
 
+test("file and table paths reject private grading metadata even when their hashes match", async () => {
+  const root = await makeFixtureDir();
+  for (const kind of ["file", "table"]) {
+    for (const [name, value] of [
+      ["raw.json", { modelVisible: { records: [{ id: "WB-001" }] }, oracle: { resultIds: ["WB-001"] } }],
+      ["nested.json", { rows: [{ answerKey: "PRIVATE-GRADING-ANSWER" }] }],
+      ["renamed.txt", { modelVisible: { text: "public" }, groundTruth: "PRIVATE-GRADING-ANSWER" }],
+    ]) {
+      const fixture = await writeFixture(root, `${kind}-${name}`, JSON.stringify(value));
+      await assert.rejects(loadAcceptanceResources({
+        allowedFixtureRoots: [root],
+        resourceMap: { fixture: { kind, agents: ["agent-a"], ...fixture } },
+      }, { agentProfile: "agent-a", fixtureNames: ["fixture"] }), (error) => {
+        assert.match(error.message, /hidden-oracle metadata/);
+        assert.doesNotMatch(error.message, /PRIVATE-GRADING-ANSWER/);
+        return true;
+      });
+    }
+  }
+});
+
+test("file JSON admission rejects malformed documents without disclosing their contents", async () => {
+  const root = await makeFixtureDir();
+  const fixture = await writeFixture(root, "invalid.json", '{"oracle":"PRIVATE-GRADING-ANSWER"');
+  await assert.rejects(loadAcceptanceResources({
+    allowedFixtureRoots: [root],
+    resourceMap: { fixture: { kind: "file", agents: ["agent-a"], ...fixture } },
+  }, { agentProfile: "agent-a", fixtureNames: ["fixture"] }), (error) => {
+    assert.match(error.message, /valid JSON/);
+    assert.doesNotMatch(error.message, /PRIVATE-GRADING-ANSWER/);
+    return true;
+  });
+});
+
+test("safe projected JSON remains a file reference and keeps harmless canary samples intact", async () => {
+  const root = await makeFixtureDir();
+  const fixture = await writeFixture(root, "projected.json", JSON.stringify({
+    records: Array.from({ length: 300 }, (_, index) => ({ id: index })),
+    samples: ["DUMMY_PRIVATE_OUTPUT_CANARY_002"],
+  }));
+  const result = await loadAcceptanceResources({
+    allowedFixtureRoots: [root],
+    resourceMap: { fixture: { kind: "table", agents: ["agent-a"], ...fixture } },
+  }, { agentProfile: "agent-a", fixtureNames: ["fixture"] });
+  assert.equal(result.bindings[0].sha256, fixture.sha256);
+  assert.doesNotMatch(result.modelVisibleContext, /DUMMY_PRIVATE_OUTPUT_CANARY_002|"records"/);
+});
+
 test("URL resources deny unsafe protocols, credentials, credential query, and unapproved hosts", async () => {
   const base = { kind: "table", agents: ["dsh-assistant"], pageSize: 10 };
   async function rejectUrl(url, pattern, resourceHosts = ["fixtures.example.test"]) {

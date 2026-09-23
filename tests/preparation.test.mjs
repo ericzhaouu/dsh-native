@@ -851,3 +851,23 @@ test("mode instructions prioritize the immediate output without case-specific ro
     assert.doesNotMatch(instructions, /本轮不要联网|请诚实说明|02no-network|05partner|https?:\/\//);
   }
 });
+
+test("optional skill relevance cannot promote a supplied non-execution decision or grant read access", () => {
+  const input = request({
+    userText: "Write a short summary of the supplied text without opening files.",
+    policy: policy({ executionTools: ["read", "exec"], skillAllowlist: ["summary-method"] }),
+  });
+  const result = resolve(input, decision({
+    mode: "draft", goal: "Summarize the supplied text.",
+    deliverables: ["A short summary"], enhancedPrompt: "Use only the text in this request.",
+    evidence: { source: "current", quote: input.userText },
+  }));
+  assert.equal(result.decision.mode, "draft");
+  assert.deepEqual(result.allowedTools, []);
+  const instructions = renderPreparationInstructions(input.policy);
+  assert.match(instructions, /Automatic skill use is optional for an explanation or draft/);
+  assert.match(instructions, /do not promote a non-execution answer to execute merely to load a relevant skill/);
+  assert.match(instructions, /explicitly requests a skill.*permitted tools in execute mode/);
+  assert.match(instructions, /do not claim the full method was applied unless it was loaded/);
+  assert.throws(() => parsePreparationResolution({ ...result, allowedTools: ["read"] }), /only execute/);
+});

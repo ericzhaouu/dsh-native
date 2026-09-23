@@ -659,8 +659,8 @@ export async function runAcceptance(argv = process.argv.slice(2)) {
           if (reviewBudget.priced && reviewBudget.currencyMicros <= 0) {
             throw new Error("No independent review currency budget remains");
           }
-          const reviewTimeoutMs = Math.min(120000, testCase.limits.timeoutMs,
-            scope.reviewOperationalBudget?.maxDurationMs ?? Number.MAX_SAFE_INTEGER);
+          const reviewTimeoutMs = Math.min(testCase.limits.timeoutMs,
+            scope.reviewOperationalBudget?.maxDurationMs ?? 120000);
           const reviewDeadlineAtMs = deadlineAfter(reviewStartedAtMs, reviewTimeoutMs);
           const reviewOperationalBudget = scope.reviewOperationalBudget ?
             allocateOperationalBudget(scope.reviewOperationalBudget, reviewBudget, reviewTimeoutMs, { review: true }) : undefined;

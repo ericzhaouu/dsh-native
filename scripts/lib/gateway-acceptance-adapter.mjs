@@ -444,6 +444,47 @@ function turnInputsForCase(testCase) {
   return Array.isArray(testCase.turns) ? testCase.turns.map(normalizeTurnInput) : [normalizeTurnInput(testCase.prompt)];
 }
 
+function validateGatewayControls(testCase, prompts) {
+  const duplicateByTurn = new Map();
+  const resetAfter = new Set();
+  const controls = testCase.adapterControls ?? [];
+  const fail = (reason) => ({ ok: false, reason });
+  for (const control of controls) {
+    if (!["new_context", "duplicate_inbound_delivery"].includes(control.type)) {
+      return fail("Unsupported Gateway control; no input sent");
+    }
+    if (control.visibleToModel !== false) return fail("Gateway controls must be hidden from the model");
+    if (control.type === "new_context") {
+      if (control.replaySourceTurn !== undefined || control.controlVersion !== undefined) {
+        return fail("Versioned replay fields apply only to duplicate_inbound_delivery");
+      }
+      if (!positive(control.appliesAfterTurn) || control.appliesAfterTurn >= prompts.length) {
+        return fail("new_context must apply after an existing non-final turn");
+      }
+      if (resetAfter.has(control.appliesAfterTurn)) return fail("new_context may only be declared once per turn");
+      resetAfter.add(control.appliesAfterTurn);
+      continue;
+    }
+    if (!positive(control.appliesToTurn) || control.appliesToTurn > prompts.length) {
+      return fail("duplicate_inbound_delivery appliesToTurn is outside compiled turns");
+    }
+    if (duplicateByTurn.has(control.appliesToTurn)) {
+      return fail("duplicate_inbound_delivery may only be declared once per turn");
+    }
+    if (control.replaySourceTurn !== undefined || control.controlVersion !== undefined) {
+      if (control.controlVersion !== 1) return fail("replaySourceTurn requires duplicate_inbound_delivery controlVersion 1");
+    }
+    if (control.replaySourceTurn !== undefined) {
+      if (!positive(control.replaySourceTurn) || control.replaySourceTurn >= control.appliesToTurn ||
+          control.replaySourceTurn > prompts.length) {
+        return fail("replaySourceTurn must name an earlier compiled turn captured by this case");
+      }
+    }
+    duplicateByTurn.set(control.appliesToTurn, control);
+  }
+  return { ok: true, duplicateByTurn, resetAfter };
+}
+
 async function realConnection(config, events) {
   const configBytes = await readFile(config.configPath, "utf8");
   const configFingerprint = hash(configBytes);
@@ -582,8 +623,9 @@ export async function createGatewayAcceptanceAdapter(options = {}) {
       transportControlled: true, selfAsserted: false, sessionKey: state.sessionKey };
   }
 
-  async function turn(testCase, context, state, turnInput, index, duplicate) {
+  async function turn(testCase, context, state, turnInput, index, duplicateControl, capturedMessage) {
     const { prompt, submissionId } = normalizeTurnInput(turnInput);
+    const duplicate = duplicateControl !== undefined;
     const runId = randomUUID();
     state.runtimeBudgetDirectory = undefined;
     state.budgetExpected = undefined;
@@ -659,7 +701,8 @@ export async function createGatewayAcceptanceAdapter(options = {}) {
           admissionMode: "operator-configured-caps" });
       }
     }
-    const message = context.resources?.modelVisibleContext ? `${prompt}\n\n${context.resources.modelVisibleContext}` : prompt;
+    const message = capturedMessage ??
+      (context.resources?.modelVisibleContext ? `${prompt}\n\n${context.resources.modelVisibleContext}` : prompt);
     const args = { sessionKey: state.sessionKey, agentId: state.agentId, message, thinking: "medium",
       timeoutMs: Math.min(testCase.limits.timeoutMs, 240000),
       ...(config.isolation ? {} : { expectedPermissionMode: "read-only" }), idempotencyKey: runId };
@@ -722,8 +765,11 @@ export async function createGatewayAcceptanceAdapter(options = {}) {
     });
     if (!["chat", "clarify", "draft", "execute"].includes(mode)) throw new Error("Missing actual native preparation mode");
     context.reportUsage(native.usage);
+    state.capturedInputs.set(index + 1, { prompt, message, runId });
     if (duplicate) {
-      await ledger(context, { event: "duplicate_request_planned", runId, sessionKey: state.sessionKey });
+      await ledger(context, { event: "duplicate_request_planned", runId, sessionKey: state.sessionKey,
+        appliesToTurn: index + 1, ...(duplicateControl.replaySourceTurn !== undefined ?
+          { replaySourceTurn: duplicateControl.replaySourceTurn } : {}) });
       const beforeHash = hash(JSON.stringify(rows));
       const reply = await request("chat.send", args, context.signal, 30000, checkDispatch);
       assert.equal(reply.runId, runId);
@@ -750,6 +796,8 @@ export async function createGatewayAcceptanceAdapter(options = {}) {
       provider: native.provider, model: native.model, sessionId: settled.history.sessionId,
       nativeSessionId: settled.binding.sessionId, runId,
       usageBasis: native.usageBasis,
+      ...(duplicateControl?.replaySourceTurn !== undefined ? { replaySourceTurn: duplicateControl.replaySourceTurn } : {}),
+      dispatchedMessageSha256: hash(message),
       ...(submissionId ? { submissionId } : {}),
     };
   }
@@ -784,9 +832,9 @@ export async function createGatewayAcceptanceAdapter(options = {}) {
       };
       if (!agentId || !config.allowedAgentIds.includes(agentId)) return block("Agent profile not authorized");
       if (testCase.category === "delivery") return block("Actual Feishu controls require the channel adapter, not Gateway proxying");
-      if ((testCase.adapterControls ?? []).some((item) => !["new_context", "duplicate_inbound_delivery"].includes(item.type))) {
-        return block("Unsupported Gateway control; no input sent");
-      }
+      const prompts = turnInputsForCase(testCase);
+      const controlPlan = validateGatewayControls(testCase, prompts);
+      if (!controlPlan.ok) return block(controlPlan.reason);
       const roots = [config.operationalBudget, context.operationalBudget].filter((value) => value !== undefined)
         .map((value) => validateOperationalBudget(value));
       for (const root of roots) deadlineAtMs = resolveDeadlineAtMs(startedAt, root.maxDurationMs, deadlineAtMs);
@@ -826,7 +874,8 @@ export async function createGatewayAcceptanceAdapter(options = {}) {
         await marker.sync();
       } finally { await marker.close(); }
       state = { sessionKey: `agent:${agentId}:${config.ownedSessionPrefix}-${token}`, agentId, settled: false,
-        operationalBudget, prepareBudget, deadlineAtMs, proofs: [], usage: { ...zeroUsage(), priced: false } };
+        operationalBudget, prepareBudget, deadlineAtMs, proofs: [], usage: { ...zeroUsage(), priced: false },
+        capturedInputs: new Map() };
       states.set(testCase.id, state);
       const turns = [];
       const controlReceipts = [];
@@ -852,19 +901,34 @@ export async function createGatewayAcceptanceAdapter(options = {}) {
           assert.equal(created.entry?.permissionMode, "read-only", "Host must confirm read-only scope before any model input");
           state.hostSessionId = created.entry.sessionId;
         }
-        const prompts = turnInputsForCase(testCase);
         for (const [index, prompt] of prompts.entries()) {
           assert.equal(typeof prompt.prompt, "string", "Compiled turns must be original prompt strings");
-          if (index && testCase.adapterControls?.some((item) => item.type === "new_context" && item.appliesAfterTurn === index)) {
+          if (index && controlPlan.resetAfter.has(index)) {
             controlReceipts.push(await reset(state, context, index));
           }
-          const duplicate = testCase.adapterControls?.some((item) => item.type === "duplicate_inbound_delivery" && item.appliesToTurn === index + 1);
-          const result = await turn(testCase, context, state, prompt, index, duplicate);
+          const duplicate = controlPlan.duplicateByTurn.get(index + 1);
+          const sourceTurn = duplicate?.replaySourceTurn !== undefined
+            ? state.capturedInputs.get(duplicate.replaySourceTurn) : undefined;
+          if (duplicate?.replaySourceTurn !== undefined && !sourceTurn) {
+            throw new Error("replaySourceTurn source turn was not captured and settled");
+          }
+          const turnInput = sourceTurn ? { prompt: sourceTurn.prompt,
+            ...(prompt.submissionId ? { submissionId: prompt.submissionId } : {}) } : prompt;
+          const result = await turn(testCase, context, state, turnInput, index, duplicate, sourceTurn?.message);
           turns.push(result);
           usage = sumUsage(usage, result.usage);
           state.usage = usage;
           if (duplicate) controlReceipts.push({ type: "duplicate_inbound_delivery", appliesToTurn: index + 1,
-            receiptId: result.runId, transportControlled: true, selfAsserted: false, surface: "Gateway-RPC" });
+            receiptId: result.runId, transportControlled: true, selfAsserted: false, surface: "Gateway-RPC",
+            dispatchedPromptSha256: hash(result.prompt),
+            dispatchedMessageSha256: result.dispatchedMessageSha256,
+            ...(duplicate.controlVersion !== undefined ? { controlVersion: duplicate.controlVersion } : {}),
+            ...(sourceTurn ? { replaySourceTurn: duplicate.replaySourceTurn, sourceReceiptId: sourceTurn.runId,
+              sourcePromptSha256: hash(sourceTurn.prompt), targetManifestPromptSha256: hash(prompt.prompt),
+              sourceMessageSha256: hash(sourceTurn.message),
+              replayCrossesReset: [...controlPlan.resetAfter].some((after) =>
+                after >= duplicate.replaySourceTurn && after < index + 1),
+              modelContext: "target turn sees only the replayed captured input bytes plus host-visible context for its current reset epoch" } : {}) });
           if (!["completed", "correctly_blocked"].includes(result.executionStatus)) break;
         }
         const effects = sideEffects(turns.flatMap((item) => item.tools));

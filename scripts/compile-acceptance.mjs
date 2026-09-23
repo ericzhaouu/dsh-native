@@ -1,16 +1,17 @@
 #!/usr/bin/env node
 import { createHash } from "node:crypto";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { compileManifestValidator, ensureAbsoluteRunRoot, ensureSafeRunRoot } from "./lib/acceptance-contract.mjs";
 import { assertCaseExpectation, compileExpectationContract, compileFixtureScope, fixtureScopeAssertion } from "./lib/acceptance-expectations.mjs";
+import { readAcceptanceCorpusBytes, readAcceptanceFixtureBytes } from "./lib/acceptance-source-bytes.mjs";
 
 const corpusRoot = new URL("../tests/acceptance/cases/", import.meta.url);
 const fixtureRoot = new URL("../tests/fixtures/acceptance/", import.meta.url);
 const CORPUS_VERSION = "approved1.0testplan.acceptanceCorpus.v1";
-const sourceCorpusVersions = { 1: CORPUS_VERSION, 2: "approved-v2" };
-const usage = "Usage: node scripts\\compile-acceptance.mjs --output-root <new-absolute-dir> [--subset all|single|multi|canary] [--contract-version 1|2] [--source-corpus-version 1|2]";
+const sourceCorpusVersions = { 1: CORPUS_VERSION, 2: "approved-v2", 3: "approved-v3" };
+const usage = "Usage: node scripts\\compile-acceptance.mjs --output-root <new-absolute-dir> [--subset all|single|multi|canary] [--contract-version 1|2] [--source-corpus-version 1|2|3]";
 const modes = new Set(["chat", "clarify", "draft", "execute"]);
 
 function category(taskClass = "") {
@@ -41,13 +42,13 @@ function limits(turns, maxHostCalls) {
 export async function compileCorpus({ subset = "all", contractVersion = 2, sourceCorpusVersion = 1 } = {}) {
   if (!["all", "single", "multi", "canary"].includes(subset)) throw new Error("Unknown corpus subset");
   if (![1, 2].includes(contractVersion)) throw new Error("Unsupported expectation contract version");
-  if (![1, 2].includes(sourceCorpusVersion)) throw new Error("Unsupported source corpus version");
-  if (sourceCorpusVersion === 2 && contractVersion !== 2) throw new Error("Source corpus approved-v2 requires expectation contract version 2");
+  if (![1, 2, 3].includes(sourceCorpusVersion)) throw new Error("Unsupported source corpus version");
+  if (sourceCorpusVersion > 1 && contractVersion !== 2) throw new Error(`Source corpus ${sourceCorpusVersions[sourceCorpusVersion]} requires expectation contract version 2`);
   const selected = [
     ["single", "single-turn.json"], ["multi", "multi-turn.json"], ["canary", "feishu-canary.json"],
   ].filter(([kind]) => subset === "all" || kind === subset);
   const manifest = {
-    version: contractVersion, suiteId: `dsh-v${contractVersion}${sourceCorpusVersion === 2 ? "-approved-v2" : ""}-${subset}`, stage: "live",
+    version: contractVersion, suiteId: `dsh-v${contractVersion}${sourceCorpusVersion > 1 ? `-${sourceCorpusVersions[sourceCorpusVersion]}` : ""}-${subset}`, stage: "live",
     description: "Planned real-model cases; execution requires private resource authorization and a trusted adapter.",
     limits: {
       concurrency: 1, perAgentConcurrency: 1, userTurns: 240, modelRequests: 1500,
@@ -58,7 +59,7 @@ export async function compileCorpus({ subset = "all", contractVersion = 2, sourc
   };
   const oracles = { version: contractVersion, suiteId: manifest.suiteId, corpusHashes: {}, fixtureHashes: {}, fixtures: {}, cases: {} };
   if (contractVersion === 2) oracles.sourceCorpusVersion = sourceCorpusVersions[sourceCorpusVersion];
-  if (sourceCorpusVersion === 2) oracles.sourceFiles = {};
+  if (sourceCorpusVersion > 1) oracles.sourceFiles = {};
   let submissions = 0;
   function add(item, id, prompt, turns, script, source) {
     const expected = script ? script.turns.at(-1).expected : item.expected;
@@ -119,18 +120,24 @@ export async function compileCorpus({ subset = "all", contractVersion = 2, sourc
     submissions += count;
   }
   for (const [kind, name] of selected) {
-    const sourceName = sourceCorpusVersion === 2 && kind === "single" ? `v2/${name}` : name;
-    const bytes = await readFile(new URL(sourceName, corpusRoot));
+    const sourceName =
+      sourceCorpusVersion === 2 && kind === "single" ? `v2/${name}` :
+      sourceCorpusVersion === 3 && ["single", "multi"].includes(kind) ? `v3/${name}` :
+      name;
+    const bytes = await readAcceptanceCorpusBytes(new URL(sourceName, corpusRoot), sourceName);
     const doc = JSON.parse(bytes);
-    const expectedVersion = sourceCorpusVersion === 2 && kind === "single" ? sourceCorpusVersions[2] : CORPUS_VERSION;
+    const expectedVersion =
+      sourceCorpusVersion === 2 && kind === "single" ? sourceCorpusVersions[2] :
+      sourceCorpusVersion === 3 && ["single", "multi"].includes(kind) ? sourceCorpusVersions[3] :
+      CORPUS_VERSION;
     if (doc.schemaVersion !== expectedVersion) throw new Error(`Unsupported corpus version in ${sourceName}`);
     oracles.corpusHashes[sourceName] = createHash("sha256").update(bytes).digest("hex");
-    if (sourceCorpusVersion === 2) {
+    if (sourceCorpusVersion > 1) {
       oracles.sourceFiles[sourceName] = {
         schemaVersion: doc.schemaVersion, ...(doc.sourceReview ? { review: doc.sourceReview } : {}),
       };
     }
-    const provenance = (item, variant) => sourceCorpusVersion === 2 ? {
+    const provenance = (item, variant) => sourceCorpusVersion > 1 ? {
       path: sourceName, schemaVersion: item.schemaVersion,
       caseId: item.caseId ?? item.scriptId,
       ...(variant ? { variant } : {}),
@@ -156,7 +163,7 @@ export async function compileCorpus({ subset = "all", contractVersion = 2, sourc
       throw new Error(`Unrecognized acceptance fixture ${name}`);
     }
     const filename = `${name}.${name === "synthetic-article" ? "txt" : "json"}`;
-    const bytes = await readFile(new URL(filename, fixtureRoot));
+    const bytes = await readAcceptanceFixtureBytes(new URL(filename, fixtureRoot), filename);
     oracles.fixtureHashes[filename] = createHash("sha256").update(bytes).digest("hex");
     oracles.fixtures[name] = filename.endsWith(".json") ? JSON.parse(bytes) : { body: bytes.toString("utf8") };
   }
@@ -180,7 +187,7 @@ export async function compileAcceptance(argv = process.argv.slice(2)) {
     usage,
     defaults: { sourceCorpusVersion: 1, contractVersion: 2 },
     sourceVersions: sourceCorpusVersions,
-    compatibility: "Source 1 supports contracts 1 and 2; approved-v2 requires contract 2. Compilation plans a new run only; it never regrades historical evidence.",
+    compatibility: "Source 1 supports contracts 1 and 2; approved-v2 and approved-v3 require contract 2. Compilation plans a new run only; it never regrades historical evidence.",
   };
   let outputRoot;
   let subset = "all";

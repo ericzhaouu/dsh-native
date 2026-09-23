@@ -104,6 +104,31 @@ test("blocked live scope does not even initialize a potentially connecting adapt
   await assert.rejects(readFile(called), /ENOENT/);
 });
 
+test("a hash-matched raw scoring fixture is blocked before live adapter initialization", async () => {
+  const called = join(root, `oracle-file-initialized-${++counter}.txt`);
+  const a = await writeAdapter("oracle-file-no-init", `import {writeFile} from "node:fs/promises";
+    await writeFile(${JSON.stringify(called)}, "initialized");
+    export function createAdapter(){throw new Error("must not initialize");}`);
+  const raw = JSON.stringify({ modelVisible: { fact: "public" }, oracle: { answer: "PRIVATE_ORACLE_PAYLOAD" } });
+  const fixture = join(root, `scoring-fixture-${++counter}.json`);
+  await writeFile(fixture, raw);
+  const s = await writeScope(scope({
+    allowedFixtureRoots: [root],
+    resourceMap: { sample: { kind: "file", agents: ["agent-a"], path: fixture,
+      sha256: createHash("sha256").update(raw).digest("hex") } },
+  }));
+  const file = await writeManifest(manifest({ stage: "live", cases: [caseDef({
+    stage: "live", fixtures: { names: ["sample"] }, prerequisites: ["approved-scope"],
+  })] }));
+  const result = await runAcceptance(["--execute", "--live", "--trusted-capable-adapter", "--scope", s,
+    "--manifest", file, "--adapter", a, "--run-root", resolve(root, "oracle-file-admission")]);
+  assert.equal(result.code, 1);
+  assert.equal(result.report.cases[0].outcome, "blocked");
+  assert.match(result.report.cases[0].errors.join("\n"), /hidden-oracle metadata/);
+  await assert.rejects(readFile(called), /ENOENT/);
+  assert.doesNotMatch(await readFile(result.tracePath, "utf8"), /PRIVATE_ORACLE_PAYLOAD/);
+});
+
 test("missing prerequisite facts block before adapter execution", async () => {
   const called = join(root, `called-${++counter}.txt`);
   const a = await writeAdapter("preq", `import { writeFile } from "node:fs/promises"; export function createAdapter(){ return { async executeCase(){ await writeFile(${JSON.stringify(called)}, "called"); return {}; }, async cleanupCase(){ return { cleaned:true }; } }; }`);
@@ -218,7 +243,7 @@ async function corpusFixture(actualMode = "chat", options = {}) {
     { name: "independentOracleEvaluated", value: true }, { name: "businessAssertionsPassed", value: true },
     { name: "safetyAssertionsPassed", value: true }, { name: "expectedModesSatisfied", value: true },
     { name: "agentPolicyMatched", value: true },
-  ] }, fixtures: options.fixtureName ? { names: [options.fixtureName] } : undefined });
+  ] }, fixtures: options.fixtureName ? { names: [options.fixtureName] } : undefined, ...options.case });
   const suite = manifest({ stage: "live", cases: Array.from({ length: options.caseCount ?? 1 },
     (_, index) => ({ ...item, id: index ? `${id}-${index}` : id })), ...options.manifest });
   const oracle = { version: 1, suiteId: suite.suiteId, corpusHashes: { source: "a".repeat(64) }, cases: {
@@ -256,7 +281,8 @@ async function corpusFixture(actualMode = "chat", options = {}) {
     export function createReviewer(){${options.reviewInitialize ?? ""} return {async reviewCase({testCase,oracleCase,evidence},context){
       reviewContext=context;
       await writeFile(${JSON.stringify(reviewSeen)},JSON.stringify({budget:context.budget,
-        operationalBudget:context.operationalBudget,timeoutMs:context.timeoutMs}));
+        operationalBudget:context.operationalBudget,timeoutMs:context.timeoutMs,
+        deadlineAtMs:context.deadlineAtMs,observedAtMs:Date.now()}));
       const usage=${JSON.stringify(usage({ toolCalls: 0, userTurns: 0 }))};
       ${options.review ?? ""}
       ${options.catchUsage ? "try { context.reportUsage(usage); } catch {}" : "context.reportUsage(usage);"}
@@ -293,6 +319,64 @@ test("runner review deadline includes reviewer initialization and does not hand 
   assert.equal(clock.sends, 0);
   assert.match(result.report.stopReason, /maxDurationMs.*remaining/);
   assert.equal(result.report.budgetAccounting.review.status, "unknown");
+});
+
+test("explicit review maxDuration above the legacy default reaches reviewer and includes setup time", async () => {
+  const f = await corpusFixture("chat", {
+    case: { limits: { timeoutMs: 300000, usage: cap() } },
+    scope: { reviewOperationalBudget: operationalBudget({ maxDurationMs: 240000 }) },
+    reviewInitialize: "Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,30);",
+    reviewResult: `budgetAttestation:{status:"verified",hardLimitsVerified:true,quiescent:true,
+      operationalBudget:context.operationalBudget,contextWindow:context.operationalBudget.maxInputTokens},
+      cleanup:{cleaned:true,quiescent:true},`,
+  });
+  const result = await runAcceptance(f.args);
+  assert.equal(result.code, 0, JSON.stringify(result.report.cases[0].errors));
+  const seen = JSON.parse(await readFile(f.reviewSeen, "utf8"));
+  assert.equal(seen.timeoutMs, 240000);
+  assert.equal(seen.operationalBudget.maxDurationMs, 240000);
+  const remainingAtReview = seen.deadlineAtMs - seen.observedAtMs;
+  assert.ok(remainingAtReview < 240000, `expected setup to consume review deadline, got ${remainingAtReview}`);
+  assert.ok(remainingAtReview > 239000, `unexpectedly low review deadline headroom ${remainingAtReview}`);
+});
+
+test("legacy independent review timeout keeps the default 120s maximum without an explicit review budget", async () => {
+  const f = await corpusFixture("chat", { case: { limits: { timeoutMs: 300000, usage: cap() } } });
+  const result = await runAcceptance(f.args);
+  assert.equal(result.code, 0, JSON.stringify(result.report.cases[0].errors));
+  const seen = JSON.parse(await readFile(f.reviewSeen, "utf8"));
+  assert.equal(seen.timeoutMs, 120000);
+  assert.equal(Object.hasOwn(seen, "operationalBudget"), false);
+});
+
+test("independent review timeout remains capped by the case timeout", async () => {
+  const f = await corpusFixture("chat", {
+    case: { limits: { timeoutMs: 90000, usage: cap() } },
+    scope: { reviewOperationalBudget: operationalBudget({ maxDurationMs: 240000 }) },
+    reviewResult: `budgetAttestation:{status:"verified",hardLimitsVerified:true,quiescent:true,
+      operationalBudget:context.operationalBudget,contextWindow:context.operationalBudget.maxInputTokens},
+      cleanup:{cleaned:true,quiescent:true},`,
+  });
+  const result = await runAcceptance(f.args);
+  assert.equal(result.code, 0, JSON.stringify(result.report.cases[0].errors));
+  const seen = JSON.parse(await readFile(f.reviewSeen, "utf8"));
+  assert.equal(seen.timeoutMs, 90000);
+  assert.equal(seen.operationalBudget.maxDurationMs, 90000);
+});
+
+test("narrower explicit independent review maxDuration is honored", async () => {
+  const f = await corpusFixture("chat", {
+    case: { limits: { timeoutMs: 300000, usage: cap() } },
+    scope: { reviewOperationalBudget: operationalBudget({ maxDurationMs: 60000 }) },
+    reviewResult: `budgetAttestation:{status:"verified",hardLimitsVerified:true,quiescent:true,
+      operationalBudget:context.operationalBudget,contextWindow:context.operationalBudget.maxInputTokens},
+      cleanup:{cleaned:true,quiescent:true},`,
+  });
+  const result = await runAcceptance(f.args);
+  assert.equal(result.code, 0, JSON.stringify(result.report.cases[0].errors));
+  const seen = JSON.parse(await readFile(f.reviewSeen, "utf8"));
+  assert.equal(seen.timeoutMs, 60000);
+  assert.equal(seen.operationalBudget.maxDurationMs, 60000);
 });
 
 test("compiled corpus requires hash-bound sidecar and independent reviewer before adapter execution", async () => {

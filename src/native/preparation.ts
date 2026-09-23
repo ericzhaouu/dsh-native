@@ -47,6 +47,7 @@ export function filterPreparationSkills(prompt: string | undefined, allowlist: r
   return [
     "Only the following operator-selected skills are advertised for task execution.",
     "A listed skill is guidance, not permission. Check its dependencies against the currently supplied tools.",
+    "A relevant catalog entry does not require skill loading or execute mode for an explanation or draft.",
     "Use only the tools actually supplied by the host. Do not bypass an unavailable capability through another tool.",
     "<available_skills>", ...skills, "</available_skills>",
   ].join("\n");

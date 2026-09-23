@@ -1,4 +1,4 @@
-DSH NATIVE FOR OPENCLAW -- RELEASE CANDIDATE 1.0.0-rc.1 (NOT STABLE)
+DSH NATIVE FOR OPENCLAW -- RELEASE CANDIDATE 1.0.0-rc.2 (NOT STABLE)
 
 Source: https://github.com/ericzhaouu/dsh-native
 Author: https://github.com/ericzhaouu
@@ -7,6 +7,20 @@ Plugin / harness ID: dsh-native
 Example Agent: dsh-experiment
 License: MIT; Copyright (c) 2026 ericzhaouu.
 The Chinese README.md contains the complete guide.
+
+ROOT REPAIRS AND DIAGNOSTICS (1.0.0-rc.2)
+
+Runtime duration and process-group shutdown waits use monotonic time. Fixed
+failure reason/phase diagnostics omit callback bodies, while unsettled preparation
+retains ownership and cannot be replayed. Non-execution modes remain tool-free;
+automatic Skill use is optional, and explicit loading still requires host authority.
+
+Acceptance repairs cover private-oracle file isolation, captured-payload replay,
+separate semantic/safety attribution, reviewed byte formats and safe fixture modes.
+Explicit source-v3 does not regrade historical source-v1/v2 failures.
+This candidate never changes config, cron, business records or host companions
+automatically. Real Feishu/write/remote-CI gates and historical incident diagnosis
+remain separate; local regression success is not stable1.0 certification.
 
 IMMEDIATE REQUEST PRECEDENCE (1.0.0-rc.1)
 
@@ -21,6 +35,9 @@ Source acceptance explicitly selects the approved new corpus with
 --source-corpus-version 2: 200 cases / 224 inputs, including blocked-goal
 contrasts. The default source corpus and historical hashes/reports stay intact.
 Source corpus version is separate from the expectation/evidence contract version.
+The explicit --source-corpus-version 3 selects corrected prompt/oracle contracts
+without changing source-v1/v2 history or the default selection. Compilation and
+local regressions do not certify fresh real-model or platform acceptance.
 Internal dsh_prepare_task observations remain visible but are not HOST dispatches;
 no actual host call or side effect is excused by that distinction.
 Real acceptance and publication gates still require evidence for this candidate.
@@ -230,6 +247,10 @@ Each turn recomputes its gate. Changing policy or toggling preparation on an
 existing session requires /new; corrupt/uncertain state never falls back to
 unrestricted execution. Reaching the clarification limit produces an unresolved
 draft, not mandatory execution. Only explicit skillAllowlist entries are advertised.
+Automatic Skill use is optional for explanations and drafts. Skill relevance
+alone must not promote the turn to execute. An explicit Skill request may load
+missing instructions only through currently permitted tools in execute mode;
+otherwise disclose the limitation. Non-execution modes remain host-tool-free.
 skillAllowlistByAgent can replace that shared list for one enabled Agent without
 changing another. Listing a skill is not a guarantee its dependencies or tools
 are supported.
@@ -557,6 +578,12 @@ allowances and time before EACH dispatch; the runner never reconfigures the plug
 Configure experiment-specific caps deliberately, not by copying an example over
 shared running configuration.
 
+The independent reviewer controller defaults to 120 seconds. An explicit private
+scope.reviewOperationalBudget.maxDurationMs replaces that default, but remains
+capped by the case limits.timeoutMs. Initialization, resource and auth preparation
+consume the same absolute deadline; leave headroom for the configured native
+runtime duration. This does not change native duration or request/token/tool caps.
+
 CAPABILITIES / DASHBOARD
 
 Text input and text-compatible tool results only. The legacy default family is:
@@ -611,6 +638,11 @@ atomic: stop and reconcile partial/uncertain writes, without blind retry or
 automatic rollback.
 
 STATE / FAILURE / SECURITY
+
+Blocked bindings may retain fixed failure reason codes, child lifecycle phase,
+and preparation request/callback state. These diagnostics never persist callback
+error text or request bodies. inspect-state projects only whitelisted fields;
+diagnostic evidence does not authorize replay, unlock, or claim remote quiescence.
 
 NATIVE COMPACTION / MAINTENANCE (0.6.0)
 

@@ -560,6 +560,9 @@ export function renderPreparationInstructions(policy: PreparationPolicy): string
     `Use at most ${parsed.maxToolCalls} subsequent host-tool calls, still subject to stricter host limits.`,
     `The only permitted skill names are ${JSON.stringify(parsed.skillAllowlist)}. Do not auto-load unlisted ` +
       "skills or assume listed skills are installed. A listed skill is guidance, not a tool grant. " +
+      "Automatic skill use is optional for an explanation or draft; do not promote a non-execution answer to execute merely to load a relevant skill. " +
+      "When the user explicitly requests a skill, obtain missing instructions only through permitted tools in execute mode, " +
+      "or explain the missing capability without pretending the method was applied. " +
       "In chat, clarify, and draft, skill descriptions may be visible but full instructions cannot be read unless " +
       "already present in approved context; do not claim the full method was applied unless it was loaded. " +
       "Search, MCP and plugin tools may be used only if present in this turn's actual host tool surface; " +

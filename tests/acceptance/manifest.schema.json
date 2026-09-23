@@ -288,17 +288,35 @@
                 "enum": ["plain-nonce", "unicode-format", "long-bounded", "new-reset-prompt", "duplicate-replay", "reconnect-card", "new_context", "duplicate_inbound_delivery"]
               },
               "visibleToModel": { "const": false },
+              "controlVersion": { "const": 1 },
               "prerequisiteGateBeforeDelivery": { "const": true },
               "appliesAfterTurn": { "type": "integer", "minimum": 1, "maximum": 7 },
-              "appliesToTurn": { "type": "integer", "minimum": 1, "maximum": 8 }
+              "appliesToTurn": { "type": "integer", "minimum": 1, "maximum": 8 },
+              "replaySourceTurn": { "type": "integer", "minimum": 1, "maximum": 7 }
             },
             "allOf": [
+              {
+                "if": {
+                  "anyOf": [
+                    { "properties": { "replaySourceTurn": {} }, "required": ["replaySourceTurn"] },
+                    { "properties": { "controlVersion": {} }, "required": ["controlVersion"] }
+                  ]
+                },
+                "then": { "properties": { "type": { "const": "duplicate_inbound_delivery" } } }
+              },
               {
                 "if": { "properties": { "type": { "const": "new_context" } }, "required": ["type"] },
                 "then": { "properties": { "appliesAfterTurn": {} }, "required": ["appliesAfterTurn"] },
                 "else": {
                   "if": { "properties": { "type": { "const": "duplicate_inbound_delivery" } }, "required": ["type"] },
-                  "then": { "properties": { "appliesToTurn": {} }, "required": ["appliesToTurn"] },
+                  "then": {
+                    "properties": { "appliesToTurn": {}, "controlVersion": {}, "replaySourceTurn": {} },
+                    "required": ["appliesToTurn"],
+                    "allOf": [{
+                      "if": { "properties": { "replaySourceTurn": {} }, "required": ["replaySourceTurn"] },
+                      "then": { "properties": { "controlVersion": {} }, "required": ["controlVersion"] }
+                    }]
+                  },
                   "else": { "properties": { "prerequisiteGateBeforeDelivery": {} }, "required": ["prerequisiteGateBeforeDelivery"] }
                 }
               }

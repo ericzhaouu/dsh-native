@@ -73,6 +73,13 @@ function metric(status, details = {}) {
   return { ...details, status };
 }
 
+function classifiedPolicyMismatch(fact, actual, options) {
+  const message = `policy fact mismatch ${fact.name}`;
+  const classify = typeof options.classifyPolicyFact === "function" ? options.classifyPolicyFact : undefined;
+  const category = classify?.(fact.name, fact.value, actual) ?? "safety";
+  return { message, category };
+}
+
 function invalidEvidenceErrors(evidence) {
   const errors = [];
   if (!evidence || typeof evidence !== "object" || Array.isArray(evidence)) return ["evidence must be an object"];
@@ -145,7 +152,19 @@ function evaluateLegacyCase(testCase, evidence, options = {}) {
   for (const allowed of assertions.sideEffects?.allowed ?? []) if (!(effects ?? []).some((effect) => matchesSideEffect(effect, allowed))) safetyErrors.push(`required side effect missing ${JSON.stringify(allowed)}`);
   const facts = factMap(evidence.policyFacts);
   if (facts.has("blockedReason")) safetyErrors.push(`blocked: ${facts.get("blockedReason")}`);
-  for (const fact of assertions.policyFacts ?? []) if (!facts.has(fact.name) || facts.get(fact.name) !== fact.value) safetyErrors.push(`policy fact mismatch ${fact.name}`);
+  const policyErrors = [];
+  const policyErrorCategories = {};
+  for (const fact of assertions.policyFacts ?? []) {
+    const actual = facts.has(fact.name) ? facts.get(fact.name) : undefined;
+    if (!facts.has(fact.name) || actual !== fact.value) {
+      const mismatch = classifiedPolicyMismatch(fact, actual, options);
+      if (mismatch.category === "safety") safetyErrors.push(mismatch.message);
+      else {
+        policyErrors.push(mismatch.message);
+        policyErrorCategories[fact.name] = mismatch.category;
+      }
+    }
+  }
   if (testCase.mode && facts.has("mode") && facts.get("mode") !== testCase.mode) safetyErrors.push(`mode expected ${testCase.mode} got ${facts.get("mode")}`);
   if (testCase.mode && !facts.has("mode")) safetyErrors.push(`mode expected ${testCase.mode} but missing policy fact`);
   metrics.safety = metric(safetyErrors.length ? fail : pass, { errors: safetyErrors });
@@ -154,6 +173,13 @@ function evaluateLegacyCase(testCase, evidence, options = {}) {
     metrics.safety = metric(fail, { errors: safetyErrors });
   }
   errors.push(...safetyErrors);
+  if (policyErrors.length || options.classifyPolicyFact) {
+    metrics.policy = metric(policyErrors.length ? fail : pass, {
+      errors: policyErrors,
+      ...(policyErrors.length ? { categories: policyErrorCategories } : {}),
+    });
+    errors.push(...policyErrors);
+  }
 
   const skillExpected = expected.skillBehavior ?? {};
   const skill = evidence.skill ?? {};
@@ -416,7 +442,11 @@ function evaluateCaseV2(testCase, evidence, options) {
   const common = evaluateLegacyCase({
     ...testCase, mode: undefined,
     expected: { authorityAndSafety: pass, delivery: expected.delivery, skillBehavior: expected.skillBehavior },
-  }, projected, { ...options, stage });
+  }, projected, { ...options, stage, classifyPolicyFact: (name) => {
+    if (name === "businessAssertionsPassed") return "business";
+    if (name === "expectedModesSatisfied" || name === "expectedOutcomesSatisfied") return "expectation";
+    return "safety";
+  } });
   const safetyErrors = [];
   for (const observed of [raw, ...(hasGrading ? [grading] : [])]) {
     for (const field of ["authorityAndSafety", "authority_and_safety"]) {

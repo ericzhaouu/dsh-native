@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { lstat, readFile, realpath } from "node:fs/promises";
-import { isAbsolute, relative, resolve } from "node:path";
+import { extname, isAbsolute, relative, resolve } from "node:path";
 
 const allowedKinds = new Set(["file", "table", "inline"]);
 const allowedFields = new Set(["kind", "agents", "path", "url", "description", "pageSize", "modelVisible", "sha256"]);
@@ -154,10 +154,37 @@ async function validatePath(path, fixtureId, scope) {
   return resolved;
 }
 
-async function verifyHash(path, expected, fixtureId) {
-  if (!expected) return undefined;
-  const actual = createHash("sha256").update(await readFile(path)).digest("hex");
-  if (actual !== expected) throw new TypeError(`${fixtureId}.sha256 mismatch`);
+function assertPublicFileContents(bytes, path, fixtureId) {
+  const text = bytes.toString("utf8").replace(/^\uFEFF/, "");
+  const jsonFile = extname(path).toLowerCase() === ".json";
+  if (!jsonFile && !/^\s*[\[{]/u.test(text)) return;
+  let value;
+  try {
+    value = JSON.parse(text);
+  } catch (error) {
+    if (!(error instanceof SyntaxError)) throw error;
+    if (jsonFile) throw new TypeError(`${fixtureId} must contain valid JSON before model admission`);
+    return;
+  }
+  const pending = [value];
+  while (pending.length) {
+    const item = pending.pop();
+    if (item === null || typeof item !== "object") continue;
+    for (const [key, child] of Object.entries(item)) {
+      if (hiddenKeyPattern.test(key)) {
+        throw new TypeError(`${fixtureId}.${key} is hidden-oracle metadata and cannot be model-visible; ` +
+          "bind only the public fixture projection, not the private scoring document");
+      }
+      if (child !== null && typeof child === "object") pending.push(child);
+    }
+  }
+}
+
+async function verifyFileContents(path, expected, fixtureId) {
+  const bytes = await readFile(path);
+  const actual = expected === undefined ? undefined : createHash("sha256").update(bytes).digest("hex");
+  if (expected !== undefined && actual !== expected) throw new TypeError(`${fixtureId}.sha256 mismatch`);
+  assertPublicFileContents(bytes, path, fixtureId);
   return actual;
 }
 
@@ -211,7 +238,7 @@ async function validateRecord(record, fixtureId, agentId, scope) {
   if (kind === "file") {
     if (record.url !== undefined || record.pageSize !== undefined) throw new TypeError(`${fixtureId} file resource cannot declare url or pageSize`);
     const path = await validatePath(record.path, fixtureId, scope);
-    const actualSha = await verifyHash(path, sha256, fixtureId);
+    const actualSha = await verifyFileContents(path, sha256, fixtureId);
     return {
       binding: { fixtureId, kind, path, sha256: actualSha ?? sha256 },
       visible: { fixtureId, kind, path, description },
@@ -222,7 +249,7 @@ async function validateRecord(record, fixtureId, agentId, scope) {
   const hasUrl = record.url !== undefined;
   if (hasPath === hasUrl) throw new TypeError(`${fixtureId} table resource must declare exactly one of path or url`);
   const address = hasPath ? { path: await validatePath(record.path, fixtureId, scope) } : { url: validateUrl(record.url, fixtureId, scope) };
-  const actualSha = hasPath ? await verifyHash(address.path, sha256, fixtureId) : undefined;
+  const actualSha = hasPath ? await verifyFileContents(address.path, sha256, fixtureId) : undefined;
   const effectivePageSize = pageSize ?? 10;
   return {
     binding: { fixtureId, kind, ...address, pageSize: effectivePageSize, sha256: actualSha ?? sha256 },
