@@ -739,7 +739,7 @@ test("canonical policy and authoritative prior state persist across children wit
 });
 
 test("enabling, disabling or changing preparation on a ready binding requires /new", async (t) => {
-  for (const mode of ["enable", "disable", "policy"]) {
+  for (const mode of ["enable", "disable", "policy", "skills", "tools", "clarification-limit"]) {
     await t.test(mode, async (t) => withMock(t, { async onRun(params, peer) {
       return params.taskPreparation ? prepare(params, peer) : {};
     } }, async ({ runtime, input, children }) => {
@@ -748,10 +748,37 @@ test("enabling, disabling or changing preparation on a ready binding requires /n
       if (mode === "enable") enablePreparation(input);
       if (mode === "disable") delete input.taskPreparation;
       if (mode === "policy") input.taskPreparation.policy.maxToolCalls++;
+      if (mode === "skills") input.taskPreparation.policy.skillAllowlist.push("local-helper");
+      if (mode === "tools") input.taskPreparation.policy.executionTools.push("write");
+      if (mode === "clarification-limit") input.taskPreparation.policy.maxClarificationTurns++;
       await assert.rejects(runtime.run({ ...input, runId: "second" }), /\/new/);
       assert.equal(children.length, 1);
     }));
   }
+});
+
+test("conversational intent changes keep the policy fingerprint and blocking gaps across runtime turns", async (t) => {
+  await withMock(t, { async onRun(params, peer) {
+    const prior = params.taskPreparation.previous;
+    const decision = decisionFor(params.taskPreparation, prior
+      ? { mode: "chat", task: "none", question: "" }
+      : { mode: "clarify", question: "Which source?", unresolved: ["Missing source"] });
+    return { preparation: await peer.request("prepare", { decision }) };
+  } }, async ({ root, runtime, input }) => {
+    enablePreparation(input);
+    const first = await runtime.run(input);
+    const before = JSON.parse(await readFile(bindingPath(root, input), "utf8"));
+    const second = await runtime.run({ ...input, runId: "second", taskPreparation: {
+      ...input.taskPreparation, userText: "Ask me one question about the idea instead.",
+    } });
+    const after = JSON.parse(await readFile(bindingPath(root, input), "utf8"));
+    assert.equal(after.taskPreparation.policyFingerprint, before.taskPreparation.policyFingerprint);
+    assert.equal(second.preparation.decision.mode, "chat");
+    assert.deepEqual(second.preparation.allowedTools, []);
+    assert.equal(second.preparation.state.clarificationTurns, 1);
+    assert.deepEqual(second.preparation.state.unresolved, first.preparation.state.unresolved);
+    assert.equal(second.preparation.state.question, "Which source?");
+  });
 });
 
 test("corrupt preparation bindings fail closed before spawning another child", async (t) => {

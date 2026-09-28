@@ -1,6 +1,16 @@
 OPENCLAW AGENT HARNESS PIN -- OPTIONAL EXPERIMENTAL HOST PATCH
 DSH Native 0.6.3 (Agent-pin patch specification unchanged from 0.3.0)
 
+INDEPENDENT DSH CHAT FINAL-TEXT COMPANION
+
+Agent-pinned DSH attempts also require chat-final-text\apply.mjs on the same
+stopped OpenClaw 2026.9.2 installation. It preserves legitimate body whitespace
+through Gateway final/last-delta projection using trusted run identity and the
+explicit harness pin. It does not change ordinary harnesses or widen permissions.
+Missing/partial support fails native preflight before model execution. Legacy
+model-scoped DSH keeps its previous projection, without the byte guarantee.
+See chat-final-text\USAGE.txt for check/apply/restore and lifecycle boundaries.
+
 INDEPENDENT COPILOT COMPACTION COMPANION
 
 OpenClaw 2026.9.2 native compaction omits provider runtime-auth preparation.

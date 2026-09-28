@@ -10,6 +10,7 @@ import type {
   ReasoningEfforts,
 } from "./protocol.js";
 import type { PreparationPolicy, PreparationResolution, TaskPreparationConfig } from "./preparation.js";
+import type { BitablePolicy } from "./tool-policy.js";
 
 export interface DshConfig {
   stateDir: string;
@@ -21,6 +22,10 @@ export interface DshConfig {
   allowedCopilotBaseUrls?: string[];
   taskPreparation?: TaskPreparationConfig;
   toolAllowlist?: string[];
+  toolAllowlistByAgent?: Record<string, string[]>;
+  bitablePolicyByAgent?: Record<string, BitablePolicy>;
+  /** Parser-owned provenance; absent means conservatively treat executionTools as explicit. */
+  taskPreparationExecutionToolsExplicit?: boolean;
   operationalBudget?: OperationalBudget;
   operationalBudgetByAgent?: Record<string, OperationalBudget>;
 }

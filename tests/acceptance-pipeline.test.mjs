@@ -428,7 +428,10 @@ for (const event of ["error", "fallback"]) {
     const evidence = result.stored.cases[0].evidenceSummary;
     assert.equal(evidence.executionStatus, event === "error" ? "failed" : "infrastructure_blocked");
     assert.equal(evidence.turns[0].executionStatus, evidence.executionStatus);
-    assert.equal(evidence.turns[0].prompt, result.state.tasks[0].prompt);
+    assert.equal(evidence.turns[0].prompt, undefined);
+    assert.equal(evidence.turns[0].outputText, undefined);
+    assert.ok(!JSON.stringify(evidence).includes(result.state.tasks[0].prompt),
+      "failure diagnostics must not persist prompt text");
     assert.equal(result.state.reviews.length, 0);
     assert.equal(result.state.aborts, 1);
     assert.equal(result.stored.cleanupReceipts[0].receipt.quiescent, false);

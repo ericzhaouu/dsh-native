@@ -7,6 +7,7 @@ import { performance } from "node:perf_hooks";
 import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 import { normalizeBaseUrl, parseOperationalBudget, resolveOperationalBudget } from "./config.js";
+import { resolveAgentToolPolicy } from "./tool-policy.js";
 import { COPILOT_ENDPOINTS, copilotHeaders } from "./copilot-policy.js";
 import { createBridgePatch } from "./bridge/profile.js";
 import { BudgetLedger, budgetError } from "./bridge/budget-ledger.js";
@@ -41,6 +42,7 @@ interface SessionState {
   compactRunIds?: string[];
   pendingCompact?: { runId: string };
   modelRoute?: string;
+  toolPolicyFingerprint?: string;
   budgetFailure?: "DSH_BUDGET_EXCEEDED" | "DSH_BUDGET_UNCERTAIN";
   taskPreparation?: SessionPreparation;
   failureDiagnostic?: RuntimeFailureDiagnostic;
@@ -112,6 +114,7 @@ async function loadState(path: string): Promise<SessionState | undefined> {
         Object.keys(value.pendingCompact).some((key) => key !== "runId") ||
         typeof value.pendingCompact.runId !== "string" || !value.pendingCompact.runId) ||
       value.modelRoute !== undefined && (typeof value.modelRoute !== "string" || !/^[a-f0-9]{64}$/.test(value.modelRoute)) ||
+      value.toolPolicyFingerprint !== undefined && (typeof value.toolPolicyFingerprint !== "string" || !/^[a-f0-9]{64}$/.test(value.toolPolicyFingerprint)) ||
       value.budgetFailure !== undefined && !["DSH_BUDGET_EXCEEDED", "DSH_BUDGET_UNCERTAIN"].includes(String(value.budgetFailure)) ||
       typeof value.lastRunId !== "string" || !["ready", "running", "blocked"].includes(String(value.status))) {
     throw new Error("Invalid or incompatible DSH session state; start a new OpenClaw session.");
@@ -144,6 +147,7 @@ async function loadState(path: string): Promise<SessionState | undefined> {
     ...(value.compactRunIds ? { compactRunIds: value.compactRunIds } : {}),
     ...(value.pendingCompact ? { pendingCompact: { runId: String(value.pendingCompact.runId) } } : {}),
     modelRoute: value.modelRoute,
+    ...(value.toolPolicyFingerprint ? { toolPolicyFingerprint: value.toolPolicyFingerprint as string } : {}),
     ...(value.budgetFailure ? { budgetFailure: value.budgetFailure as SessionState["budgetFailure"] } : {}),
     status: value.status === "ready" ? "ready" : value.status === "running" ? "running" : "blocked",
     ...(taskPreparation ? { taskPreparation } : {}),
@@ -572,6 +576,11 @@ async function runChild(config: DshConfig, input: DshAttempt, budget?: AttemptBu
     credential: createHash("sha256").update(input.apiKey).digest("hex"),
     headers: Object.entries(headers ?? {}).sort(([a], [b]) => a.localeCompare(b)),
   })).digest("hex");
+  const toolPolicy = resolveAgentToolPolicy(config, input.agentId);
+  const toolPolicyFingerprint = toolPolicy.fingerprint;
+  if (toolPolicyFingerprint && input.tools.some((tool) => !toolPolicy.toolAllowlist?.includes(tool.name))) {
+    throw new Error("DSH Agent tool surface exceeds the configured candidates.");
+  }
   const key = createHash("sha256").update(input.nativeStateId ?? input.sessionId).digest("hex");
   const directory = join(config.stateDir, key);
   // Windows can read longer paths while CreateProcess still rejects a long cwd.
@@ -600,6 +609,9 @@ async function runChild(config: DshConfig, input: DshAttempt, budget?: AttemptBu
     const previous = await loadState(statePath);
     if (previous?.budgetFailure) {
       throw budgetError(previous.budgetFailure, "Previous budget outcome blocks this session; start a new session.");
+    }
+    if (previous && previous.toolPolicyFingerprint !== toolPolicyFingerprint) {
+      throw new Error("DSH Agent tool policy changed; use /new to start a new OpenClaw session.");
     }
     if (previous && previous.status !== "ready") {
       throw new Error("Previous DSH outcome is uncertain; refusing to replay possible tool side effects. Start a new session.");
@@ -637,6 +649,7 @@ async function runChild(config: DshConfig, input: DshAttempt, budget?: AttemptBu
       consumedRunIds: [...(previous?.consumedRunIds ?? []), input.runId],
       ...(previous?.compactRunIds ? { compactRunIds: [...previous.compactRunIds] } : {}),
       modelRoute,
+      ...(toolPolicyFingerprint ? { toolPolicyFingerprint } : {}),
     };
     state = currentState;
     if (budget) {
@@ -727,6 +740,7 @@ async function runChild(config: DshConfig, input: DshAttempt, budget?: AttemptBu
 async function compactChild(config: DshConfig, input: DshCompactAttempt, budget?: AttemptBudget): Promise<BridgeCompactResult> {
   input.signal.throwIfAborted();
   input.assertActive();
+  const toolPolicyFingerprint = resolveAgentToolPolicy(config, input.agentId).fingerprint;
   const baseUrl = normalizeBaseUrl(input.baseUrl);
   const provider = input.provider ?? "deepseek";
   if (provider !== "deepseek" && provider !== "github-copilot") throw new Error("Unsupported DSH model provider.");
@@ -780,6 +794,9 @@ async function compactChild(config: DshConfig, input: DshCompactAttempt, budget?
     if (previous?.pendingCompact && await hasBudgetHistory(directory, previous.pendingCompact.runId)) {
       releaseLock = false;
       throw budgetError("DSH_BUDGET_UNCERTAIN", "Budgeted compaction cannot be recovered by replay or receipt inspection.");
+    }
+    if (previous && previous.toolPolicyFingerprint !== toolPolicyFingerprint) {
+      throw new Error("DSH Agent tool policy changed; use /new before compaction or recovery.");
     }
     if (input.recoverOnly && (!previous || previous.status === "ready" && !previous.pendingCompact)) {
       return { compacted: false, sessionId: previous?.sessionId ?? input.sessionId, details: { recovered: false } };

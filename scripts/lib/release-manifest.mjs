@@ -3,6 +3,7 @@ import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { lstat, mkdir, readFile, realpath, writeFile } from "node:fs/promises";
+import { PATCH_ID as CHAT_FINAL_TEXT_PATCH_ID } from "../../host-patch/chat-final-text/spec.mjs";
 import { checkPackage } from "../check-package.mjs";
 
 const execFile = promisify(execFileCallback);
@@ -63,6 +64,12 @@ const COMPANION_DEFS = [
     id: "openclaw-dsh-native-table-policy-v1",
     specPath: "host-patch/table-policy/spec.mjs",
     files: ["host-patch/table-policy/apply.mjs", "host-patch/table-policy/spec.mjs", "host-patch/table-policy/USAGE.txt", "host-patch/engine.mjs"],
+  },
+  {
+    key: "chat-final-text",
+    id: CHAT_FINAL_TEXT_PATCH_ID,
+    specPath: "host-patch/chat-final-text/spec.mjs",
+    files: ["host-patch/chat-final-text/apply.mjs", "host-patch/chat-final-text/spec.mjs", "host-patch/chat-final-text/USAGE.txt", "host-patch/spec.mjs", "host-patch/engine.mjs"],
   },
   {
     key: "group-readonly",

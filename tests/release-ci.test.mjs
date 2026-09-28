@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import test from "node:test";
-import { evaluateGate, sdkTransportRequirement, verifyRepack } from "../scripts/release-ci.mjs";
+import { fileURLToPath } from "node:url";
+import { evaluateGate, sdkCompanionPaths, sdkTransportRequirement, verifyRepack } from "../scripts/release-ci.mjs";
 import { approvedSdkSource, downloadSdkBytes } from "../scripts/release-sdk.mjs";
 import { APPROVED_SDK_SHA256 } from "../scripts/lib/release-manifest.mjs";
 
@@ -33,6 +35,19 @@ test("Linux full SDK runs cannot silently omit isolated transport coverage", () 
   assert.equal(sdkTransportRequirement("linux", "1"), true);
   assert.equal(sdkTransportRequirement("win32", undefined), false);
   assert.equal(sdkTransportRequirement("win32", "1"), false);
+});
+
+test("SDK checks include chat-final-text as required and group-readonly when present", () => {
+  const root = fileURLToPath(new URL("..", import.meta.url));
+  const required = ["", "compact-auth", "source-reply", "table-policy", "chat-final-text"];
+  assert.deepEqual(sdkCompanionPaths(root),
+    [...required, "group-readonly"].map((name) => join(root, "host-patch", name, "apply.mjs")));
+  const absentRoot = join(root, "tests");
+  assert.deepEqual(sdkCompanionPaths(absentRoot),
+    required.map((name) => join(absentRoot, "host-patch", name, "apply.mjs")));
+  const source = readFileSync(new URL("../scripts/release-ci.mjs", import.meta.url), "utf8");
+  assert.match(source, /for \(const companion of sdkCompanionPaths\(\)\)/);
+  assert.match(source, /\[companion, "--root", target, "--check"\]/);
 });
 
 test("SDK allowlist accepts verified fixed npm source or official release/artifact plus exact pin", () => {
@@ -107,6 +122,10 @@ test("workflow keeps required Linux independent from Windows and uploads exact n
     assert.match(jobs.get(key), /runs-on: windows-2022/);
   }
   assert.match(jobs.get("full-sdk-acceptance"), /DSH_RUN_ISOLATED_SDK_TRANSPORT: "1"/);
+  for (const key of ["full-sdk-acceptance", "full-sdk-windows-experimental"]) {
+    assert.match(jobs.get(key), /run: node scripts\/release-sdk\.mjs/);
+    assert.match(jobs.get(key), /run: node scripts\/release-ci\.mjs full/);
+  }
   assert.doesNotMatch(jobs.get("full-sdk-windows-experimental"), /DSH_RUN_ISOLATED_SDK_TRANSPORT/);
   assert.doesNotMatch(jobs.get("package-acceptance"), /DSH_RUN_ISOLATED_SDK_TRANSPORT/);
   const gate = jobs.get("required-linux-gate");

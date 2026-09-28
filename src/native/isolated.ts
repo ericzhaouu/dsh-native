@@ -6,6 +6,7 @@ import type { BridgeContextUsage, BridgeEvent, BridgeResult, BridgeUsage, ModelP
 import type { DshAttempt, DshConfig, DshRuntime } from "../runtime-types.js";
 import { resolveOperationalBudget } from "../config.js";
 import { isBudgetFailure, rethrowBudgetFailure } from "../bridge/budget-terminal.js";
+import { resolveAgentToolPolicy } from "../tool-policy.js";
 
 type IsolatedRun = NonNullable<AgentHarnessV2["runIsolatedCompletionV2"]>;
 type IsolatedParams = Parameters<IsolatedRun>[0];
@@ -192,6 +193,7 @@ export function createIsolatedCompletion(
       fail("isolated completion capacity reached before state or model submission");
     }
     assertPreparedModel(p);
+    resolveAgentToolPolicy(config, p.agentId);
     const maxRequestBytes = options.maxRequestBytes ?? DEFAULT_MAX_REQUEST_BYTES;
     const requestBytes = new TextEncoder().encode(`${p.systemPrompt}\n${p.prompt}`).byteLength;
     if (requestBytes > maxRequestBytes) fail("prompt payload exceeds the isolated completion request limit");

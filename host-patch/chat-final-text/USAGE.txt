@@ -1,0 +1,33 @@
+DSH Gateway final-text companion (OpenClaw 2026.9.2 exact build)
+
+node host-patch/chat-final-text/apply.mjs --root <OpenClaw package directory> --check
+node host-patch/chat-final-text/apply.mjs --root <OpenClaw package directory> --apply --offline-confirmed
+node host-patch/chat-final-text/apply.mjs --root <OpenClaw package directory> --restore --offline-confirmed
+
+Stop the selected Gateway before apply/restore. This command never restarts it.
+Install alongside the Agent harness-pin companion. Check requires exact hashes;
+apply saves originals and a receipt; known partial transactions can be completed
+or restored. Unknown edits, corrupt backups/receipts, and live locks fail closed.
+
+Only a trusted registered run whose agent explicitly pins embedded/dsh-native
+can preserve ordinary body whitespace. The decision is captured on its first
+accepted event, bound to the context object, agent/session, source/client alias,
+chat registration and lifecycle generation. Prompt text, event agentId, itemId,
+model choice and arbitrary event metadata cannot grant preservation. Missing or
+conflicting identity fails closed. Configuration reload does not change an
+already-bound run. Terminal projection retains the binding after registry.shift
+or context cleanup; clearRun removes it even when other record state is retained.
+
+All four Gateway trim assignments are scoped; non-DSH behavior is unchanged.
+Existing internal-context/directive/media redaction, heartbeat and control-token
+suppression, and reasoning/commentary projection still run. Whitespace-only
+terminal output remains invisible. This is not a raw-text metadata bypass or a
+promise to display control/directive text verbatim.
+
+The native runtime checks this companion before an explicitly agent-pinned DSH
+attempt starts. An absent, partial or modified companion fails preflight. Other
+harnesses and legacy model-selected DSH retain their existing behavior; the latter
+does not gain whitespace preservation. Isolated completions/compaction do not
+publish this chat final and do not run this gate.
+Restart after applying so the process uses the verified files.
+No canonical history, comparator normalization or sentinel is involved.

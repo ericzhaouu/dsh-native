@@ -180,7 +180,7 @@ test("accepts only the explicit reversible compaction companion patch modules", 
   }
 });
 
-for (const name of ["source-reply", "table-policy", "group-readonly"]) {
+for (const name of ["source-reply", "table-policy", "chat-final-text", "group-readonly"]) {
   test(`allows only the complete ${name} companion and rejects extra files`, async () => {
     const files = ["apply.mjs", "spec.mjs", "USAGE.txt"];
     const allowed = goodEntries([
@@ -194,21 +194,41 @@ for (const name of ["source-reply", "table-policy", "group-readonly"]) {
       assert.ok(report.findings.some((item) => item.code === "missing-entrypoint" &&
         item.path === `package/host-patch/${name}/${file}`));
     }
+    for (const file of ["engine.mjs", "spec.mjs"]) {
+      const report = await checkPackage({ packagePath: await writeTgz(`${name}-missing-shared-${file}.tgz`,
+        allowed.filter(([path]) => path !== `package/host-patch/${file}`)) });
+      assert.ok(report.findings.some((item) => item.code === "missing-entrypoint" &&
+        item.path === `package/host-patch/${file}`));
+    }
     const extra = await checkPackage({ packagePath: await writeTgz(`${name}-extra.tgz`,
       [...allowed, [`package/host-patch/${name}/unapproved.mjs`, "export {};\n"]]) });
     assert.ok(extra.findings.some((item) => item.code === "unexpected-file"));
   });
 }
 
-test("the native ownership module requires its complete companion even if all companion files are omitted", async () => {
+test("the native ownership module requires its complete companions even if all companion files are omitted", async () => {
   const report = await checkPackage({ packagePath: await writeTgz("missing-required-ownership.tgz",
     goodEntries([["package/dist/native/source-reply-ownership.js", "export {};\n"]])) });
-  for (const name of ["source-reply", "table-policy"]) {
+  for (const name of ["source-reply", "table-policy", "chat-final-text"]) {
     for (const file of ["apply.mjs", "spec.mjs", "USAGE.txt"]) {
       assert.ok(report.findings.some((item) => item.code === "missing-entrypoint" &&
         item.path === `package/host-patch/${name}/${file}`));
     }
   }
+});
+
+test("the native harness requires chat-final-text even when the entire companion is omitted", async () => {
+  const entries = goodEntries([["package/dist/native/harness.js", "export {};\n"]]);
+  const report = await checkPackage({ packagePath: await writeTgz("missing-chat-final-text.tgz", entries) });
+  assert.equal(report.ok, false);
+  const required = ["apply.mjs", "spec.mjs", "USAGE.txt"].map((file) => `package/host-patch/chat-final-text/${file}`);
+  required.push("package/host-patch/engine.mjs");
+  for (const path of required) {
+    assert.ok(report.findings.some((item) => item.code === "missing-entrypoint" && item.path === path));
+  }
+  const complete = await checkPackage({ packagePath: await writeTgz("complete-chat-final-text.tgz",
+    [...entries, ...required.map((path) => [path, "fixture\n"])]) });
+  assert.equal(complete.ok, true, JSON.stringify(complete.findings));
 });
 
 test("requires explicit --package and gives clear CLI usage", async () => {

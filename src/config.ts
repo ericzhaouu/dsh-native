@@ -4,11 +4,13 @@ import { isRecord, type OperationalBudget } from "./protocol.js";
 import type { DshConfig } from "./runtime-types.js";
 import { COPILOT_ENDPOINTS } from "./copilot-policy.js";
 import { parseTaskPreparationConfig, parseToolAllowlist } from "./preparation.js";
+import { parseBitablePolicyByAgent, parseToolAllowlistByAgent, policyRecord, resolveAgentToolPolicy } from "./tool-policy.js";
 
 const KEYS = new Set([
   "stateDir", "startupTimeoutMs", "shutdownTimeoutMs", "streamIdleTimeoutMs", "allowedBaseUrls", "allowedCopilotBaseUrls",
   "taskPreparation",
   "toolAllowlist",
+  "toolAllowlistByAgent", "bitablePolicyByAgent",
   "maxConcurrentRuns",
   "operationalBudget", "operationalBudgetByAgent",
 ]);
@@ -79,6 +81,7 @@ export function normalizeBaseUrl(value: string): string {
 export function parseDshConfig(value: unknown): DshConfig {
   const input = value ?? {};
   if (!isRecord(input)) throw new Error("dsh-native configuration must be an object.");
+  if ("toolAllowlistByAgent" in input || "bitablePolicyByAgent" in input) policyRecord(input);
   for (const key of Object.keys(input)) {
     if (!KEYS.has(key)) throw new Error(`Unknown dsh-native configuration field: ${key}`);
   }
@@ -95,6 +98,8 @@ export function parseDshConfig(value: unknown): DshConfig {
     throw new Error("allowedCopilotBaseUrls must be a nonempty array of exact endpoint URLs.");
   }
   const toolAllowlist = input.toolAllowlist === undefined ? undefined : parseToolAllowlist(input.toolAllowlist);
+  const toolAllowlistByAgent = input.toolAllowlistByAgent === undefined ? undefined : parseToolAllowlistByAgent(input.toolAllowlistByAgent);
+  const bitablePolicyByAgent = input.bitablePolicyByAgent === undefined ? undefined : parseBitablePolicyByAgent(input.bitablePolicyByAgent);
   let taskPreparation = input.taskPreparation === undefined ? undefined : parseTaskPreparationConfig(input.taskPreparation);
   if (toolAllowlist && taskPreparation) {
     const nested = isRecord(input.taskPreparation) && Object.hasOwn(input.taskPreparation, "executionTools");
@@ -104,7 +109,7 @@ export function parseDshConfig(value: unknown): DshConfig {
     }
     taskPreparation = { ...taskPreparation, executionTools: [...toolAllowlist] };
   }
-  return {
+  const parsed: DshConfig = {
     stateDir,
     startupTimeoutMs: timeout(input.startupTimeoutMs, 60_000, "startupTimeoutMs"),
     shutdownTimeoutMs: timeout(input.shutdownTimeoutMs, 15_000, "shutdownTimeoutMs"),
@@ -114,9 +119,17 @@ export function parseDshConfig(value: unknown): DshConfig {
     allowedCopilotBaseUrls: copilotUrls.map((url: string) => normalizeBaseUrl(url)),
     ...(taskPreparation ? { taskPreparation } : {}),
     ...(toolAllowlist ? { toolAllowlist } : {}),
+    ...(toolAllowlistByAgent ? { toolAllowlistByAgent,
+      taskPreparationExecutionToolsExplicit: isRecord(input.taskPreparation) && Object.hasOwn(input.taskPreparation, "executionTools"),
+    } : {}),
+    ...(bitablePolicyByAgent ? { bitablePolicyByAgent } : {}),
     ...(input.operationalBudget === undefined ? {} : { operationalBudget: parseOperationalBudget(input.operationalBudget) }),
     ...(input.operationalBudgetByAgent === undefined ? {} : { operationalBudgetByAgent: parseAgentBudgets(input.operationalBudgetByAgent) }),
   };
+  for (const agentId of new Set([...Object.keys(toolAllowlistByAgent ?? {}), ...Object.keys(bitablePolicyByAgent ?? {})])) {
+    resolveAgentToolPolicy(parsed, agentId);
+  }
+  return parsed;
 }
 
 function concurrency(value: unknown): number {

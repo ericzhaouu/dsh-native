@@ -15,6 +15,8 @@ import {
   type NativeSourceReplyDelivery, type NativeSourceReplyReceiptState, SourceReplyDeliveryError,
 } from "./source-reply.js";
 import type { NativeSourceReplyOwnership } from "./source-reply-ownership.js";
+import { createBitableGate, type BitableScope } from "./bitable-gate.js";
+import { toolPolicyDenied, type BitablePolicy } from "../tool-policy.js";
 
 type Attempt = Parameters<AgentHarnessV2["runAttempt"]>[0];
 type Runtime = typeof import("openclaw/plugin-sdk/agent-harness-runtime");
@@ -184,6 +186,7 @@ export interface NativeToolHostOptions {
   privateSourceReplyAttempt?: Attempt;
   requireSourceReplyOwnership?: boolean;
   cleanupTimeoutMs?: number;
+  bitableScope?: BitableScope;
 }
 
 export class NativeHostCleanupError extends Error {
@@ -204,6 +207,7 @@ export class NativeHostCleanupError extends Error {
 /** Installs the final dispatch gate before the host adds its before-tool policy wrapper. */
 export function createNativeToolHost(options: NativeToolHostOptions): Omit<NativeHost, "systemPrompt" | "prompt"> {
   const sdk = options.runtime;
+  const bitableGate = options.bitableScope ? createBitableGate(options.bitableScope, options) : undefined;
   const controller = new AbortController();
   const lifetime = AbortSignal.any([options.signal, controller.signal]);
   const pending = new Set<Promise<BridgeToolResult>>();
@@ -256,7 +260,8 @@ export function createNativeToolHost(options: NativeToolHostOptions): Omit<Nativ
   };
   const installEntry = (entry: HostToolEntry) => {
     validators.set(entry.source.name, entry.validator);
-    replaySafeTools.set(entry.source.name, entry.replaySafe);
+    replaySafeTools.set(entry.source.name, entry.replaySafe &&
+      !(bitableGate && entry.source.name === "feishu_bitable_update_record"));
     sources.set(entry.source.name, entry.source);
   };
 
@@ -264,6 +269,11 @@ export function createNativeToolHost(options: NativeToolHostOptions): Omit<Nativ
     tools: options.tools, runtime: sdk, toolAllowlist: options.toolAllowlist,
     toolExecutionAllow: options.toolExecutionAllow, sources: options.toolSources, notices: options.toolNotices,
   });
+  if (bitableGate) {
+    selection.entries = selection.entries.filter(({ tool, source }) => bitableGate.admits(tool, source));
+    selection.toolNotices = buildHostToolNotices(options.toolAllowlist ?? [],
+      selection.entries.map(({ source }) => source.name), selection.toolNotices);
+  }
   const sources = new Map<string, HostToolSourceSnapshot>();
   for (const entry of selection.entries) {
     installEntry(entry);
@@ -301,6 +311,13 @@ export function createNativeToolHost(options: NativeToolHostOptions): Omit<Nativ
       source.assertUnchanged();
       if (executionAllow && !executionAllow.has(name)) throw new Error(`Execution denied for ${name}`);
       validate(name, args);
+      if (bitableGate && invocation.privateSourceReplyText === undefined) {
+        bitableGate.assertCall(tool, source, args);
+        args = structuredClone(args);
+        if (record(args) && record(args.fields)) Object.freeze(args.fields);
+        Object.freeze(args);
+        bitableGate.assertCall(tool, source, args);
+      }
       if (invocation.privateSourceReplyText !== undefined) {
         assertPrivateSourceReplyArgs(args, invocation.privateSourceReplyText);
       }
@@ -312,15 +329,21 @@ export function createNativeToolHost(options: NativeToolHostOptions): Omit<Nativ
       activeCount++;
       if (!replaySafeTools.get(name)) hadPotentialSideEffects = true;
       try {
-        return await execute(callId, args, executionSignal, onUpdate);
+        const result = await execute(callId, args, executionSignal, bitableGate ? undefined : onUpdate);
+        return bitableGate && invocation.privateSourceReplyText === undefined ? bitableGate.projectResult(result, args) : result;
       } catch (error) {
         if (executionSignal.aborted) uncertain = true;
+        if (bitableGate && invocation.privateSourceReplyText === undefined) toolPolicyDenied();
         throw error;
       } finally {
         activeCount--;
         completedCount++;
       }
     };
+    if (bitableGate && tool !== options.privateSourceReplyTool) {
+      // A hook must not replace the dispatch gate with a same-name callback.
+      Object.defineProperty(tool, "execute", { value: tool.execute, writable: false, configurable: false });
+    }
   }
   const bound = options.bindToolSurface(executableEntries.map(({ tool }) => tool), { cwd: options.cwd });
   if (bound.length !== executableEntries.length || bound.some((tool, i) =>
@@ -328,6 +351,11 @@ export function createNativeToolHost(options: NativeToolHostOptions): Omit<Nativ
     throw new Error("Host binding did not preserve the policy-wrapped tool surface");
   }
   for (const { source } of executableEntries) source.assertUnchanged();
+  if (bitableGate) {
+    for (const tool of bound.filter((tool) => tool.name !== "message")) {
+      Object.defineProperty(tool, "execute", { value: tool.execute, writable: false, configurable: false });
+    }
+  }
   const byName = new Map(bound.map((tool) => [tool.name, tool]));
   const advertised = new Set(selection.entries.map(({ source }) => source.name));
 
@@ -412,7 +440,8 @@ export function createNativeToolHost(options: NativeToolHostOptions): Omit<Nativ
         }
       }
       if (invocation.started && (blocked || executionSignal.aborted)) uncertain = true;
-      const error = failed ? sdk.formatToolExecutionErrorMessage(failure, "Host tool execution failed") : undefined;
+      const error = failed ? bitableGate && privateSourceReplyText === undefined
+        ? "DSH tool scope denied or unverifiable." : sdk.formatToolExecutionErrorMessage(failure, "Host tool execution failed") : undefined;
       if (privateSourceReplyText !== undefined && invocation.started && result && options.privateSourceReplyAttempt) {
         sourceReplyDelivery ??= buildSourceReplyDeliveryEvidence({
           sdk, attempt: options.privateSourceReplyAttempt, args, result, isError,
@@ -436,7 +465,8 @@ export function createNativeToolHost(options: NativeToolHostOptions): Omit<Nativ
       return {
         bridge: failed
           ? { text: error ?? "Host tool execution failed", isError: true }
-          : projectNativeToolResult(result, isError),
+          : projectNativeToolResult(bitableGate && privateSourceReplyText === undefined
+            ? bitableGate.projectResult(result, args) : result, isError),
         result,
         isError,
         args,
@@ -561,7 +591,7 @@ export function createNativeToolHost(options: NativeToolHostOptions): Omit<Nativ
 export async function prepareNativeHost(p: Parameters<AgentHarnessV2["runAttempt"]>[0], signal: AbortSignal,
   assertActive: () => void, history: Awaited<ReturnType<AgentHarnessV2["runAttempt"]>>["messagesSnapshot"] = [],
   preparation?: { policy: PreparationPolicy; gate: PreparationGate },
-  toolAllowlist?: readonly string[], lifecycle?: { cleanupTimeoutMs?: number }): Promise<NativeHost> {
+  toolAllowlist?: readonly string[], lifecycle?: { cleanupTimeoutMs?: number; bitablePolicy?: BitablePolicy }): Promise<NativeHost> {
   assertNativeHostSupported(p);
   const controller = new AbortController();
   const lifetime = AbortSignal.any([signal, controller.signal, ...(p.abortSignal ? [p.abortSignal] : [])]);
@@ -744,6 +774,9 @@ export async function prepareNativeHost(p: Parameters<AgentHarnessV2["runAttempt
       privateSourceReplyTool, privateSourceReplyAttempt: requiresPrivateSourceReply ? p : undefined,
       requireSourceReplyOwnership: requiresPrivateSourceReply,
       cleanupTimeoutMs: lifecycle?.cleanupTimeoutMs,
+      // Routing fields and plugin ownership do not attest the callback's effective account.
+      // Keep this policy-only until the host can bind authenticated ingress to the original instance.
+      ...(lifecycle?.bitablePolicy ? { bitableScope: { policy: lifecycle.bitablePolicy } } : {}),
     });
     const preparedHost = host;
     return {

@@ -20,15 +20,23 @@ import {
 } from "./lib/acceptance-contract.mjs";
 import { buildReport, evaluateRun } from "./lib/acceptance-evaluator.mjs";
 import { loadAcceptanceResources } from "./lib/acceptance-resources.mjs";
-import { evaluateCorpusEvidence, loadCorpusOracles } from "./lib/acceptance-oracles.mjs";
+import { corpusObservationDigest, corpusObservationDigestKind, evaluateCorpusEvidence, loadCorpusOracles } from "./lib/acceptance-oracles.mjs";
+import { assertBudgetFitsDeadline, assertConfiguredBudgetFits, assertNativeBudgetFitsAllocation, captureBudgetDeadline, monotonicNowMs,
+  narrowOperationalBudget, remainingNativeAllocation, remainingOperationalBudget,
+  preflightConfiguredOperationalBudget } from "./lib/gateway-acceptance-adapter.mjs";
+
+export { preflightConfiguredOperationalBudget };
 
 const operationalBudgetGuidance = [
   "Private scope.operationalBudget and scope.reviewOperationalBudget opt in to attestation; legacy/default executions remain unattested.",
+  "scope.caseBudget is the whole DUT case root; scope.attemptBudget is the unchanged native per-turn ceiling. Explicit caseBudget overrides the legacy operationalBudget root; operationalBudget then remains an attempt ceiling fallback. Without caseBudget/operationalBudget, attemptBudget derives resource roots for all turns, using the case timeout separately.",
+  "Review uses its own once-per-case reviewCaseBudget/reviewAttemptBudget and reviewBudgets pool (legacy reviewOperationalBudget is supported). Parent campaign reservations must include DUT plus review separately before starting the child.",
   "BEFORE every dispatch, the trusted adapter/reviewer must verify configured plugin effective operational caps (the minimum of global operationalBudget and exact-agent operationalBudgetByAgent caps when both exist) fit every remaining case/campaign allocation, including duration. Operators must install suitably small configured caps; the runner does not configure the plugin.",
   "budget and operationalBudget allocations passed to adapters/reviewers are ceilings, not automatic native narrowing. Chat messages or prompt text cannot enforce these limits.",
   "Configured runtime maxDurationMs must be strictly below the case/review deadline with setup headroom and a dispatch margin. Resource, prompt, and auth preparation consume the original absolute deadline; waiting timeouts do not guarantee remote abort or quiescence.",
   "maxInputTokens and remaining uncached inputTokens must allow the prepared full contextWindow for a worst-case cache miss, not guessed nominal prompt tokens. Cache read/write allocations cannot fund this reservation.",
   "Bounded Gateway/reviewer native total-input caps must also fit EACH remaining cacheReadTokens/cacheWriteTokens allocation. Their native ledgers are unpriced: priced/currency allocations require separate runtime enforcement and are rejected before dispatch.",
+  "In bounded execution, budgets.inputTokens is one aggregate input+cache ceiling, not three authorizations. Input/cache reporting fields may each hold the full native cap; cache counters remain separate evidence and are charged to aggregate input exactly once.",
   "Attestation requires actual runtime enforcement/settlement proof plus successful quiescent cleanup. Unknown post-dispatch accounting and fenced/locked runtimes remain unknown, never known zero or attested.",
   "Failure accounting keeps measured observedLowerBound, journal outstandingReservations, and conservative unresolvedExposure separate; incomplete journals cannot release unproven exposure.",
 ];
@@ -125,6 +133,34 @@ function allocateOperationalBudget(root, caps, timeoutMs, { review = false } = {
   }, "operationalBudget allocation (zero/exhausted limits are forbidden)");
 }
 
+export function resolveCaseBudgetAllocation(testCase, scope = {}, {
+  review = false, globalCaps = review ? scope.reviewBudgets : scope.budgets, globalUsed = zeroUsage(),
+} = {}) {
+  const usageErrors = validateUsageShape(globalUsed, { requirePricing: false });
+  if (usageErrors.length) throw new TypeError(`Invalid prior pool usage: ${usageErrors.join("; ")}`);
+  for (const field of review ? ["reviewCaseBudget", "reviewOperationalBudget", "reviewAttemptBudget"] :
+    ["caseBudget", "operationalBudget", "attemptBudget"]) {
+    if (Object.hasOwn(scope, field)) validateOperationalBudget(scope[field], `scope.${field}`);
+  }
+  const explicit = review ? scope.reviewCaseBudget : scope.caseBudget;
+  const legacy = review ? scope.reviewOperationalBudget : scope.operationalBudget;
+  const attempt = (review ? scope.reviewAttemptBudget : scope.attemptBudget) ?? (explicit ? legacy : undefined);
+  const attemptBudget = attempt === undefined ? undefined : validateOperationalBudget(attempt, "attemptBudget");
+  let root = explicit ?? legacy;
+  if (root === undefined && attemptBudget) {
+    const turns = review ? 1 : testCase.turns?.length || 1;
+    root = Object.fromEntries(operationalFields.map((key) =>
+      [key, key === "maxDurationMs" ? testCase.limits.timeoutMs : attemptBudget[key] * turns]));
+  }
+  const caseBudget = root === undefined ? undefined : validateOperationalBudget(root, "caseBudget");
+  const timeoutMs = Math.min(testCase.limits.timeoutMs, caseBudget?.maxDurationMs ?? (review ? 120000 : Number.MAX_SAFE_INTEGER));
+  const pool = remaining(globalCaps, globalUsed, !!caseBudget);
+  const caps = review ? { ...pool, toolCalls: 0 } : testCase.limits.usage;
+  const budget = minimumAllocation(caps, pool);
+  const operationalBudget = caseBudget ? allocateOperationalBudget(caseBudget, budget, timeoutMs, { review }) : undefined;
+  return { budget, caseBudget: operationalBudget, operationalBudget, attemptBudget, timeoutMs };
+}
+
 function checkBudgetAttestation(value, root, cleanup, usage) {
   if (cleanup?.cleaned === false || cleanup?.error) {
     throw new Error("adapter cleanup is incomplete; usage and hard limits are unproven");
@@ -154,6 +190,57 @@ function checkBudgetAttestation(value, root, cleanup, usage) {
   return { status: "adapter-attested", attestation: structuredClone(value) };
 }
 
+function checkCompleteAccounting(source, usage, { required = false } = {}) {
+  const records = [source?.budgetAccounting, source?.accounting].filter((value) => value !== undefined);
+  if (required && !records.length) throw new Error("failure recovery requires complete accounting");
+  for (const data of records) {
+    const sameUsage = (value) => !validateUsageShape(value).length &&
+      [...budgetFields, "priced", "currencyMicros"].every((field) => value[field] === usage?.[field]);
+    const zeroExposure = (value) => value && typeof value === "object" && !Array.isArray(value) &&
+      ["modelRequests", "inputTokens", "outputTokens", "toolCalls"].every((field) => value[field] === 0) &&
+      Object.values(value).every((amount) => amount === 0);
+    if (data?.usageStatus !== "complete" || validateUsageShape(usage).length ||
+        !sameUsage(data.observedLowerBound) || (data.usage !== undefined && !sameUsage(data.usage)) ||
+        !zeroExposure(data.reserved) ||
+        (data.unresolvedExposure !== undefined && !zeroExposure(data.unresolvedExposure))) {
+      throw new Error("failure accounting is incomplete, inconsistent, or retains unresolved exposure");
+    }
+  }
+}
+
+function checkFailureRecovery(error, value, root, settled, controller, tracker) {
+  if (!root || !settled || controller.signal.aborted || tracker.failure) {
+    throw new Error("failure recovery requires independently settled, bounded execution");
+  }
+  for (const source of [error, value]) {
+    if (source?.unknownEffects === true || source?.liveUnknown === true ||
+        ["unknown", "infrastructure_blocked"].includes(source?.executionStatus)) {
+      throw new Error("failure recovery has unknown post-dispatch state");
+    }
+    checkCompleteAccounting(source, value?.usage, { required: source === error });
+  }
+  checkBudgetAttestation(value?.budgetAttestation, root, value?.cleanup, value?.usage);
+}
+
+function failedCorpusGrading(testCase, evidence, error, version, source = "independent review") {
+  const message = `${source} failed: ${error.message}`;
+  return {
+    status: "failed", errors: [message],
+    checks: [{ name: source === "execution" ? "executionBusinessResult" : "reviewerOutputParsed", status: "failed", message }],
+    policyFacts: { independentOracleEvaluated: false, businessAssertionsPassed: false,
+      safetyAssertionsPassed: false, expectedModesSatisfied: false, agentPolicyMatched: false,
+      ...(version === 2 ? { expectedOutcomesSatisfied: false } : {}) },
+    ...(version === 2 ? {
+      executionStatus: "failed", businessResult: "failed",
+      turns: testCase.expected.turnExpectations.map((turn, index) => ({
+        submissionId: turn.submissionId, mode: evidence.turns?.[index]?.mode,
+        executionStatus: "failed", businessResult: "failed",
+      })),
+      observationDigestKind: corpusObservationDigestKind, observationSha256: corpusObservationDigest(evidence),
+    } : {}),
+  };
+}
+
 function addUsage(a, b) {
   const out = { ...a };
   for (const field of budgetFields) out[field] = (out[field] ?? 0) + (b[field] ?? 0);
@@ -164,11 +251,12 @@ function addUsage(a, b) {
   return out;
 }
 
-function remaining(caps, used) {
+function remaining(caps, used, aggregateInput = false) {
   const out = {};
   for (const field of budgetFields) out[field] = (caps?.[field] ?? Number.MAX_SAFE_INTEGER) - (used[field] ?? 0);
   if (Number.isFinite(caps?.currencyMicros)) out.currencyMicros = caps.currencyMicros - (used.currencyMicros ?? 0);
   out.priced = caps?.priced === true;
+  if (aggregateInput) out.inputTokens -= (used.cacheReadTokens ?? 0) + (used.cacheWriteTokens ?? 0);
   return out;
 }
 
@@ -180,7 +268,9 @@ function minimumAllocation(caps, rem) {
   return allocation;
 }
 
-function makeBudgetTracker(testCase, globalCaps, globalUsed, { allowNarrowing = false } = {}) {
+function makeBudgetTracker(testCase, globalCaps, globalUsed, {
+  allowNarrowing = false, operationalBudget, attemptBudget, review = false,
+} = {}) {
   const caseCaps = testCase.limits?.usage ?? {};
   const observed = { ...zeroUsage(), priced: false };
   let failure;
@@ -189,12 +279,21 @@ function makeBudgetTracker(testCase, globalCaps, globalUsed, { allowNarrowing = 
   let outstandingReservations;
   let unresolvedExposure;
   const latch = (error) => { failure ??= error; return failure; };
+  const checkedUsage = (usage) => operationalBudget ? { ...usage,
+    inputTokens: (usage.inputTokens ?? 0) + (usage.cacheReadTokens ?? 0) + (usage.cacheWriteTokens ?? 0) } : usage;
+  const rootErrors = (usage) => {
+    if (!operationalBudget) return [];
+    return usageExceeds(checkedUsage(usage), {
+      modelRequests: operationalBudget.maxModelRequests, inputTokens: operationalBudget.maxInputTokens,
+      outputTokens: operationalBudget.maxOutputTokens, toolCalls: review ? 0 : operationalBudget.maxToolCalls,
+    });
+  };
   return {
     observed,
     get outstandingReservations() { return outstandingReservations; },
     get unresolvedExposure() { return unresolvedExposure; },
     retainLowerBound(error) {
-      const data = error?.budgetAccounting;
+      const data = error?.budgetAccounting ?? error?.accounting;
       if (!data) return;
       if (closed) {
         latch(new Error("error accounting after accounting closed"));
@@ -220,13 +319,28 @@ function makeBudgetTracker(testCase, globalCaps, globalUsed, { allowNarrowing = 
     closeUsage() { usageClosed = true; },
     close() { usageClosed = true; closed = true; },
     latch,
-    allocation: minimumAllocation(caseCaps, remaining(globalCaps, globalUsed)),
+    allocation: minimumAllocation(caseCaps, remaining(globalCaps, globalUsed, !!operationalBudget)),
+    beforeDispatch(configured) {
+      try {
+        if (usageClosed || failure) throw failure ?? new Error("dispatch after accounting closed");
+        if (!operationalBudget) return;
+        if (attemptBudget) assertConfiguredBudgetFits(configured, attemptBudget);
+        let allocation = remainingOperationalBudget(operationalBudget, observed);
+        for (const caps of [remainingNativeAllocation(caseCaps, observed),
+          remaining(globalCaps, addUsage(globalUsed, observed), true)]) {
+          allocation = narrowOperationalBudget(allocation, caps, undefined, { zeroTools: review });
+          assertNativeBudgetFitsAllocation(configured, caps);
+          if (!review && caps.userTurns !== undefined && caps.userTurns < 1) throw new Error("No DUT userTurns budget remains");
+        }
+        assertConfiguredBudgetFits(configured, allocation);
+      } catch (error) { throw latch(error); }
+    },
     admit() {
       if (!finiteUsageCaps(caseCaps)) return `case ${testCase.id} is missing required finite usage budget fields`;
       if (globalCaps.priced === true && (caseCaps.priced !== true || !Number.isSafeInteger(caseCaps.currencyMicros))) {
         return `case ${testCase.id} needs a priced allocation under the private currency budget`;
       }
-      const rem = remaining(globalCaps, globalUsed);
+      const rem = remaining(globalCaps, globalUsed, !!operationalBudget);
       for (const field of budgetFields) {
         if ((!allowNarrowing && caseCaps[field] > rem[field]) || (caseCaps[field] > 0 && rem[field] <= 0)) {
           return `case ${testCase.id} budget cap ${field} exceeds remaining suite budget`;
@@ -246,15 +360,16 @@ function makeBudgetTracker(testCase, globalCaps, globalUsed, { allowNarrowing = 
       const next = addUsage(observed, delta);
       if (validateUsageShape(next).length) {
         for (const field of [...budgetFields, "currencyMicros"]) {
-          if (next[field] !== undefined) observed[field] = Math.min(next[field], Number.MAX_SAFE_INTEGER);
+          if (next[field] !== undefined) observed[field] = next[field];
         }
         observed.priced = next.priced;
         throw latch(new Error("observed usage accumulation is not a safe integer"));
       }
       Object.assign(observed, next);
-      const capErrors = usageExceeds({ ...next, priced: next.priced ?? false }, caseCaps);
-      const suiteErrors = usageExceeds({ ...addUsage(globalUsed, next), priced: next.priced ?? false }, globalCaps);
-      if (capErrors.length || suiteErrors.length) throw latch(new Error([...capErrors, ...suiteErrors].join("; ")));
+      const capErrors = usageExceeds(checkedUsage({ ...next, priced: next.priced ?? false }), caseCaps);
+      const suiteErrors = usageExceeds(checkedUsage({ ...addUsage(globalUsed, next), priced: next.priced ?? false }), globalCaps);
+      const capFailures = [...capErrors, ...suiteErrors, ...rootErrors(next)];
+      if (capFailures.length) throw latch(new Error(capFailures.join("; ")));
       if (failure) throw failure;
     },
     reconcile(finalUsage) {
@@ -267,8 +382,8 @@ function makeBudgetTracker(testCase, globalCaps, globalUsed, { allowNarrowing = 
         } else if (field === "currencyMicros" && observed.priced === true) errors.push("usage.currencyMicros final usage missing");
       }
       if (finalUsage?.priced === true && Number.isSafeInteger(finalUsage.currencyMicros) && finalUsage.currencyMicros >= 0) observed.priced = true;
-      errors.push(...usageExceeds(finalUsage ?? {}, caseCaps));
-      errors.push(...usageExceeds(addUsage(globalUsed, observed), globalCaps));
+      errors.push(...usageExceeds(checkedUsage(finalUsage ?? {}), caseCaps));
+      errors.push(...usageExceeds(checkedUsage(addUsage(globalUsed, observed)), globalCaps), ...rootErrors(observed));
       if (errors.length) latch(new Error(errors.join("; ")));
       if (failure) errors.push(failure.message);
       return errors;
@@ -320,7 +435,8 @@ function validateScope(scope, manifest) {
   if (!finiteUsageCaps(scope.budgets)) errors.push("live scope must contain finite budgets for all usage dimensions");
   if (scope.budgets?.priced === true && (!Number.isSafeInteger(scope.budgets.currencyMicros) || scope.budgets.currencyMicros < 0)) errors.push("priced live scope requires non-negative currencyMicros");
   if (scope.budgets?.priced !== true && scope.budgets?.priced !== false) errors.push("live scope budgets must explicitly declare priced");
-  for (const field of ["operationalBudget", "reviewOperationalBudget"]) {
+  for (const field of ["operationalBudget", "caseBudget", "attemptBudget",
+    "reviewOperationalBudget", "reviewCaseBudget", "reviewAttemptBudget"]) {
     if (!Object.hasOwn(scope, field)) continue;
     try { scope[field] = validateOperationalBudget(scope[field], `scope.${field}`); }
     catch (error) { errors.push(error.message); }
@@ -361,12 +477,8 @@ function preflightCase(testCase, manifest, args, scope) {
   return undefined;
 }
 
-function deadlineAfter(startedAtMs, timeoutMs) {
-  return startedAtMs + Math.min(timeoutMs, Number.MAX_SAFE_INTEGER - startedAtMs);
-}
-
 function checkDeadline(deadlineAtMs, timeoutMs, controller, caseId) {
-  if (Date.now() >= deadlineAtMs) {
+  if (monotonicNowMs() >= deadlineAtMs) {
     controller.abort(new Error(`case ${caseId} timed out after ${timeoutMs}ms`));
   }
   controller.signal.throwIfAborted();
@@ -383,19 +495,20 @@ async function withTimeout(promise, timeoutMs, controller, caseId, deadlineAtMs)
           const error = new Error(`case ${caseId} timed out after ${timeoutMs}ms`);
           controller.abort(error);
           reject(error);
-        }, Math.min(deadlineAtMs - Date.now(), 2147483647));
+        }, Math.min(deadlineAtMs - monotonicNowMs(), 2147483647));
       }),
     ]);
-    if (Date.now() >= deadlineAtMs) checkDeadline(deadlineAtMs, timeoutMs, controller, caseId);
+    if (monotonicNowMs() >= deadlineAtMs) checkDeadline(deadlineAtMs, timeoutMs, controller, caseId);
     return result;
   } finally { clearTimeout(timer); }
 }
 
 async function executeCase(prepare, testCase, context, tracker) {
-  const started = Date.now();
+  const started = monotonicNowMs();
   const timeoutMs = context.timeoutMs;
-  const deadlineAtMs = deadlineAfter(started, timeoutMs);
-  context = { ...context, deadlineAtMs };
+  const deadline = captureBudgetDeadline(context, started);
+  const deadlineAtMs = deadline.deadlineMonotonicMs;
+  context = { ...context, ...deadline };
   const controller = new AbortController();
   let adapter;
   let error;
@@ -410,6 +523,11 @@ async function executeCase(prepare, testCase, context, tracker) {
       checkDeadline(deadlineAtMs, timeoutMs, controller, testCase.id);
       return await adapter.executeCase(Object.freeze(adapterCase(testCase)), {
         ...context, signal: controller.signal,
+        beforeDispatch(configured) {
+          checkDeadline(deadlineAtMs, timeoutMs, controller, testCase.id);
+          try { assertBudgetFitsDeadline(configured, deadline); tracker.beforeDispatch(configured); }
+          catch (error) { controller.abort(error); throw error; }
+        },
         reportUsage(delta) {
           try { tracker.reportUsage(delta); }
           catch (caught) {
@@ -428,22 +546,35 @@ async function executeCase(prepare, testCase, context, tracker) {
   try {
     evidence = await withTimeout(execution, timeoutMs, controller, testCase.id, deadlineAtMs);
   } catch (caught) {
-    error = caught;
-    tracker.latch(caught);
-    evidence = caught.evidence && typeof caught.evidence === "object" && !Array.isArray(caught.evidence)
-      ? { ...caught.evidence, unknownEffects: true }
-      : blockEvidence(caught.message, { liveUnknown: stageOf(context.manifestInfo, testCase) === "live", unknownEffects: true });
+    error = tracker.failure ?? caught;
+    try {
+      if (caught.evidence?.businessResult !== "failed" ||
+          !["completed", "failed", "correctly_blocked"].includes(caught.evidence.executionStatus)) throw caught;
+      checkFailureRecovery(caught, caught.evidence, context.operationalBudget, settled, controller, tracker);
+      evidence = { ...caught.evidence };
+    } catch {
+      tracker.latch(error);
+      evidence = caught.evidence && typeof caught.evidence === "object" && !Array.isArray(caught.evidence)
+        ? { ...caught.evidence, unknownEffects: true }
+        : blockEvidence(error.message, { liveUnknown: stageOf(context.manifestInfo, testCase) === "live", unknownEffects: true });
+    }
   } finally { tracker.closeUsage(); }
   if (!evidence || typeof evidence !== "object" || Array.isArray(evidence)) {
     error ??= tracker.latch(new Error("adapter returned no valid evidence"));
     evidence = blockEvidence(error.message, { unknownEffects: true });
   }
-  if (evidence.executionStatus === "infrastructure_blocked") {
+  if (["infrastructure_blocked", "unknown"].includes(evidence.executionStatus)) {
     tracker.latch(new Error(evidence.policyFacts?.blockedReason ?? "infrastructure-blocked execution has unknown usage"));
   }
   if (evidence.unknownEffects === true || evidence.liveUnknown === true) {
     tracker.latch(new Error("adapter reported unknown post-dispatch state; usage and hard limits are unproven"));
   }
+  const businessFailure = evidence.businessResult === "failed" || evidence.executionStatus === "failed";
+  if (businessFailure && evidence.error?.message) error ??= new Error(evidence.error.message);
+  if (error) evidence = { ...evidence, policyFacts: { ...evidence.policyFacts, executionError: error.message } };
+  tracker.retainLowerBound(evidence);
+  try { checkCompleteAccounting(evidence, evidence.usage); }
+  catch (caught) { tracker.latch(caught); }
   let cleanupReceipt;
   let cleanupError;
   let cleanupTimer;
@@ -460,14 +591,22 @@ async function executeCase(prepare, testCase, context, tracker) {
   finally { clearTimeout(cleanupTimer); tracker.close(); }
   const cleanup = cleanupError ? { error: cleanupError.message } : cleanupReceipt;
   if (!cleanup || typeof cleanup !== "object") evidence = { ...(evidence ?? {}), cleanup: { error: "missing cleanup receipt" } };
-  else evidence = { ...(evidence ?? {}), cleanup, latencyMs: evidence?.latencyMs ?? Date.now() - started };
+  else evidence = { ...(evidence ?? {}), cleanup, latencyMs: evidence?.latencyMs ?? monotonicNowMs() - started };
   if (!settled || controller.signal.aborted) {
-    error ??= tracker.latch(controller.signal.reason ?? new Error("execution promise is not settled"));
+    const failure = tracker.latch(controller.signal.reason ?? new Error("execution promise is not settled"));
+    error ??= failure;
     evidence.cleanup = { ...evidence.cleanup, quiescent: false };
   }
   let hardLimits = { status: "unattested" };
-  try { hardLimits = checkBudgetAttestation(evidence.budgetAttestation, context.operationalBudget, evidence.cleanup, evidence.usage); }
-  catch (caught) { error ??= tracker.latch(caught); }
+  try {
+    if (businessFailure && evidence.cleanup?.quiescent !== true) {
+      throw new Error("business failure requires independently quiescent cleanup");
+    }
+    hardLimits = checkBudgetAttestation(evidence.budgetAttestation, context.operationalBudget, evidence.cleanup, evidence.usage);
+  } catch (caught) {
+    tracker.latch(caught);
+    error ??= tracker.failure;
+  }
   if (tracker.failure) {
     evidence = { ...evidence,
       ...(context.manifestInfo.version === 2 ? {} : { executionStatus: "infrastructure_blocked", businessResult: "failed" }),
@@ -577,14 +716,15 @@ export async function runAcceptance(argv = process.argv.slice(2)) {
       }
       let resources;
       let resourceError;
-      const tracker = makeBudgetTracker(testCase, globalCaps, globalUsed, { allowNarrowing: !!scope?.operationalBudget });
-      let admissionError = tracker.admit();
-      let operationalBudget;
-      const timeoutMs = Math.min(testCase.limits.timeoutMs, scope?.operationalBudget?.maxDurationMs ?? Number.MAX_SAFE_INTEGER);
-      if (!admissionError && scope?.operationalBudget) {
-        try { operationalBudget = allocateOperationalBudget(scope.operationalBudget, tracker.allocation, timeoutMs); }
-        catch (error) { admissionError = error.message; }
-      }
+      let allocation;
+      let admissionError;
+      try { allocation = resolveCaseBudgetAllocation(testCase, scope, { globalCaps, globalUsed }); }
+      catch (error) { admissionError = error.message; }
+      const { operationalBudget, attemptBudget, timeoutMs } = allocation ?? {};
+      const tracker = makeBudgetTracker(testCase, globalCaps, globalUsed, {
+        allowNarrowing: !!operationalBudget, operationalBudget, attemptBudget,
+      });
+      admissionError ??= tracker.admit();
       if (admissionError) {
         stopReason = admissionError;
         evidenceById.set(testCase.id, blockEvidence(admissionError));
@@ -614,13 +754,14 @@ export async function runAcceptance(argv = process.argv.slice(2)) {
         }
         checkDeadline(deadlineAtMs, timeoutMs, controller, testCase.id);
         await appendTrace(trace, { event: "case_started", caseId: testCase.id, agentProfile: testCase.agentProfile,
-          budgetAllocation: { semantics: "ceilings-only", usage: tracker.allocation, operationalBudget, timeoutMs },
+          budgetAllocation: { semantics: "ceilings-only", usage: tracker.allocation, operationalBudget, attemptBudget, timeoutMs },
           hardLimits: { status: "unattested" } });
         return { adapter, resources };
       }, testCase, {
         runId, runDir, manifestInfo, fixtureEvidence: testCase.fixtures?.evidence,
         budget: Object.freeze({ ...tracker.allocation }), timeoutMs,
-        ...(operationalBudget ? { operationalBudget: Object.freeze(operationalBudget) } : {}),
+        ...(operationalBudget ? { operationalBudget: Object.freeze(operationalBudget), caseBudget: Object.freeze(operationalBudget) } : {}),
+        ...(attemptBudget ? { attemptBudget: Object.freeze(attemptBudget) } : {}),
       }, tracker);
       if (resourceError && !result.controller.signal.aborted) {
         evidenceById.set(testCase.id, blockEvidence(`resource binding failed: ${resourceError.message}`,
@@ -638,32 +779,40 @@ export async function runAcceptance(argv = process.argv.slice(2)) {
         result.evidence = { ...result.evidence,
           ...(manifest.version === 2 ? {} : { executionStatus: "infrastructure_blocked", businessResult: "failed" }),
           policyFacts: { ...(result.evidence.policyFacts ?? {}), budgetError: reconcileErrors.join("; ") }, unknownEffects: true };
-        stopReason = reconcileErrors.join("; ");
+        stopReason ??= result.error?.message ?? reconcileErrors.join("; ");
       } else if (accounting.complete) {
         globalUsed = addUsage(globalUsed, result.evidence.usage);
       }
       if (result.uncertain) stopReason ??= result.error?.message ?? result.evidence?.cleanup?.error ?? "uncertain execution or cleanup state";
       if (corpusOracles && !result.uncertain && !reconcileErrors.length &&
           result.evidence.executionStatus !== "infrastructure_blocked") {
-        const reviewStartedAtMs = Date.now();
-        const reviewBudget = remaining(scope.reviewBudgets, reviewUsed);
+        const reviewStartedAtMs = monotonicNowMs();
+        let reviewAllocation;
+        let reviewAllocationError;
+        try { reviewAllocation = resolveCaseBudgetAllocation(testCase, scope, { review: true, globalUsed: reviewUsed }); }
+        catch (error) { reviewAllocationError = error; }
+        const reviewBudget = reviewAllocation?.budget ?? remaining(scope.reviewBudgets, reviewUsed, true);
+        const reviewOperationalBudget = reviewAllocation?.operationalBudget;
+        const reviewAttemptBudget = reviewAllocation?.attemptBudget;
         const reviewTracker = makeBudgetTracker({ id: `${testCase.id}:independent-review`,
-          limits: { usage: { ...reviewBudget, toolCalls: 0 } } }, scope.reviewBudgets, reviewUsed);
+          limits: { usage: { ...reviewBudget, toolCalls: 0 } } }, scope.reviewBudgets, reviewUsed, {
+          operationalBudget: reviewOperationalBudget, attemptBudget: reviewAttemptBudget, review: true,
+        });
         const controller = new AbortController();
         const reviewEntry = { caseId: testCase.id, tracker: reviewTracker, complete: false, settled: false, controller };
         reviewAccounting.push(reviewEntry);
+        let reviewFailure;
         try {
+          if (reviewAllocationError) throw reviewAllocationError;
           for (const field of ["modelRequests", "inputTokens", "outputTokens"]) {
             if (reviewBudget[field] < 1) throw new Error(`No independent review ${field} budget remains`);
           }
           if (reviewBudget.priced && reviewBudget.currencyMicros <= 0) {
             throw new Error("No independent review currency budget remains");
           }
-          const reviewTimeoutMs = Math.min(testCase.limits.timeoutMs,
-            scope.reviewOperationalBudget?.maxDurationMs ?? 120000);
-          const reviewDeadlineAtMs = deadlineAfter(reviewStartedAtMs, reviewTimeoutMs);
-          const reviewOperationalBudget = scope.reviewOperationalBudget ?
-            allocateOperationalBudget(scope.reviewOperationalBudget, reviewBudget, reviewTimeoutMs, { review: true }) : undefined;
+          const reviewTimeoutMs = reviewAllocation.timeoutMs;
+          const reviewDeadline = captureBudgetDeadline({ timeoutMs: reviewTimeoutMs }, reviewStartedAtMs);
+          const reviewDeadlineAtMs = reviewDeadline.deadlineMonotonicMs;
           const reviewExecution = Promise.resolve().then(async () => {
             try {
               checkDeadline(reviewDeadlineAtMs, reviewTimeoutMs, controller, `${testCase.id}:independent-review`);
@@ -677,7 +826,7 @@ export async function runAcceptance(argv = process.argv.slice(2)) {
               }
               await appendTrace(trace, { event: "independent_review_started", caseId: testCase.id,
                 budgetAllocation: { semantics: "ceilings-only", usage: reviewBudget,
-                  operationalBudget: reviewOperationalBudget, timeoutMs: reviewTimeoutMs },
+                  operationalBudget: reviewOperationalBudget, attemptBudget: reviewAttemptBudget, timeoutMs: reviewTimeoutMs },
                 hardLimits: { status: "unattested" } });
               checkDeadline(reviewDeadlineAtMs, reviewTimeoutMs, controller, `${testCase.id}:independent-review`);
               return await reviewer.reviewCase({
@@ -695,9 +844,16 @@ export async function runAcceptance(argv = process.argv.slice(2)) {
                 evidence: structuredClone(result.evidence),
                 resources: structuredClone(resources),
               }, {
-                runId, runDir, signal: controller.signal, timeoutMs: reviewTimeoutMs, deadlineAtMs: reviewDeadlineAtMs,
+                runId, runDir, signal: controller.signal, timeoutMs: reviewTimeoutMs, ...reviewDeadline,
                 budget: Object.freeze({ ...reviewBudget }),
-                ...(reviewOperationalBudget ? { operationalBudget: Object.freeze(reviewOperationalBudget) } : {}),
+                ...(reviewOperationalBudget ? { operationalBudget: Object.freeze(reviewOperationalBudget),
+                  caseBudget: Object.freeze(reviewOperationalBudget) } : {}),
+                ...(reviewAttemptBudget ? { attemptBudget: Object.freeze(reviewAttemptBudget) } : {}),
+                beforeDispatch(configured) {
+                  checkDeadline(reviewDeadlineAtMs, reviewTimeoutMs, controller, `${testCase.id}:independent-review`);
+                  try { assertBudgetFitsDeadline(configured, reviewDeadline); reviewTracker.beforeDispatch(configured); }
+                  catch (error) { controller.abort(error); throw error; }
+                },
                 async recordReviewCompletion(receipt) {
                   if (reviewEntry.settled || controller.signal.aborted || reviewTracker.failure) {
                     const error = reviewTracker.latch(new Error("review completion callback after accounting closed"));
@@ -721,9 +877,18 @@ export async function runAcceptance(argv = process.argv.slice(2)) {
           reviewExecution.catch(() => {});
           let review;
           try { review = await withTimeout(reviewExecution, reviewTimeoutMs, controller, `${testCase.id}:independent-review`, reviewDeadlineAtMs); }
+          catch (error) {
+            reviewFailure = reviewTracker.failure ?? error;
+            if (!["REVIEW_JSON_INVALID", "REVIEW_RECORD_INVALID"].includes(error.code)) throw error;
+            checkFailureRecovery(error, error, reviewOperationalBudget, reviewEntry.settled, controller, reviewTracker);
+            review = { usage: error.usage, budgetAttestation: error.budgetAttestation,
+              cleanup: error.cleanup, reviewer: error.reviewer };
+          }
           finally { reviewTracker.closeUsage(); }
+          reviewTracker.retainLowerBound(review);
           const reviewErrors = reviewTracker.reconcile(review?.usage);
           if (reviewErrors.length) throw new Error(reviewErrors.join("; "));
+          checkCompleteAccounting(review, review?.usage);
           controller.signal.throwIfAborted();
           if (review?.unknownEffects === true || review?.liveUnknown === true) {
             throw new Error("reviewer reported unknown post-dispatch state; usage and hard limits are unproven");
@@ -731,10 +896,13 @@ export async function runAcceptance(argv = process.argv.slice(2)) {
           reviewEntry.hardLimits = checkBudgetAttestation(review?.budgetAttestation, reviewOperationalBudget, review?.cleanup, review?.usage);
           reviewUsed = addUsage(reviewUsed, review.usage);
           reviewEntry.complete = true;
-          const grading = evaluateCorpusEvidence({
-            testCase, oracleCase: corpusOracles.cases[testCase.id],
-            evidence: result.evidence, semanticReview: review,
-          });
+          const grading = result.evidence.businessResult === "failed"
+            ? failedCorpusGrading(testCase, result.evidence, result.error ?? new Error("adapter reported business failure"), manifest.version, "execution")
+            : reviewFailure ? failedCorpusGrading(testCase, result.evidence, reviewFailure, manifest.version)
+              : evaluateCorpusEvidence({
+                testCase, oracleCase: corpusOracles.cases[testCase.id],
+                evidence: result.evidence, semanticReview: review,
+              });
           result.evidence = manifest.version === 2 ? { ...result.evidence, corpusGrading: grading } : {
             ...result.evidence, corpusGrading: grading,
             policyFacts: { ...result.evidence.policyFacts, ...grading.policyFacts },
@@ -745,7 +913,7 @@ export async function runAcceptance(argv = process.argv.slice(2)) {
         } catch (error) {
           reviewTracker.retainLowerBound(error);
           reviewTracker.latch(error);
-          stopReason ??= `independent review failed: ${error.message}`;
+          stopReason ??= `independent review failed: ${(reviewFailure ?? reviewTracker.failure).message}`;
           result.evidence = { ...result.evidence,
             ...(manifest.version === 2 ? { unknownEffects: true } : { executionStatus: "infrastructure_blocked", businessResult: "failed" }),
             policyFacts: { ...result.evidence.policyFacts, independentOracleEvaluated: false, blockedReason: stopReason } };

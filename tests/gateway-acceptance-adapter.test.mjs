@@ -3,11 +3,14 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import test from "node:test";
+import { performance } from "node:perf_hooks";
+import { inspect } from "node:util";
 import { createGatewayAcceptanceAdapter, nativeTurnEvidence, narrowOperationalBudget,
   readRuntimeBudgetProof, resolveConfiguredOperationalBudget, resolveDeadlineAtMs,
-  validateOperationalBudget, validateRuntimeBudgetProof } from "../scripts/lib/gateway-acceptance-adapter.mjs";
+  validateOperationalBudget, validateRuntimeBudgetProof, captureBudgetDeadline, remainingDeadlineMs,
+  assertBudgetFitsDeadline, preflightConfiguredOperationalBudget } from "../scripts/lib/gateway-acceptance-adapter.mjs";
 
-const root = resolve("artifacts", "gateway-acceptance-adapter-test");
+const root = resolve(process.env.DSH_ACCEPTANCE_TEST_ROOT ?? "artifacts", "gateway-acceptance-adapter-test");
 const usage = { input: 3, output: 2, cacheRead: 1, cacheWrite: 0 };
 const hash = (value) => createHash("sha256").update(value).digest("hex");
 const operationalBudget = { maxModelRequests: 4, maxInputTokens: 512, maxOutputTokens: 64,
@@ -30,8 +33,9 @@ function nativeRows(name = "read") {
 async function fixture(t, { finalText = "ok", tool = "read", dropFinal = false, runtimeBudget = false,
   contextWindow = 128, mutateProof, extraAttempt = false, unsupported = false, onSend,
   configured = false, runtimeCap = operationalBudget, byAgent, missingProof = false, sourceLedger,
-  providerUsage = usage, mode = "execute", assistantObservation = {}, extraEvents = [],
-  onCreate, onPrepare, onConnect, onHealthy, mutateAdmission, runtimeLedgerClass = sourceLedger, onRuntimeLedger } = {}) {
+  providerUsage = usage, mode = "execute", assistantObservation = {}, finalObservation = {}, extraEvents = [],
+  onCreate, onPrepare, onConnect, onHealthy, mutateAdmission, runtimeLedgerClass = sourceLedger, onRuntimeLedger,
+  canonicalText = "ok", projectedText, mutateBinding, mutateNativeRows } = {}) {
   const runDir = join(root, randomUUID());
   const nativeStateDir = join(runDir, "native");
   const sessionId = randomUUID();
@@ -102,29 +106,36 @@ async function fixture(t, { finalText = "ok", tool = "read", dropFinal = false, 
             append({ type: "request_settled", requestId: id, usage: providerUsage });
           };
           attempt("main", "main");
-          if (extraAttempt) attempt("maintenance", "compaction", providerUsage.output);
+          for (let index = 0; index < Number(extraAttempt); index++) {
+            attempt(index ? `maintenance-${index}` : "maintenance", "compaction", providerUsage.output * (index + 1));
+          }
           append({ type: "tool_started", callId: "call-1" });
           append({ type: "tool_settled", callId: "call-1" });
           append({ type: "settled", providerSettled: true, toolsSettled: true });
           mutateProof?.({ runtimeConfig, ledger: runtimeLedger });
           await writeProof();
         }
-        assistant = { role: "assistant", content: [{ type: "text", text: "ok" }],
+        assistant = { role: "assistant", content: [{ type: "text", text: canonicalText }],
           idempotencyKey: `${assistantKeyPrefix}${params.idempotencyKey}:assistant`, usage: providerUsage, ...assistantObservation };
         raw.push({ id: randomUUID(), parentId: raw.at(-1)?.id ?? null, type: "message", message: assistant });
-        await writeFile(join(directory, "binding.json"), JSON.stringify({
+        const binding = {
           status: "ready", lastRunId: params.idempotencyKey, sessionId: nativeSessionId,
+          consumedRunIds: [...completedRuns, params.idempotencyKey],
           taskPreparation: { state: { mode } },
-        }));
+        };
+        mutateBinding?.(binding);
+        await writeFile(join(directory, "binding.json"), JSON.stringify(binding));
         for (const event of extraEvents) {
           events.push(typeof event === "function" ? event(params) : event);
         }
         if (!dropFinal) events.push({ event: "chat", payload: { sessionKey: params.sessionKey,
-          runId: params.idempotencyKey, state: "final", message: { ...assistant, content: finalText } } });
+           runId: params.idempotencyKey, state: "final", ...finalObservation,
+          message: { ...assistant, content: typeof finalText === "function" ? finalText(params) : finalText } } });
         completedRuns.add(params.idempotencyKey);
         return { status: "started", runId: params.idempotencyKey };
       }
-      if (method === "chat.history") return { sessionId, messages: [assistant], inFlightRun: false };
+      if (method === "chat.history") return { sessionId,
+        messages: [projectedText === undefined ? assistant : { ...assistant, content: projectedText }], inFlightRun: false };
       if (method === "sessions.reset") {
         const resetId = `reset-${++resetCount}`;
         raw.push({ id: resetId, parentId: raw.at(-1)?.id ?? null, type: "reset", context: "clear", reason: params.reason });
@@ -141,7 +152,11 @@ async function fixture(t, { finalText = "ok", tool = "read", dropFinal = false, 
     async stopAndWait() {},
   };
   const adapter = await createGatewayAcceptanceAdapter({
-    config, events, readNativeRows: async () => nativeRows(tool),
+    config, events, readNativeRows: async () => {
+      const rows = nativeRows(tool);
+      mutateNativeRows?.(rows);
+      return rows;
+    },
     connectionFactory: async () => { await onConnect?.(); return { client, assertHealthy() { onHealthy?.(); },
       ...(runtimeBudget && !unsupported && !configured ? { prepareOperationalBudget: async (expected) => {
         await onPrepare?.(expected);
@@ -155,7 +170,7 @@ async function fixture(t, { finalText = "ok", tool = "read", dropFinal = false, 
     ...(configured ? { operationalBudget: { ...runtimeCap, maxDurationMs: 5000 } } : {}),
     reportUsage: (value) => reported.push(value),
     resources: { modelVisibleContext: "Address: selected file", observations: { hiddenMetadata: "not a prompt" } } };
-  return { adapter, context, calls, reported, config, directory, sessionId, hostConfig };
+  return { adapter, context, calls, reported, config, directory, sessionId, hostConfig, events };
 }
 
 test("task-only inputs use actual event, canonical and native evidence without double-counting usage", async (t) => {
@@ -198,6 +213,30 @@ function proofFixture() {
       { seq: 3, type: "settled", at: at + 3, providerSettled: true, toolsSettled: true },
     ] } };
 }
+
+test("settled native accounting does not use a later wall-clock reading as a TTL", () => {
+  const proof = proofFixture();
+  for (const entry of proof.ledger.entries) entry.at += 60000;
+  assert.equal(validateRuntimeBudgetProof(proof, { settled: true }).quiescent, true);
+  proof.ledger.entries = proof.ledger.entries.slice(0, 1);
+  assert.throws(() => validateRuntimeBudgetProof(proof, { settled: false }), /clock identity changed/);
+});
+
+test("malformed native tool JSON never leaks parser input into failure diagnostics", async (t) => {
+  const secret = "private-parser-input-sentinel";
+  const f = await fixture(t, { runtimeBudget: true, mutateNativeRows(rows) {
+    rows.find((row) => row.type === "tool/call").data.arguments = secret;
+  } });
+  await assert.rejects(f.adapter.executeCase(item(), f.context), (error) => {
+    assert.equal(error.message, "Invalid JSON in native evidence");
+    assert.ok(!JSON.stringify({ message: error.message, evidence: error.evidence }).includes(secret));
+    return true;
+  });
+  const ledger = await readFile(join(f.context.runDir, "gateway-acceptance-ledger.jsonl"), "utf8");
+  assert.ok(!ledger.includes(secret));
+  assert.equal(f.reported.length, 0);
+  assert.equal((await f.adapter.cleanupCase(item(), f.context)).quiescent, false);
+});
 
 test("runtime host-tool accounting excludes the internal preparation control but preserves its evidence", () => {
   const proof = validateRuntimeBudgetProof(proofFixture(), { settled: true });
@@ -301,6 +340,7 @@ test("first dispatch counts slow connection and session setup against the origin
     await t.test(setup, async (t) => {
       let now = 10000;
       t.mock.method(Date, "now", () => now);
+      t.mock.method(performance, "now", () => now);
       const f = await fixture(t, { configured: true, runtimeCap: configuredCap, [setup]: () => { now += 750; } });
       const result = await f.adapter.executeCase(item({ limits: { timeoutMs: 1000 } }), f.context);
       assert.equal(result.executionStatus, "infrastructure_blocked");
@@ -317,6 +357,7 @@ test("inherited deadlines cannot be extended by adapter entry", async (t) => {
     await t.test(String(inherited), async (t) => {
       let now = 10000;
       t.mock.method(Date, "now", () => now);
+      t.mock.method(performance, "now", () => now);
       const f = await fixture(t, { configured: true, runtimeCap: { ...configuredCap, maxDurationMs: 400 },
         onCreate: () => { now += 200; } });
       f.context.deadlineAtMs = inherited;
@@ -330,6 +371,7 @@ test("inherited deadlines cannot be extended by adapter entry", async (t) => {
 test("subsequent turns retain the original duration after actual first-turn consumption", async (t) => {
   let now = 10000;
   t.mock.method(Date, "now", () => now);
+  t.mock.method(performance, "now", () => now);
   const f = await fixture(t, { configured: true, runtimeCap: { ...configuredCap, maxDurationMs: 500 },
     onSend: () => { now += 600; } });
   f.context.operationalBudget = { ...operationalBudget, maxModelRequests: 20,
@@ -355,6 +397,7 @@ test("equal aggregate and configured durations require operator setup headroom e
 test("async preparation cannot dispatch a runtime admission whose duration no longer fits", async (t) => {
   let now = 10000;
   t.mock.method(Date, "now", () => now);
+  t.mock.method(performance, "now", () => now);
   const f = await fixture(t, { runtimeBudget: true, onPrepare: () => { now += 750; } });
   await assert.rejects(f.adapter.executeCase(item({ limits: { timeoutMs: 1000 } }), f.context),
     /Configured maxDurationMs.*remaining/);
@@ -366,6 +409,7 @@ test("send-boundary recheck rejects a budget that became stale after config chec
   let now = 10000;
   let checks = 0;
   t.mock.method(Date, "now", () => now);
+  t.mock.method(performance, "now", () => now);
   const f = await fixture(t, { configured: true, runtimeCap: { ...configuredCap, maxDurationMs: 500 },
     onHealthy: () => { if (++checks === 4) now += 600; } });
   const result = await f.adapter.executeCase(item({ limits: { timeoutMs: 1000 } }), f.context);
@@ -467,6 +511,133 @@ test("multiple configured turns can use a larger case allocation without widenin
   assert.equal(result.executionStatus, "completed");
   assert.equal(result.usage.modelRequests, 2);
   assert.deepEqual(result.budgetAttestation.proofs.map((proof) => proof.operationalBudget), [configuredCap, configuredCap]);
+});
+
+test("explicit case roots admit repeated native attempts without subtracting earlier turns from the attempt cap", async (t) => {
+  const native = { maxModelRequests: 8, maxInputTokens: 2000000, maxOutputTokens: 8000,
+    maxToolCalls: 12, maxDurationMs: 90000 };
+  const f = await fixture(t, { configured: true, runtimeCap: native, extraAttempt: 2 });
+  const root = { maxModelRequests: 24, maxInputTokens: 6000000, maxOutputTokens: 24000,
+    maxToolCalls: 36, maxDurationMs: 300000 };
+  const admitted = [];
+  Object.assign(f.context, { caseBudget: root, attemptBudget: native, operationalBudget: native,
+    budget: { inputTokens: 6000000, cacheReadTokens: 6000000, cacheWriteTokens: 6000000 },
+    beforeDispatch: (budget) => admitted.push(budget) });
+  const result = await f.adapter.executeCase(item({ turns: ["first", "second", "third"],
+    limits: { timeoutMs: 300000 } }), f.context);
+  assert.equal(result.executionStatus, "completed");
+  assert.equal(result.usage.modelRequests, 9);
+  assert.deepEqual(admitted, [native, native, native]);
+  assert.deepEqual(result.budgetAttestation.operationalBudget, root);
+  assert.deepEqual(result.budgetAttestation.proofs.map((proof) => proof.operationalBudget), admitted);
+});
+
+test("aggregate input prevents a second turn even when each separate input/cache field still fits", async (t) => {
+  const native = { ...configuredCap, maxInputTokens: 128 };
+  const f = await fixture(t, { configured: true, runtimeCap: native,
+    providerUsage: { input: 40, cacheRead: 40, cacheWrite: 40, output: 2 } });
+  Object.assign(f.context, {
+    caseBudget: { ...operationalBudget, maxInputTokens: 240 }, attemptBudget: native,
+    budget: { inputTokens: 240, cacheReadTokens: 240, cacheWriteTokens: 240 },
+  });
+  const result = await f.adapter.executeCase(item({ turns: ["first", "second"] }), f.context);
+  assert.equal(result.executionStatus, "infrastructure_blocked");
+  assert.equal(result.turns.length, 1);
+  assert.equal(result.usage.inputTokens + result.usage.cacheReadTokens + result.usage.cacheWriteTokens, 120);
+  assert.equal(f.calls.filter((call) => call.method === "chat.send").length, 1);
+});
+
+test("custom native admission stays inside an explicit attempt ceiling even under a larger root", async (t) => {
+  const attemptBudget = { ...configuredCap, maxModelRequests: 2, maxInputTokens: 256 };
+  const prepared = [];
+  const f = await fixture(t, { runtimeBudget: true, onPrepare: (expected) => prepared.push(expected.operationalBudget) });
+  Object.assign(f.context, { caseBudget: { ...operationalBudget, maxModelRequests: 16, maxInputTokens: 4096,
+    maxOutputTokens: 128, maxToolCalls: 8 },
+    attemptBudget });
+  const result = await f.adapter.executeCase(item({ turns: ["first", "second"] }), f.context);
+  assert.equal(result.executionStatus, "completed");
+  assert.deepEqual(prepared, [attemptBudget, attemptBudget]);
+  assert.ok(result.budgetAttestation.proofs.every((proof) =>
+    proof.operationalBudget.maxModelRequests === 2 && proof.operationalBudget.maxInputTokens === 256));
+});
+
+test("runner dispatch rejection stops Gateway model input at the native boundary", async (t) => {
+  const f = await fixture(t, { configured: true, runtimeCap: configuredCap });
+  f.context.beforeDispatch = () => { throw new Error("case pool exhausted"); };
+  const result = await f.adapter.executeCase(item(), f.context);
+  assert.equal(result.executionStatus, "infrastructure_blocked");
+  assert.match(result.policyFacts.blockedReason, /case pool exhausted/);
+  assert.equal(f.calls.filter((call) => call.method === "chat.send").length, 0);
+});
+
+test("idempotent transport replay reuses its admitted native attempt without authorizing another", async (t) => {
+  const f = await fixture(t, { configured: true, runtimeCap: { ...configuredCap, maxDurationMs: 500 } });
+  let admissions = 0;
+  f.context.beforeDispatch = () => {
+    assert.equal(++admissions, 1, "replay must not request a fresh turn allocation after settlement");
+  };
+  const result = await f.adapter.executeCase(item({
+    adapterControls: [{ type: "duplicate_inbound_delivery", appliesToTurn: 1, visibleToModel: false }],
+  }), f.context);
+  assert.equal(result.executionStatus, "completed");
+  assert.equal(admissions, 1);
+  assert.equal(result.usage.modelRequests, 1);
+  assert.equal(f.calls.filter((call) => call.method === "chat.send").length, 2);
+});
+
+test("captured legacy wall deadlines and dispatch margins use only monotonic elapsed time", (t) => {
+  let wall = 10000, monotonic = 1000;
+  t.mock.method(Date, "now", () => wall);
+  t.mock.method(performance, "now", () => monotonic);
+  const deadline = captureBudgetDeadline({ timeoutMs: 2000, deadlineAtMs: 11000 });
+  assert.equal(deadline.deadlineMonotonicMs, 2000);
+  wall = 100;
+  monotonic += 600;
+  assert.equal(remainingDeadlineMs(deadline), 400);
+  assertBudgetFitsDeadline({ maxDurationMs: 375 }, deadline);
+  assert.throws(() => assertBudgetFitsDeadline({ maxDurationMs: 376 }, deadline), /remaining duration/);
+  wall = 1000000;
+  assert.equal(remainingDeadlineMs(deadline), 400);
+  monotonic += 401;
+  assert.throws(() => assertBudgetFitsDeadline({ maxDurationMs: 1 }, deadline), /remaining duration/);
+});
+
+test("backward wall jumps cannot authorize a later Gateway turn after monotonic duration consumption", async (t) => {
+  let wall = 10000, monotonic = 1000;
+  t.mock.method(Date, "now", () => wall);
+  t.mock.method(performance, "now", () => monotonic);
+  const f = await fixture(t, { configured: true, runtimeCap: { ...configuredCap, maxDurationMs: 500 },
+    onSend: () => { monotonic += 600; wall -= 5000; } });
+  f.context.caseBudget = { ...operationalBudget, maxModelRequests: 16, maxInputTokens: 4096 };
+  f.context.deadlineAtMs = wall + 1000;
+  const result = await f.adapter.executeCase(item({ turns: ["first", "second"],
+    limits: { timeoutMs: 1000 } }), f.context);
+  assert.equal(result.turns.length, 1);
+  assert.equal(result.executionStatus, "infrastructure_blocked");
+  assert.match(result.policyFacts.blockedReason, /remaining/);
+  assert.equal(f.calls.filter((call) => call.method === "chat.send").length, 1);
+});
+
+test("offline preflight resolves installed exact-agent caps, full context, aggregate cache and headroom", () => {
+  const native = { ...configuredCap, maxInputTokens: 128 };
+  const hostConfig = { plugins: { entries: { "dsh-native": { config: {
+    operationalBudget, operationalBudgetByAgent: { "agent-a": native },
+  } } } } };
+  const args = { hostConfig, agentId: "agent-a", contextWindow: 128, timeoutMs: 2000,
+    caseBudget: { ...operationalBudget, maxInputTokens: 256 }, attemptBudget: native,
+    budget: { inputTokens: 256, cacheReadTokens: 256, cacheWriteTokens: 256 },
+    used: { inputTokens: 40, cacheReadTokens: 40, cacheWriteTokens: 40, modelRequests: 0,
+      outputTokens: 0, toolCalls: 0, userTurns: 0 } };
+  assert.deepEqual(preflightConfiguredOperationalBudget(args), native);
+  for (const change of [
+    { contextWindow: 129 },
+    { budget: { ...args.budget, inputTokens: 240 } },
+    { attemptBudget: { ...native, maxModelRequests: native.maxModelRequests - 1 } },
+    { timeoutMs: native.maxDurationMs },
+  ]) assert.throws(() => preflightConfiguredOperationalBudget({ ...args, ...change }));
+  assert.throws(() => preflightConfiguredOperationalBudget({ ...args, agentId: "agent-b" }), /Configured/);
+  assert.throws(() => preflightConfiguredOperationalBudget({ ...args,
+    used: { ...args.used, cacheReadTokens: -1 } }), /Invalid preflight usage/);
 });
 
 test("configured admission never attests to missing, mismatched, locked, or fenced post-run proof", async (t) => {
@@ -866,8 +1037,220 @@ test("live final/history disagreement remains failed and cannot produce a clean 
   assert.equal((await f.adapter.cleanupCase(item(), f.context)).cleaned, false);
 });
 
-test("explicit raw failed, infrastructure, and unknown statuses are never promoted by native mode", async (t) => {
-  for (const executionStatus of ["failed", "infrastructure_blocked", "unknown", undefined, null]) {
+test("settled exact-body mismatches retain failure, private diagnostics and once-only accounting", async (t) => {
+  const canonical = "PRIVATE-output-中🧪";
+  for (const suffix of ["\n", "\r\n", "\t", " ", "\n\n"]) {
+    await t.test(JSON.stringify(suffix), async (t) => {
+      const f = await fixture(t, { runtimeBudget: true, canonicalText: canonical, finalText: canonical + suffix });
+      const result = await f.adapter.executeCase(item(), f.context);
+      assert.equal(result.executionStatus, "failed");
+      assert.equal(result.businessResult, "failed");
+      assert.equal(result.outputText, canonical + suffix, "keep exact delivered bytes; do not trim or replace with canonical");
+      assert.equal(result.usage.modelRequests, 1);
+      assert.equal(result.budgetAttestation.status, "verified");
+      assert.equal(result.budgetAttestation.quiescent, true);
+      assert.deepEqual(f.reported, [result.usage]);
+      assert.equal(result.diagnosis.firstDiffUtf8Byte, Buffer.byteLength(canonical));
+      assert.equal(result.diagnosis.actual.utf8Bytes, Buffer.byteLength(canonical + suffix));
+      assert.equal(result.diagnosis.canonical.sha256, hash(canonical));
+      assert.equal(result.diagnosis.actual.whitespace.trailingUtf8Bytes, Buffer.byteLength(suffix));
+      assert.doesNotMatch(JSON.stringify({ error: result.error, diagnosis: result.diagnosis }), /PRIVATE-output|中|🧪/u);
+      const rows = (await readFile(join(f.context.runDir, "gateway-acceptance-ledger.jsonl"), "utf8"))
+        .trim().split("\n").map(JSON.parse);
+      assert.equal(rows.at(-1).event, "turn_settled");
+      assert.deepEqual(rows.at(-1).judgment, { status: "failed", diagnosis: result.diagnosis });
+      assert.doesNotMatch(JSON.stringify(rows), /PRIVATE-output|中|🧪/u);
+      assert.equal((await f.adapter.cleanupCase(item(), f.context)).quiescent, true);
+      await assert.rejects(readFile(join(f.context.runDir, "gateway-admission.lock")), { code: "ENOENT" });
+      const next = await f.adapter.executeCase(item({ id: `independent-${randomUUID()}` }), f.context);
+      assert.equal(next.businessResult, "failed", "independent work runs without promoting the mismatch");
+      assert.equal(f.reported.length, 2);
+    });
+  }
+});
+
+test("projection mismatch is a body failure, not missing provider accounting", async (t) => {
+  const f = await fixture(t, { runtimeBudget: true, projectedText: "ok\n" });
+  const result = await f.adapter.executeCase(item(), f.context);
+  assert.equal(result.diagnosis.code, "GATEWAY_PROJECTED_CANONICAL_MISMATCH");
+  assert.equal(result.businessResult, "failed");
+  assert.equal(result.budgetAttestation.status, "verified");
+  assert.equal(f.reported.length, 1);
+});
+
+test("body recovery requires independently known original execution and preparation semantics", async (t) => {
+  for (const [surface, body] of [
+    ["final", { finalText: "ok\n" }],
+    ["projection", { projectedText: "ok\n" }],
+  ]) {
+    const unknowns = [
+      ...["unknown", undefined, null, "future-status"].map((executionStatus) => [
+        `execution-${String(executionStatus)}`, { assistantObservation: { executionStatus } }, executionStatus, "execute",
+      ]),
+      ["unknown-stop", { assistantObservation: { executionStatus: "completed", stopReason: "unexpected" } }, "unknown", "execute"],
+      ["conflicting-raw-status", { assistantObservation: { executionStatus: "failed" },
+        finalObservation: { executionStatus: "unknown" } }, "unknown", "execute"],
+      ...["unknown", null, ""].flatMap((mode) => ["completed", "failed"].map((executionStatus) => [
+        `mode-${String(mode)}-${executionStatus}`, { mode, assistantObservation: { executionStatus } }, executionStatus, mode,
+      ])),
+      ["missing-mode", { assistantObservation: { executionStatus: "completed" },
+        mutateBinding: (binding) => { delete binding.taskPreparation; } }, "completed", undefined],
+    ];
+    for (const [name, options, executionStatus, mode] of unknowns) {
+      await t.test(`${surface}-${name}`, async (t) => {
+        const f = await fixture(t, { runtimeBudget: true, ...body, ...options });
+        const task = item({ turns: ["first", "must remain fenced"] });
+        await assert.rejects(f.adapter.executeCase(task, f.context), (error) => {
+          assert.equal(error.code, surface === "final" ?
+            "GATEWAY_FINAL_CANONICAL_MISMATCH" : "GATEWAY_PROJECTED_CANONICAL_MISMATCH");
+          assert.equal(error.evidence.turns.length, 1);
+          assert.equal(error.evidence.turns[0].executionStatus, executionStatus);
+          assert.equal(error.evidence.turns[0].mode, mode);
+          assert.equal(error.evidence.turns[0].outputSha256, hash(surface === "final" ? "ok\n" : "ok"));
+          assert.equal(error.evidence.turns[0].usage.modelRequests, 1);
+          assert.equal(error.evidence.budgetAttestation.status, "unproven");
+          assert.equal(error.evidence.budgetAttestation.quiescent, false);
+          assert.equal(error.budgetAccounting.observedLowerBound.modelRequests, 1);
+          assert.equal(error.budgetAccounting.unresolvedExposure.inputTokens > 0, true);
+          return true;
+        });
+        assert.deepEqual(f.reported, []);
+        const rows = (await readFile(join(f.context.runDir, "gateway-acceptance-ledger.jsonl"), "utf8"))
+          .trim().split("\n").map(JSON.parse);
+        assert.equal(rows.at(-1).event, "case_failed");
+        assert.equal(rows.some((row) => row.event === "turn_settled"), false);
+        assert.ok(await readFile(join(f.context.runDir, "gateway-admission.lock")));
+        const cleanup = await f.adapter.cleanupCase(task, f.context);
+        assert.equal(cleanup.cleaned, false);
+        assert.equal(cleanup.quiescent, false);
+        await assert.rejects(f.adapter.executeCase(item({ id: "next" }), f.context), /fenced/);
+        assert.equal(f.calls.filter((call) => call.method === "chat.send").length, 1);
+      });
+    }
+  }
+});
+
+test("known execution statuses and preparation modes still settle body-only failures", async (t) => {
+  for (const mode of ["chat", "clarify", "draft", "execute"]) {
+    for (const executionStatus of ["completed", "correctly_blocked", "failed", "infrastructure_blocked"]) {
+      await t.test(`${mode}-${executionStatus}`, async (t) => {
+        const f = await fixture(t, { runtimeBudget: true, finalText: "ok\n", mode,
+          assistantObservation: { executionStatus } });
+        const result = await f.adapter.executeCase(item(), f.context);
+        assert.equal(result.executionStatus, "failed");
+        assert.equal(result.businessResult, "failed");
+        assert.equal(result.turns[0].mode, mode);
+        assert.equal(result.budgetAttestation.status, "verified");
+        assert.equal(result.budgetAttestation.quiescent, true);
+        assert.equal(result.usage.modelRequests, 1);
+        assert.deepEqual(f.reported, [result.usage]);
+        const cleanup = await f.adapter.cleanupCase(item(), f.context);
+        assert.equal(cleanup.cleaned, true);
+        assert.equal(cleanup.quiescent, true);
+        await assert.rejects(readFile(join(f.context.runDir, "gateway-admission.lock")), { code: "ENOENT" });
+      });
+    }
+  }
+});
+
+test("success followed by a settled mismatched turn never double-reports or admits a third turn", async (t) => {
+  let sends = 0;
+  const f = await fixture(t, { runtimeBudget: true, finalText: () => ++sends === 1 ? "ok" : "ok\n" });
+  const result = await f.adapter.executeCase(item({ turns: ["first", "second", "must not send"] }), f.context);
+  assert.equal(result.turns.length, 2);
+  assert.equal(result.usage.modelRequests, 2);
+  assert.equal(result.usage.inputTokens, 6);
+  assert.equal(result.usage.userTurns, 2);
+  assert.equal(result.budgetAttestation.proofs.length, 2);
+  assert.equal(f.reported.length, 2);
+  assert.equal(f.calls.filter((call) => call.method === "chat.send").length, 2);
+  assert.equal((await f.adapter.cleanupCase(item(), f.context)).quiescent, true);
+});
+
+test("mismatch proof gaps and fenced bindings cannot be converted to complete accounting", async (t) => {
+  for (const [name, options] of [
+    ["no proof", { configured: true, runtimeCap: configuredCap, missingProof: true }],
+    ["foreign run", { runtimeBudget: true, mutateProof: ({ runtimeConfig, ledger }) => {
+      runtimeConfig.runId = ledger.runId = "other"; ledger.configSha256 = hash(JSON.stringify(runtimeConfig));
+    } }],
+    ["foreign session", { runtimeBudget: true, mutateProof: ({ runtimeConfig, ledger }) => {
+      runtimeConfig.sessionKey = ledger.sessionKey = "other"; ledger.configSha256 = hash(JSON.stringify(runtimeConfig));
+    } }],
+    ["foreign agent", { runtimeBudget: true, mutateProof: ({ runtimeConfig, ledger }) => {
+      runtimeConfig.agentId = ledger.agentId = "other"; ledger.configSha256 = hash(JSON.stringify(runtimeConfig));
+    } }],
+    ["pending", { runtimeBudget: true, mutateProof: ({ ledger }) => ledger.entries.splice(2) }],
+    ["fenced binding", { runtimeBudget: true, mutateBinding: (binding) => { binding.budgetFailure = {}; } }],
+    ["unconsumed binding", { runtimeBudget: true, mutateBinding: (binding) => { delete binding.consumedRunIds; } }],
+  ]) {
+    await t.test(name, async (t) => {
+      const f = await fixture(t, { ...options, finalText: "ok\n" });
+      await assert.rejects(f.adapter.executeCase(item(), f.context), (error) => {
+        assert.equal(error.budgetAccounting.usageStatus, "unknown");
+        assert.equal(error.evidence.budgetAttestation.status, "unproven");
+        assert.equal(error.budgetAccounting.unresolvedExposure.inputTokens > 0, true);
+        if (name !== "fenced binding") assert.match(error.message, /differs from committed/);
+        return true;
+      });
+      assert.equal(f.reported.length, 0);
+      assert.equal((await f.adapter.cleanupCase(item(), f.context)).quiescent, false);
+    });
+  }
+});
+
+test("a usage callback that throws after recording cannot be retried by mismatch recovery", async (t) => {
+  const f = await fixture(t, { runtimeBudget: true, finalText: "ok\n" });
+  const report = f.context.reportUsage;
+  f.context.reportUsage = (value) => { report(value); throw new Error("accounting callback failed"); };
+  await assert.rejects(f.adapter.executeCase(item(), f.context), (error) => {
+    assert.match(error.message, /differs from committed/);
+    assert.equal(error.budgetAccounting.usageStatus, "unknown");
+    return true;
+  });
+  assert.equal(f.reported.length, 1);
+  assert.equal((await f.adapter.cleanupCase(item(), f.context)).quiescent, false);
+});
+
+test("late owned terminal events invalidate mismatch recovery without a second usage callback", async (t) => {
+  for (const state of ["aborted", "error", "final"]) {
+    await t.test(state, async (t) => {
+      const f = await fixture(t, { runtimeBudget: true, finalText: "ok\n" });
+      const report = f.context.reportUsage;
+      f.context.reportUsage = (value) => {
+        report(value);
+        const final = f.events.find((frame) => frame.payload.state === "final");
+        f.events.push({ event: "chat", payload: { ...final.payload, state } });
+      };
+      await assert.rejects(f.adapter.executeCase(item(), f.context), (error) => {
+        assert.match(error.message, /differs from committed/);
+        assert.equal(error.budgetAccounting.usageStatus, "unknown");
+        assert.equal(error.budgetAccounting.unresolvedExposure.inputTokens > 0, true);
+        return true;
+      });
+      assert.equal(f.reported.length, 1);
+      assert.equal((await f.adapter.cleanupCase(item(), f.context)).quiescent, false);
+      await assert.rejects(f.adapter.executeCase(item({ id: "after-late-frame" }), f.context), /fenced/);
+    });
+  }
+});
+
+test("unrecoverable mismatch errors contain fingerprints rather than private turn bodies", async (t) => {
+  const secret = "PRIVATE-output-token-中🧪";
+  const f = await fixture(t, { configured: true, runtimeCap: configuredCap, missingProof: true,
+    canonicalText: secret, finalText: `${secret}\n` });
+  await assert.rejects(f.adapter.executeCase(item({ prompt: "PRIVATE-prompt-do-not-log" }), f.context), (error) => {
+    assert.equal(error.code, "GATEWAY_FINAL_CANONICAL_MISMATCH");
+    assert.equal(error.budgetAccounting.usageStatus, "unknown");
+    assert.doesNotMatch(inspect(error, { depth: null }), /PRIVATE-output|PRIVATE-prompt|中|🧪/u);
+    assert.equal(error.evidence.turns[0].outputSha256, hash(`${secret}\n`));
+    return true;
+  });
+  const ledger = await readFile(join(f.context.runDir, "gateway-acceptance-ledger.jsonl"), "utf8");
+  assert.doesNotMatch(ledger, /PRIVATE-output|PRIVATE-prompt|中|🧪/u);
+});
+
+test("explicit raw failed and infrastructure statuses are never promoted by native mode", async (t) => {
+  for (const executionStatus of ["failed", "infrastructure_blocked"]) {
     const f = await fixture(t, { assistantObservation: { executionStatus }, mode: "clarify" });
     const task = item({ turns: ["Original prompt", "Must not overwrite the first failure"] });
     Object.defineProperty(task, "expected", { get() { throw new Error("DUT cannot see oracle"); } });
@@ -886,11 +1269,38 @@ test("explicit raw failed, infrastructure, and unknown statuses are never promot
 });
 
 test("abnormal raw stop reasons are not inferred as semantic completion", async (t) => {
-  for (const stopReason of ["error", "aborted", "unexpected"]) {
+  for (const stopReason of ["error", "aborted"]) {
     const f = await fixture(t, { assistantObservation: { stopReason, executionStatus: "completed" } });
     const result = await f.adapter.executeCase(item(), f.context);
-    assert.equal(result.executionStatus, stopReason === "unexpected" ? "unknown" : "failed");
+    assert.equal(result.executionStatus, "failed");
     assert.equal(result.businessResult, "failed");
+  }
+});
+
+test("exact bodies cannot release unknown execution or preparation semantics either", async (t) => {
+  for (const [name, options, executionStatus] of [
+    ...["unknown", undefined, null].map((executionStatus) => [
+      `execution-${String(executionStatus)}`, { assistantObservation: { executionStatus } }, executionStatus,
+    ]),
+    ["stop", { assistantObservation: { stopReason: "unexpected", executionStatus: "completed" } }, "unknown"],
+    ["mode", { mode: "unknown", assistantObservation: { executionStatus: "completed" } }, "completed"],
+  ]) {
+    await t.test(name, async (t) => {
+      const f = await fixture(t, { runtimeBudget: true, ...options });
+      await assert.rejects(f.adapter.executeCase(item(), f.context), (error) => {
+        assert.equal(error.evidence.turns[0].executionStatus, executionStatus);
+        assert.equal(error.evidence.budgetAttestation.quiescent, false);
+        assert.equal(error.budgetAccounting.observedLowerBound.modelRequests, 1);
+        assert.ok(error.budgetAccounting.unresolvedExposure.inputTokens > 0);
+        return true;
+      });
+      assert.deepEqual(f.reported, []);
+      const rows = (await readFile(join(f.context.runDir, "gateway-acceptance-ledger.jsonl"), "utf8"))
+        .trim().split("\n").map(JSON.parse);
+      assert.equal(rows.some((row) => row.event === "turn_settled"), false);
+      assert.equal((await f.adapter.cleanupCase(item(), f.context)).cleaned, false);
+      await assert.rejects(f.adapter.executeCase(item({ id: "next" }), f.context), /fenced/);
+    });
   }
 });
 
@@ -935,7 +1345,7 @@ test("fallback lifecycle events fail closed instead of certifying enforced-mode 
   await assert.rejects(f.adapter.executeCase(item(), f.context), (error) => {
     assert.match(error.message, /fallback|Owned Gateway turn failed/);
     assert.equal(error.evidence.executionStatus, "infrastructure_blocked");
-    assert.equal(error.evidence.turns[0].prompt, item().prompt);
+    assert.equal(error.evidence.turns[0].prompt, undefined, "errors must not retain prompt contents");
     assert.equal(error.evidence.turns[0].executionStatus, "infrastructure_blocked");
     assert.equal(error.evidence.turns[0].terminalEvent.payload.data.phase, "fallback");
     assert.equal(error.budgetAccounting.usageStatus, "unknown");

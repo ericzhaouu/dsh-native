@@ -1,4 +1,4 @@
-DSH NATIVE FOR OPENCLAW -- RELEASE CANDIDATE 1.0.0-rc.2 (NOT STABLE)
+DSH NATIVE FOR OPENCLAW -- RELEASE CANDIDATE 1.0.0-rc.3 (NOT STABLE)
 
 Source: https://github.com/ericzhaouu/dsh-native
 Author: https://github.com/ericzhaouu
@@ -7,6 +7,84 @@ Plugin / harness ID: dsh-native
 Example Agent: dsh-experiment
 License: MIT; Copyright (c) 2026 ericzhaouu.
 The Chinese README.md contains the complete guide.
+
+MODE, FINAL TEXT AND CAMPAIGN CONTROL (1.0.0-rc.3)
+
+This is source-candidate preparation, not a stable release, production deployment
+or an acceptance pass report. Dependency versions remain pinned. Real-model,
+Feishu/write, full-corpus and remote-CI gates require fresh candidate evidence.
+Existing native read-only source acceptance, current-source delivery routing,
+unconfigured defaults and unrelated business/read-only Agents remain unchanged.
+
+A question addressed to the user now, including exploring an idea together, is
+chat, not a draft or blocking clarification merely because unknowns remain.
+Question templates/interview scripts for later use are drafts; missing material
+or authority for a requested verification/action can require clarify. Ordinary
+chat questions do not consume the blocking-clarification count. Do not claim
+unread Skills, unretrieved sources or human review were used. Non-execution modes
+remain tool-free. Exact overrides and the default-off Bitable gate below are not
+new authority: stock prepareNativeHost supplies no Bitable capabilities, so
+production Bitable access stays fail-closed.
+
+DSH-ONLY CHAT-FINAL-TEXT COMPANION
+
+RC3 additionally requires host-patch\chat-final-text for agent-pinned native chat
+final text. Missing/partial/modified support fails at read-only preflight before
+model execution; it is never automatically applied. Only trusted runs for Agents
+explicitly pinned to runtime.type:"embedded", runtime.harness:"dsh-native" retain
+ordinary body whitespace. Text blocks concatenate without inserted newlines.
+Whitespace-only output remains hidden; control-token, heartbeat and redaction
+rules remain. Non-DSH projection is unchanged; legacy model-selected DSH retains
+its prior projection without this byte guarantee.
+
+It is independent of source-reply ownership and table formatting, and adds no
+message target, source routing or tool permission. See
+host-patch\chat-final-text\USAGE.txt and spec.mjs for scope and pinned host files.
+For an exact OpenClaw 2026.9.2 installation, stop/drain the Gateway in an exclusive
+offline maintenance window before apply/restore; these are templates, not a
+record that this candidate was deployed:
+
+  node host-patch\chat-final-text\apply.mjs --root C:\PATH\TO\openclaw --check
+  node host-patch\chat-final-text\apply.mjs --root C:\PATH\TO\openclaw --apply --offline-confirmed
+  # Only when rolling back, in the same offline conditions:
+  node host-patch\chat-final-text\apply.mjs --root C:\PATH\TO\openclaw --restore --offline-confirmed
+
+Keep the independent .dsh-native-chat-final-text-patch-v1 receipt and coordinate
+plugin rollback. The script does not restart the Gateway; existing source-reply,
+table-policy and group-readonly responsibilities/defaults remain unchanged.
+
+EXACT AGENT TOOL OVERRIDES / RESOURCE GATE
+
+plugins.entries.dsh-native.config.toolAllowlistByAgent maps exact trusted Agent
+IDs to replacement DSH candidate lists; [] means none. Unmatched Agents retain
+legacy defaults and bindings. No wildcards, duplicates, prototype keys or prompt
+identity. Host global/Agent/channel/session policies and execution/preparation
+gates remain ceilings. Implicit preparation executionTools follows the selected
+list; explicitly configured executionTools is never expanded. Memory stays
+read/write-only; isolated completion and compaction stay tool-free.
+
+bitablePolicyByAgent is default-off. It requires a matching override limited to
+feishu_bitable_get_record / feishu_bitable_update_record, exact plugin source,
+accountId, groupId, appToken, tableId, recordIds, exact field names/value types,
+operations, and maxBatchSize:1. No list/create/batch/delete/admin/permission,
+account redirect, exec, generic HTTP or field-ID aliases. Readback uses the same
+target gate and projects only permitted fields. See README for the full JSON.
+
+Production writes remain BLOCKED: the inspected exact SDK exposes attempt context
+fields and an external Feishu catalog, not a verified Bitable account/resource
+grant contract. createNativeToolHost's internal bitableScope.capabilities seam
+requires host-attested, original-instance BitableToolCapability objects with a
+live assertCurrent(), exact Agent/account/group/run/session/request, external_user
+foreground provenance and the feishu-bitable-record-v1 contract. Stock
+prepareNativeHost deliberately supplies no such capabilities. Do not manufacture
+them from prompts or copy attempt hints as proof. Verify the installed Feishu
+contract and trusted ingress/account binding before main-session production
+wiring; unsupported context stays fail-closed. Tests use synthetic resources only.
+
+toolPolicyFingerprint binds only the selected Agent's effective new policy.
+Adding/changing/removing that policy requires /new or a trusted clear-reset epoch,
+including compaction/recovery; unrelated Agents' old bindings need no migration.
+Do not append Bitable tools globally or modify existing business/readonly Agents.
 
 ROOT REPAIRS AND DIAGNOSTICS (1.0.0-rc.2)
 
@@ -360,6 +438,84 @@ Dry-run acceptance wiring is intentionally thin:
 
 That forwards to scripts\run-acceptance.mjs --dry-run. The manifest format,
 fixtures and live execution contract are owned by the acceptance runner.
+
+RC3 V4 / WAITING AND RESUMING CAMPAIGNS (SOURCE CHECKOUT ONLY)
+
+The scripts/corpus below are source-checkout tools, not general commands bundled
+in the npm package. Inspect their actual --help before preparing private config:
+
+  node scripts\compile-acceptance.mjs --help
+  node scripts\run-acceptance.mjs --help
+  node scripts\run-acceptance-campaign.mjs --help
+
+Explicit --source-corpus-version 4 --contract-version 2 selects reviewed deltas in
+tests\acceptance\cases\v4\single-turn.json, multi-turn.json, feishu-canary.json and
+review-map.json. Source-v4 is not expectation contract 4. Defaults remain
+source-v1/contract-v2; v1-v3 source history and old reports are not regraded.
+The following only compiles/plans, never certifies a model or channel:
+
+  node scripts\compile-acceptance.mjs --output-root C:\PRIVATE\rc3-v4-plan --source-corpus-version 4 --contract-version 2
+  node scripts\run-acceptance.mjs --manifest C:\PRIVATE\rc3-v4-plan\manifest.json --run-root C:\PRIVATE\rc3-v4-plan\runs --dry-run
+
+Use a new private absolute output directory. Freeze source, built runtime/host
+dist and dependency artifacts before campaign prepare; metadata changes invalidate
+old pins. Explicit private config supplies adapter, independent reviewer,
+manifest/oracles, authorized scope, health endpoint, env and SHA-256 pins.
+There is no ambient runner environment or credential discovery. The campaign root
+must be outside sourceRoot; provision Windows private ACLs externally.
+
+These are authorized-run templates, NOT actions performed by release preparation;
+start/resume may dispatch model requests:
+
+  node scripts\run-acceptance-campaign.mjs prepare --config C:\PRIVATE\rc3-campaign-config.json
+  node scripts\run-acceptance-campaign.mjs start --root C:\PRIVATE\rc3-campaign --detach
+  node scripts\run-acceptance-campaign.mjs status --root C:\PRIVATE\rc3-campaign
+  # After auditing the old execution and deciding recovery is appropriate:
+  node scripts\run-acceptance-campaign.mjs resume --root C:\PRIVATE\rc3-campaign --detach
+
+--detach is only for start/resume; no --wait, --budget or --timeout flag exists.
+Health/budget settings are JSON fields documented by --help. Only typed transient
+health faults retry; auth/config failures do not. Consecutive good samples default
+to 3 (minimum 3); health.totalWaitMs expiration persists paused/health-wait-expired,
+not a Gateway restart or a hard bound on all static work.
+
+start never reclaims a claim. resume audits controller/child PID plus OS start
+identity, journal, receipts, report and dispatch ledger. An old heartbeat alone
+is not proof of exit. Started, successful or unknown cases are not replayed.
+Complete evidence may settle old execution; uncertainty remains fenced.
+
+Foreground completed exits 0, paused/failed exit 1; completed may include settled
+failed/blocked cases. Detached launch-requested or a successful status query is
+not proof of a running controller or acceptance success. Inspect campaign.json,
+pins.json, status.json, controller.jsonl, receipts and the actual case run's
+report.json / applicable gateway-acceptance-ledger.jsonl. Budget events live in
+controller.jsonl, not a separate budget.json. Do not delete evidence or locks.
+
+RC3 BUDGET BOUNDARIES
+
+Private runner scope separates caseBudget/attemptBudget and
+reviewCaseBudget/reviewAttemptBudget, with an independent reviewBudgets pool.
+Explicit case roots override legacy operationalBudget/reviewOperationalBudget;
+those legacy keys can then provide an attempt ceiling fallback. Unconfigured
+legacy/default runs remain unattested. Allocations never install native caps.
+
+The built-in campaign policy requires budget.accountRoot plus pinned authorization
+and verified baseline files. Reuse that shared account across campaigns; never
+copy/reset it to replenish authorization. Reserve T DUT attempts plus one reviewer
+before child dispatch. Shared userTurns counts DUT inputs only; physical requests
+and tokens from both pools count. Input plus cache-read/cache-write is charged
+once to one aggregate input ceiling, not three or six authorizations. Prior actual
+usage and retained exposure both consume the same account.
+
+prepare/start preflight effective global/exact-Agent caps offline, with explicit
+full contextWindow for primary and every fallback model. Every dispatch still
+needs runtime limits that fit remaining case/campaign allocation and duration.
+budget.caseSetupMs and reviewSetupMs must each be integers >25; runnerTimeoutMs
+must exceed DUT/reviewer durations plus their setup headroom. These do not widen
+native limits. runnerTimeoutMs expiration does not kill the child or prove remote
+quiescence; unresolved execution pauses and retains exposure. Static preflight
+does not replace runtime ledger, complete accounting and quiescent cleanup proof.
+Unknown usage is not zero; measured overage is not clipped, overflow fails closed.
 
 The GitHub workflow runs only the pure Node checker fixture job by default on pull
 requests across Windows/Ubuntu and Node 22.23.1/24.15.0. This isolated gate does

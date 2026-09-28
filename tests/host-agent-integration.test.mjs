@@ -5,6 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import test from "node:test";
+import { patchHost as checkChatFinalText } from "../host-patch/chat-final-text/apply.mjs";
+import { edits as chatFinalTextEdits } from "../host-patch/chat-final-text/spec.mjs";
 import { createPatchedHostFixture, projectRoot } from "./fixtures/patched-host.mjs";
 import { startResponsesServer } from "./fixtures/responses-server.mjs";
 
@@ -33,7 +35,15 @@ test("real patched host fixes runtime per Agent while inheriting models and refu
   };
   let model;
   try {
+    const sourceFiles = await Promise.all(chatFinalTextEdits.map(async ({ file }) => {
+      const path = join(projectRoot, "node_modules", "openclaw", ...file.split("/"));
+      return { path, bytes: await readFile(path) };
+    }));
     const { host, plugin } = await createPatchedHostFixture(root);
+    assert.equal((await checkChatFinalText(host, { action: "check" })).status, "applied");
+    for (const { path, bytes } of sourceFiles) {
+      assert.deepEqual(await readFile(path), bytes, "Fixture patching must not modify the installed SDK");
+    }
     await Promise.all(["home", "state", "workspace", "main-workspace", "agent"].map((dir) => mkdir(join(root, dir))));
     model = await startResponsesServer(async ({ body, text, finish, response }) => {
       if (body.model === "gpt-unavailable") {

@@ -171,7 +171,7 @@ function isAllowedPackageFile(path) {
   if (/^package\/examples\/[A-Za-z0-9._-]+\.json$/.test(path)) return true;
   if (/^package\/host-patch\/(?:apply|spec|engine)\.mjs$/.test(path)) return true;
   if (/^package\/host-patch\/compact-auth\/(?:apply|spec)\.mjs$/.test(path)) return true;
-  if (/^package\/host-patch\/(?:source-reply|table-policy|group-readonly)\/(?:(?:apply|spec)\.mjs|USAGE\.txt)$/.test(path)) return true;
+  if (/^package\/host-patch\/(?:source-reply|table-policy|chat-final-text|group-readonly)\/(?:(?:apply|spec)\.mjs|USAGE\.txt)$/.test(path)) return true;
   if (path === "package/host-patch/USAGE.txt") return true;
   if (path === "package/scripts/inspect-state.mjs") return true;
   return false;
@@ -326,9 +326,10 @@ export async function checkPackage(options) {
   } else if (byPath.get("package/host-patch/apply.mjs")?.data.toString("utf8").includes("./engine.mjs")) {
     requireFile(byPath, findings, "package/host-patch/engine.mjs");
   }
-  for (const name of ["source-reply", "table-policy"]) {
+  for (const name of ["source-reply", "table-policy", "chat-final-text"]) {
     const files = ["apply.mjs", "spec.mjs", "USAGE.txt"].map((file) => `package/host-patch/${name}/${file}`);
-    if (files.some((path) => byPath.has(path)) || byPath.has("package/dist/native/source-reply-ownership.js")) {
+    if (files.some((path) => byPath.has(path)) || byPath.has("package/dist/native/source-reply-ownership.js") ||
+        name === "chat-final-text" && byPath.has("package/dist/native/harness.js")) {
       for (const path of [...files, "package/host-patch/engine.mjs"]) requireFile(byPath, findings, path);
     }
   }

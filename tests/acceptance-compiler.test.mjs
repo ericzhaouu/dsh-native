@@ -150,13 +150,13 @@ test("CLI help separates source selection from the expectation contract and reje
   assert.equal(help.sourceVersions[2], "approved-v2");
   assert.equal(help.sourceVersions[3], "approved-v3");
   assert.deepEqual(await compileAcceptance(["-h"]), help);
-  for (const sourceCorpusVersion of [0, 4, "2", NaN, null]) {
+  for (const sourceCorpusVersion of [0, 5, "2", NaN, null]) {
     await assert.rejects(compileCorpus({ sourceCorpusVersion }), /Unsupported source corpus version/);
   }
   await assert.rejects(compileCorpus({ sourceCorpusVersion: 2, contractVersion: 1 }),
     /approved-v2 requires expectation contract version 2/);
   const unused = resolve("artifacts", `invalid-source-${randomUUID()}`);
-  for (const value of ["0", "4", "unknown", undefined]) {
+  for (const value of ["0", "5", "unknown", undefined]) {
     await assert.rejects(compileAcceptance([
       "--output-root", unused, "--source-corpus-version", ...(value === undefined ? [] : [value]),
     ]), /Unsupported source corpus version/);

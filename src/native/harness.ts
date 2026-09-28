@@ -7,7 +7,7 @@ import { NativeHostCleanupError, prepareNativeHost, type NativeHost } from "./ho
 import { nativeSupports, resolveNativeRoute } from "./route.js";
 import { prepareNativeTranscript, readNativeMaintenanceContext } from "./transcript.js";
 import { prepareNativeContinuity } from "./continuity.js";
-import { resolvePreparationPolicy } from "../preparation.js";
+import { hasAgentToolPolicy, resolveAgentToolPolicy } from "../tool-policy.js";
 import { createPreparationGate } from "./preparation.js";
 import {
   isNativeMemoryAttempt, renderMemoryPrompt, MEMORY_OUTPUT_TOKENS, MEMORY_TIMEOUT_MS, MEMORY_TOOL_LIMIT,
@@ -19,6 +19,7 @@ import {
 import { assertSourceReplySettled, beginSourceReplyJournal } from "./delivery-journal.js";
 import { prepareSourceReplyOwnership } from "./source-reply-ownership.js";
 import { rethrowBudgetFailure } from "../bridge/budget-terminal.js";
+import { assertFinalTextCompanion } from "./final-text.js";
 
 type Attempt = Parameters<AgentHarnessV2["runAttempt"]>[0];
 type Result = Awaited<ReturnType<AgentHarnessV2["runAttempt"]>>;
@@ -33,7 +34,7 @@ type LifecycleSdk = Pick<Sdk, "setActiveEmbeddedRun" | "clearActiveEmbeddedRun" 
   "awaitAgentHarnessAgentEndHook" | "runAgentHarnessBeforeAgentFinalizeHook">;
 
 export interface NativeHarnessDependencies {
-  loadSdk(): Promise<LifecycleSdk>;
+  loadSdk(attempt?: Attempt): Promise<LifecycleSdk>;
   prepareHost: typeof prepareNativeHost;
   prepareTranscript: typeof prepareNativeTranscript;
   prepareContinuity?: typeof prepareNativeContinuity;
@@ -44,7 +45,24 @@ export interface NativeHarnessDependencies {
 }
 
 const defaults: NativeHarnessDependencies = {
-  loadSdk: () => import("openclaw/plugin-sdk/agent-harness-runtime"),
+  loadSdk: async (attempt) => {
+    const sdk = await import("openclaw/plugin-sdk/agent-harness-runtime");
+    if (attempt) {
+      const { sessionAgentId } = sdk.resolveSessionAgentIds({
+        config: attempt.config, agentId: attempt.agentId, sessionKey: attempt.sessionKey,
+      });
+      const runtime = attempt.config?.agents?.entries?.[sessionAgentId]?.runtime as
+        { type?: string; harness?: string } | undefined;
+      if (runtime?.type === "embedded" && runtime.harness === RUNTIME_ID) {
+        try { await assertFinalTextCompanion(); }
+        catch (cause) {
+          throw new sdk.AgentHarnessPreflightError(
+            "dsh-native: chat-final-text companion required; apply it offline and restart the Gateway", { cause });
+        }
+      }
+    }
+    return sdk;
+  },
   prepareHost: prepareNativeHost,
   prepareTranscript: prepareNativeTranscript,
   prepareContinuity: prepareNativeContinuity,
@@ -308,7 +326,13 @@ export function createNativeHarness(
 
     try {
       try {
-        assertNativeAttemptSupported(p, config.toolAllowlist);
+        if (hasAgentToolPolicy(config) && !p.agentId) {
+          if (!p.sessionKey) failure("scoped tools require a host-resolved Agent identity");
+          sdk = await dependencies.loadSdk(p);
+          p = { ...p, agentId: sdk.resolveSessionAgentIds({ config: p.config, sessionKey: p.sessionKey }).sessionAgentId };
+        }
+        const toolPolicy = resolveAgentToolPolicy(config, p.agentId);
+        assertNativeAttemptSupported(p, toolPolicy.toolAllowlist);
         memory = isNativeMemoryAttempt(p);
         if (disposed) failure("harness is disposed");
         if (active.has(p.sessionId)) failure("another DSH native attempt owns this session");
@@ -327,7 +351,7 @@ export function createNativeHarness(
         timer = setTimeout(expire, Math.max(0, deadlineAtMs - Date.now()));
         p.onAttemptDeadlineChanged?.({ kind: "bounded", deadlineAtMs });
         p.onAttemptTimeoutArmed?.();
-        sdk = await dependencies.loadSdk();
+        sdk ??= await dependencies.loadSdk(p);
         assertActive();
         if ((config.taskPreparation || config.operationalBudgetByAgent) && !p.agentId) {
           const { sessionAgentId } = sdk.resolveSessionAgentIds({ config: p.config, sessionKey: p.sessionKey });
@@ -336,7 +360,7 @@ export function createNativeHarness(
         const route = resolveNativeRoute(p, config, sdk.getModelProviderRequestTransport);
         if (memory) route.maxTokens = Math.min(route.maxTokens ?? MEMORY_OUTPUT_TOKENS, MEMORY_OUTPUT_TOKENS);
         executedModel = { provider: p.provider, model: route.modelId };
-        const preparationPolicy = memory ? undefined : resolvePreparationPolicy(config.taskPreparation, p.agentId ?? "");
+        const preparationPolicy = memory ? undefined : resolveAgentToolPolicy(config, p.agentId).preparationPolicy;
         if (preparationPolicy && p.inputProvenance && p.inputProvenance.kind !== "external_user") {
           failure("adaptive task preparation requires an ordinary foreground user turn");
         }
@@ -374,8 +398,8 @@ export function createNativeHarness(
         const history = transcript?.contextMessages ?? maintenance?.contextMessages ?? [];
         host = await dependencies.prepareHost(p, signal, assertActive, history,
           preparationPolicy && preparationGate ? { policy: preparationPolicy, gate: preparationGate } : undefined,
-          memory ? (config.toolAllowlist ?? ["read", "write"]).filter((name) => name === "read" || name === "write") : config.toolAllowlist,
-          { cleanupTimeoutMs: config.shutdownTimeoutMs });
+          memory ? (toolPolicy.toolAllowlist ?? ["read", "write"]).filter((name) => name === "read" || name === "write") : toolPolicy.toolAllowlist,
+          { cleanupTimeoutMs: config.shutdownTimeoutMs, ...(toolPolicy.bitablePolicy ? { bitablePolicy: toolPolicy.bitablePolicy } : {}) });
         assertActive();
         if (p.sourceReplyDeliveryMode === "message_tool_only" && !p.silentExpected && !memory && !host.deliverSourceReply) {
           failure("message-tool-only source reply requires a private current-source message route");
@@ -486,7 +510,7 @@ export function createNativeHarness(
         if (p.sourceReplyDeliveryMode === "message_tool_only" && !memory && completedAssistant &&
             !p.silentExpected && Reflect.get(completedAssistant, "display") !== false &&
             [undefined, "final_answer"].includes(Reflect.get(completedAssistant, "phase"))) {
-          const text = completedAssistant.content.filter((block) => block.type === "text").map((block) => block.text).join("\n");
+          const text = completedAssistant.content.filter((block) => block.type === "text").map((block) => block.text).join("");
           if (text.trim() && !isSilentSourceReply(p, text)) {
             const ownership = host.sourceReplyOwnershipRequired
               ? await (dependencies.prepareSourceReplyOwnership ?? prepareSourceReplyOwnership)(
@@ -594,7 +618,7 @@ export function createNativeHarness(
       if (result.terminal.kind === "ok" && sdk && completedAssistant && !p.silentExpected &&
           Reflect.get(completedAssistant, "display") !== false &&
           [undefined, "final_answer"].includes(Reflect.get(completedAssistant, "phase"))) {
-        const text = result.assistantTexts.join("\n");
+        const text = result.assistantTexts.join("");
         if (text.trim() && !isSilentSourceReply(p, text)) {
           try {
             assertPublishable();
@@ -670,6 +694,12 @@ export function createNativeHarness(
       };
       const sdk = await dependencies.loadSdk();
       assertActive();
+      if (hasAgentToolPolicy(config) && !p.agentId && !p.sessionKey) {
+        failure("scoped compaction requires a host-resolved Agent identity");
+      }
+      const agentId = p.agentId ?? (config.operationalBudgetByAgent || hasAgentToolPolicy(config)
+        ? sdk.resolveSessionAgentIds({ config: p.config, sessionKey: p.sessionKey }).sessionAgentId : undefined);
+      resolveAgentToolPolicy(config, agentId);
       const context = await (dependencies.readMaintenanceContext ?? readNativeMaintenanceContext)({ ...p, runId }, assertActive);
       const route = resolveNativeRoute({
         ...p,
@@ -685,8 +715,7 @@ export function createNativeHarness(
         ...route,
         provider,
         sessionId: p.sessionId,
-        agentId: p.agentId ?? (config.operationalBudgetByAgent
-          ? sdk.resolveSessionAgentIds({ config: p.config, sessionKey: p.sessionKey }).sessionAgentId : undefined),
+        agentId,
         nativeStateId: context.nativeStateId,
         runId,
         workspaceDir: p.cwd ?? p.workspaceDir,

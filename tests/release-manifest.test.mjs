@@ -8,6 +8,7 @@ import { dirname, join } from "node:path";
 import { gzipSync } from "node:zlib";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { PATCH_ID as CHAT_FINAL_TEXT_PATCH_ID } from "../host-patch/chat-final-text/spec.mjs";
 import { createReleaseManifest, toCliError, verifyReleaseManifest } from "../scripts/lib/release-manifest.mjs";
 
 const execFile = promisify(execFileCallback);
@@ -114,6 +115,16 @@ function baseFiles(version = "1.2.3-test.0") {
       "export const edits = [];",
     ].join("\n") + "\n",
     "host-patch/table-policy/USAGE.txt": "table policy usage\n",
+    "host-patch/chat-final-text/apply.mjs": "export const APPLY = 'chat-final-text';\n",
+    "host-patch/chat-final-text/spec.mjs": [
+      'import { replaceExactly } from "../spec.mjs";',
+      `export const PATCH_ID = "${CHAT_FINAL_TEXT_PATCH_ID}";`,
+      'export const HOST_VERSION = "2026.9.2";',
+      'export const SOURCE_COMMIT = "3928bad9badfcb6c7d140530435e806fb8092190";',
+      "export { replaceExactly };",
+      "export const edits = [];",
+    ].join("\n") + "\n",
+    "host-patch/chat-final-text/USAGE.txt": "chat final text usage\n",
     "notes/tracked.txt": "tracked\n",
     "dist/index.js": "export {};\n",
     "dist/index.d.ts": "export {};\n",
@@ -145,6 +156,9 @@ const packageMembers = [
   "host-patch/table-policy/apply.mjs",
   "host-patch/table-policy/spec.mjs",
   "host-patch/table-policy/USAGE.txt",
+  "host-patch/chat-final-text/apply.mjs",
+  "host-patch/chat-final-text/spec.mjs",
+  "host-patch/chat-final-text/USAGE.txt",
   "dist/index.js",
   "dist/index.d.ts",
   "dist/index.js.map",
@@ -230,6 +244,9 @@ const pendingCompanionPaths = [
   "host-patch/table-policy/apply.mjs",
   "host-patch/table-policy/spec.mjs",
   "host-patch/table-policy/USAGE.txt",
+  "host-patch/chat-final-text/apply.mjs",
+  "host-patch/chat-final-text/spec.mjs",
+  "host-patch/chat-final-text/USAGE.txt",
 ];
 
 function toCrLf(text) {
@@ -264,6 +281,7 @@ test("create --release succeeds on a clean root and verify re-audits package, so
     "openclaw-compaction-auth-gap-v2",
     "openclaw-native-source-reply-owner-v1",
     "openclaw-dsh-native-table-policy-v1",
+    CHAT_FINAL_TEXT_PATCH_ID,
   ]);
   assert.deepEqual(findPatch(manifest, "openclaw-native-source-reply-owner-v1").files.map((file) => file.path), [
     "host-patch/source-reply/apply.mjs",
@@ -272,6 +290,20 @@ test("create --release succeeds on a clean root and verify re-audits package, so
     "host-patch/spec.mjs",
     "host-patch/engine.mjs",
   ]);
+  const chatFinalText = findPatch(manifest, CHAT_FINAL_TEXT_PATCH_ID);
+  assert.deepEqual(chatFinalText.files.map((file) => file.path), [
+    "host-patch/chat-final-text/apply.mjs",
+    "host-patch/chat-final-text/spec.mjs",
+    "host-patch/chat-final-text/USAGE.txt",
+    "host-patch/spec.mjs",
+    "host-patch/engine.mjs",
+  ]);
+  assert.equal(chatFinalText.hostVersion, "2026.9.2");
+  assert.equal(chatFinalText.sourceCommit, "3928bad9badfcb6c7d140530435e806fb8092190");
+  for (const file of chatFinalText.files) {
+    assert.equal(file.sha256, checksum(await readFile(join(root, ...file.path.split("/")))));
+  }
+  assert.match(chatFinalText.aggregateSha256, /^[a-f0-9]{64}$/);
   assert.equal(manifest.sdk.approvedSha256, "3431f4cd2d8dbd6b936def2694ac27e19fa0256295cf4ada0f652ecf1c9ee520");
   assert.match(manifest.claims.limitations, /source\.releaseReady|CI\/test|compiler provenance/i);
   const verifyOutput = join(stateDir, "clean-release-verify.json");
@@ -304,6 +336,7 @@ test("local create succeeds for dirty staged, untracked, and missing source drif
   assert.ok(manifest.source.status.untrackedFiles >= pendingCompanionPaths.length + 1);
   assert.ok(manifest.source.status.missingFiles >= 1);
   assert.ok(findPatch(manifest, "openclaw-native-source-reply-owner-v1").files.some((file) => file.path === "host-patch/spec.mjs"));
+  assert.ok(findPatch(manifest, CHAT_FINAL_TEXT_PATCH_ID).files.some((file) => file.path === "host-patch/spec.mjs"));
   const releaseResult = await runCli(["create", "--root", root, "--package", archivePath, "--expected-sha", sha256, "--release"]);
   assert.notEqual(releaseResult.code, 0);
   assert.equal(JSON.parse(releaseResult.stdout).error.code, "package_untracked_source");
@@ -334,6 +367,7 @@ test("create accepts CRLF companion specs", async () => {
       "host-patch/compact-auth/spec.mjs": toCrLf(base["host-patch/compact-auth/spec.mjs"]),
       "host-patch/source-reply/spec.mjs": toCrLf(base["host-patch/source-reply/spec.mjs"]),
       "host-patch/table-policy/spec.mjs": toCrLf(base["host-patch/table-policy/spec.mjs"]),
+      "host-patch/chat-final-text/spec.mjs": toCrLf(base["host-patch/chat-final-text/spec.mjs"]),
     },
   });
   const archivePath = join(root, "artifacts", "release", "product.tgz");
@@ -342,6 +376,7 @@ test("create accepts CRLF companion specs", async () => {
   assert.equal(result.code, 0, result.stdout);
   const manifest = JSON.parse(result.stdout);
   assert.equal(findPatch(manifest, "openclaw-native-source-reply-owner-v1").files[3].path, "host-patch/spec.mjs");
+  assert.equal(findPatch(manifest, CHAT_FINAL_TEXT_PATCH_ID).files[3].path, "host-patch/spec.mjs");
 });
 
 test("an additional group-readonly companion is bound when present and cannot be omitted from the archive", async () => {
@@ -356,11 +391,56 @@ test("an additional group-readonly companion is bound when present and cannot be
   const { sha256 } = await createArchive(root, archivePath, [...packageMembers, ...Object.keys(groupFiles)]);
   const manifest = await createReleaseManifest({ root, packagePath: archivePath, expectedSha: sha256 });
   const group = findPatch(manifest, "openclaw-dsh-group-readonly-v1");
+  assert.equal(manifest.companions.patches.length, 6);
+  assert.ok(findPatch(manifest, CHAT_FINAL_TEXT_PATCH_ID));
   assert.equal(group.files.length, 5);
   assert.equal(manifest.source.clean, false);
   const omitted = await createArchive(root, archivePath);
   await assert.rejects(createReleaseManifest({ root, packagePath: archivePath, expectedSha: omitted.sha256 }),
     (error) => error.code === "package_validation_failed");
+});
+
+test("chat-final-text is mandatory even if its entire archive bundle is missing", async () => {
+  const { root } = await createFixture("missing-chat-final-text");
+  const archivePath = join(root, "artifacts", "release", "product.tgz");
+  for (const omitted of [undefined, "apply.mjs", "spec.mjs", "USAGE.txt"]) {
+    const members = packageMembers.filter((path) => omitted
+      ? path !== `host-patch/chat-final-text/${omitted}`
+      : !path.startsWith("host-patch/chat-final-text/"));
+    const { sha256 } = await createArchive(root, archivePath, members);
+    await assert.rejects(createReleaseManifest({ root, packagePath: archivePath, expectedSha: sha256 }),
+      (error) => error.code === "package_validation_failed");
+  }
+});
+
+test("chat-final-text specs must match the shipped patch identity and pinned SDK", async () => {
+  const { root } = await createFixture("wrong-chat-final-text-pin");
+  const archivePath = join(root, "artifacts", "release", "product.tgz");
+  const specPath = "host-patch/chat-final-text/spec.mjs";
+  for (const [name, invalid] of [
+    ["PATCH_ID", "wrong-chat-final-text-id"],
+    ["HOST_VERSION", "2026.9.3"],
+    ["SOURCE_COMMIT", "0".repeat(40)],
+  ]) {
+    const spec = baseFiles()[specPath].replace(new RegExp(`export const ${name} = "[^"]+";`),
+      `export const ${name} = "${invalid}";`);
+    await writeFile(join(root, ...specPath.split("/")), spec);
+    const { sha256 } = await createArchive(root, archivePath);
+    await assert.rejects(createReleaseManifest({ root, packagePath: archivePath, expectedSha: sha256 }),
+      (error) => error.code === "companion_pin_invalid");
+  }
+});
+
+test("verification rejects removing chat-final-text from an otherwise valid manifest", async () => {
+  const { root } = await createFixture("omitted-chat-final-text-manifest");
+  const archivePath = join(root, "artifacts", "release", "product.tgz");
+  const { sha256 } = await createArchive(root, archivePath);
+  const manifestPath = join(root, "artifacts", "release", "release-manifest.json");
+  const manifest = await createReleaseManifest({ root, packagePath: archivePath, expectedSha: sha256, outputPath: manifestPath });
+  manifest.companions.patches = manifest.companions.patches.filter((patch) => patch.id !== CHAT_FINAL_TEXT_PATCH_ID);
+  await writeFile(manifestPath, JSON.stringify(manifest));
+  await assert.rejects(verifyReleaseManifest({ root, packagePath: archivePath, expectedSha: sha256, manifestPath }),
+    (error) => error.code === "manifest_mismatch");
 });
 
 test("create rejects unsafe output paths", async () => {

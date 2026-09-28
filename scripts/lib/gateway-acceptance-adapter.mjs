@@ -4,32 +4,99 @@ import { readFileSync } from "node:fs";
 import { lstat, mkdir, open, readFile, readdir, realpath, rm } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import { resolveActiveResetBoundary } from "../../dist/native/reset-boundary.js";
-import { validateUsageShape, zeroUsage } from "./acceptance-contract.mjs";
+import { performance } from "node:perf_hooks";
+import { executionStatuses, validateUsageShape, zeroUsage } from "./acceptance-contract.mjs";
 
 const hash = (text) => createHash("sha256").update(text).digest("hex");
 const textOf = (message) => typeof message?.content === "string" ? message.content :
   (message?.content ?? []).filter((block) => block.type === "text").map((block) => block.text).join("");
 const usageKeys = Object.keys(zeroUsage());
+const preparationModes = ["chat", "clarify", "draft", "execute"];
 const sumUsage = (a, b) => Object.fromEntries([
   ...usageKeys.map((key) => [key, a[key] + b[key]]), ["priced", false],
 ]);
 
+function exactBodyError(actual, canonical, code, message) {
+  if (actual === canonical) return undefined;
+  const bytes = [Buffer.from(actual, "utf8"), Buffer.from(canonical, "utf8")];
+  let firstDiffUtf8Byte = 0;
+  while (firstDiffUtf8Byte < Math.min(...bytes.map((value) => value.length)) &&
+      bytes[0][firstDiffUtf8Byte] === bytes[1][firstDiffUtf8Byte]) firstDiffUtf8Byte++;
+  const identity = (text) => ({
+    sha256: hash(text), utf8Bytes: Buffer.byteLength(text, "utf8"),
+    whitespace: {
+      leadingUtf8Bytes: Buffer.byteLength(text.match(/^\s*/u)[0], "utf8"),
+      trailingUtf8Bytes: Buffer.byteLength(text.match(/\s*$/u)[0], "utf8"),
+      lf: (text.match(/\n/g) ?? []).length, cr: (text.match(/\r/g) ?? []).length,
+      tabs: (text.match(/\t/g) ?? []).length, spaces: (text.match(/ /g) ?? []).length,
+    },
+  });
+  return Object.assign(new Error(message), { code,
+    diagnosis: { code, actual: identity(actual), canonical: identity(canonical), firstDiffUtf8Byte } });
+}
+
+function safeFailure(error) {
+  if (["GATEWAY_FINAL_CANONICAL_MISMATCH", "GATEWAY_PROJECTED_CANONICAL_MISMATCH"].includes(error?.code) &&
+      error.diagnosis?.code === error.code) return error;
+  const message = error?.code === "ERR_ASSERTION" ? error.message.split("\n")[0] :
+    error instanceof SyntaxError ? "Invalid JSON in native evidence" : error?.message ?? "Gateway execution failed";
+  const safe = new Error(message);
+  if (error?.code) safe.code = error.code;
+  for (const key of ["budgetAccounting", "observedTurn", "preDispatchBudgetBlock", "remoteUnsettled"]) {
+    if (error?.[key] !== undefined) safe[key] = error[key];
+  }
+  return safe;
+}
+
+function failureTurnSummary(turn) {
+  const { prompt, outputText, tools, ...summary } = turn;
+  return { ...summary,
+    ...(typeof outputText === "string" ? {
+      outputSha256: hash(outputText), outputUtf8Bytes: Buffer.byteLength(outputText, "utf8"),
+    } : {}),
+    ...(tools ? { tools: tools.map(({ callId, name, isError }) => ({ callId, name, isError })) } : {}),
+  };
+}
+
 function observedExecutionStatus(mode, ...observations) {
   const statuses = observations.filter((value) => value && Object.hasOwn(value, "executionStatus"))
     .map((value) => value.executionStatus);
+  const unknown = statuses.findIndex((status) => !executionStatuses.includes(status));
+  if (unknown >= 0) return statuses[unknown];
   const unsafe = statuses.findIndex((status) => !["completed", "correctly_blocked"].includes(status));
   if (unsafe >= 0) return statuses[unsafe];
   const abnormal = observations.find((value) => value?.stopReason !== undefined && !["stop", "length"].includes(value.stopReason));
   if (abnormal) return ["error", "aborted"].includes(abnormal.stopReason) ? "failed" : "unknown";
   if (statuses.length) return statuses[0];
-  if (!["chat", "clarify", "draft", "execute"].includes(mode)) return "unknown";
+  if (!preparationModes.includes(mode)) return "unknown";
   return mode === "clarify" ? "correctly_blocked" : "completed";
 }
 
 const operationalFields = ["maxModelRequests", "maxInputTokens", "maxOutputTokens", "maxToolCalls", "maxDurationMs"];
 const positive = (value) => Number.isSafeInteger(value) && value > 0;
 const nonNegative = (value) => Number.isSafeInteger(value) && value >= 0;
+export const monotonicNowMs = () => Math.floor(performance.now());
+
+// Capture legacy wall deadlines once at entry; only the monotonic deadline is authoritative thereafter.
+export function captureBudgetDeadline(context = {}, startedAtMs = monotonicNowMs()) {
+  const wallNow = Date.now();
+  const deadlineAtMs = resolveDeadlineAtMs(wallNow, context.timeoutMs, context.deadlineAtMs);
+  let inherited = context.deadlineMonotonicMs;
+  if (inherited === undefined && context.deadlineAtMs !== undefined) {
+    inherited = resolveDeadlineAtMs(startedAtMs, Math.max(1, context.deadlineAtMs - wallNow));
+    if (context.deadlineAtMs <= wallNow) inherited = startedAtMs;
+  }
+  const deadlineMonotonicMs = resolveDeadlineAtMs(startedAtMs, context.timeoutMs, inherited);
+  return Object.freeze({ deadlineAtMs, deadlineMonotonicMs });
+}
+
+export function remainingDeadlineMs(deadline) {
+  const captured = typeof deadline === "number" ? captureBudgetDeadline({ deadlineAtMs: deadline }) : deadline;
+  if (captured?.deadlineMonotonicMs === undefined) return undefined;
+  assert.ok(nonNegative(captured.deadlineMonotonicMs), "Invalid monotonic deadline");
+  return captured.deadlineMonotonicMs - monotonicNowMs();
+}
+
 export function resolveDeadlineAtMs(startedAtMs, timeoutMs, inheritedDeadlineAtMs) {
   assert.ok(nonNegative(startedAtMs), "Invalid deadline start time");
   if (inheritedDeadlineAtMs !== undefined) {
@@ -41,9 +108,8 @@ export function resolveDeadlineAtMs(startedAtMs, timeoutMs, inheritedDeadlineAtM
     inheritedDeadlineAtMs ?? Number.MAX_SAFE_INTEGER);
 }
 
-export function assertBudgetFitsDeadline(budget, deadlineAtMs) {
-  assert.ok(nonNegative(deadlineAtMs), "deadlineAtMs must be a non-negative safe integer");
-  const remaining = deadlineAtMs - Date.now() - 25;
+export function assertBudgetFitsDeadline(budget, deadline) {
+  const remaining = remainingDeadlineMs(deadline) - 25;
   assert.ok(positive(budget.maxDurationMs) && budget.maxDurationMs <= remaining,
     `Configured maxDurationMs (${budget.maxDurationMs}) exceeds remaining duration (${remaining}ms including dispatch margin); ` +
     "operator must install smaller configured limits strictly below the case/review deadline with setup headroom. " +
@@ -120,6 +186,48 @@ export function resolveConfiguredOperationalBudget(hostConfig, agentId) {
     [key, Math.min(...caps.map((cap) => cap[key]))])) : undefined;
 }
 
+export function remainingNativeAllocation(caps = {}, used = zeroUsage()) {
+  const remaining = { ...caps };
+  for (const key of usageKeys) {
+    if (caps[key] !== undefined) remaining[key] = caps[key] - (used[key] ?? 0);
+  }
+  if (caps.inputTokens !== undefined) {
+    remaining.inputTokens = caps.inputTokens - checkedSum(used.inputTokens ?? 0,
+      used.cacheReadTokens ?? 0, used.cacheWriteTokens ?? 0);
+  }
+  return remaining;
+}
+
+export function remainingOperationalBudget(root, used = zeroUsage()) {
+  const budget = validateOperationalBudget(root);
+  budget.maxModelRequests -= used.modelRequests ?? 0;
+  budget.maxInputTokens -= checkedSum(used.inputTokens ?? 0, used.cacheReadTokens ?? 0, used.cacheWriteTokens ?? 0);
+  budget.maxOutputTokens -= used.outputTokens ?? 0;
+  budget.maxToolCalls -= used.toolCalls ?? 0;
+  return validateOperationalBudget(budget, "remaining operationalBudget (no exhausted limits)");
+}
+
+// Offline admission only: no Gateway, auth, model preparation or runtime attestation.
+export function preflightConfiguredOperationalBudget({ hostConfig, agentId, caseBudget, attemptBudget,
+  budget = {}, used = zeroUsage(), contextWindow, timeoutMs, zeroTools = false }) {
+  assert.deepEqual(validateUsageShape(used, { requirePricing: false }), [], "Invalid preflight usage");
+  const configured = resolveConfiguredOperationalBudget(hostConfig, agentId);
+  assert.ok(configured, "Runtime budget proof unsupported without configured plugin operationalBudget limits for the exact agent");
+  const caps = remainingNativeAllocation(budget, used);
+  const remaining = narrowOperationalBudget(caseBudget !== undefined ? remainingOperationalBudget(caseBudget, used) : configured,
+    caps, timeoutMs, { zeroTools });
+  assertConfiguredBudgetFits(configured, remaining);
+  if (attemptBudget !== undefined) assertConfiguredBudgetFits(configured, attemptBudget);
+  assertNativeBudgetFitsAllocation(configured, caps);
+  assert.ok(positive(contextWindow) && contextWindow <= configured.maxInputTokens,
+    "Configured maxInputTokens must cover the full prepared contextWindow, not guessed prompt tokens");
+  if (timeoutMs !== undefined || caseBudget !== undefined) {
+    assert.ok(configured.maxDurationMs <= remaining.maxDurationMs - 25,
+      "Configured maxDurationMs requires dispatch margin and setup headroom below the case/review timeoutMs");
+  }
+  return Object.freeze(configured);
+}
+
 export function assertConfiguredBudgetFits(configured, remaining) {
   assert.ok(configured, "Runtime budget proof unsupported without configured plugin operationalBudget limits for the exact agent");
   const cap = validateOperationalBudget(configured);
@@ -176,7 +284,7 @@ export function validateRuntimeBudgetProof(proof, expected = {}) {
   try {
   for (const [seq, entry] of entries.entries()) {
     assert.equal(entry.seq, seq, "Budget ledger sequence is discontinuous");
-    assert.ok(nonNegative(entry.at) && entry.at >= lastAt && entry.at <= Date.now(),
+    assert.ok(nonNegative(entry.at) && entry.at >= lastAt,
       "Invalid runtime ledger time");
     lastAt = entry.at;
     assert.ok(!terminal, "Budget ledger continued after its terminal fence/settlement");
@@ -257,7 +365,9 @@ export function validateRuntimeBudgetProof(proof, expected = {}) {
   try {
     if (expected.settled === false) {
       assert.equal(status, "admitted", "Expected fresh runtime admission before any work");
-      assert.ok(Date.now() - start < budget.maxDurationMs, "Runtime budget admission deadline already expired");
+      const admissionAge = Date.now() - start;
+      assert.ok(admissionAge >= 0, "Runtime budget admission clock identity changed");
+      assert.ok(admissionAge < budget.maxDurationMs, "Runtime budget admission deadline already expired");
     }
     if (expected.settled === true) {
       assert.equal(status, "settled", "Runtime requests are unsettled or fenced");
@@ -328,19 +438,25 @@ function validateConfig(value) {
   }
   if (value.isolation !== undefined && value.isolation !== "agent-policy-read-only") throw new Error("Unsupported evaluation isolation");
   return { ...value, gatewayUrl: url.href.replace(/\/$/, ""),
-    ...(value.operationalBudget !== undefined ? { operationalBudget: validateOperationalBudget(value.operationalBudget) } : {}) };
+    ...Object.fromEntries(["operationalBudget", "caseBudget", "attemptBudget"]
+      .filter((key) => value[key] !== undefined).map((key) => [key, validateOperationalBudget(value[key], key)])) };
 }
 
 async function waitFor(predicate, signal, timeoutMs, label) {
-  const deadline = Date.now() + timeoutMs;
+  const deadline = resolveDeadlineAtMs(monotonicNowMs(), timeoutMs);
   for (;;) {
     signal?.throwIfAborted();
     const value = await predicate();
     signal?.throwIfAborted();
     if (value) return value;
-    if (Date.now() >= deadline) throw new Error(`Timed out waiting for ${label}`);
+    if (monotonicNowMs() >= deadline) throw new Error(`Timed out waiting for ${label}`);
     await new Promise((done) => setTimeout(done, 200));
   }
+}
+
+async function resolveActiveResetBoundary(...args) {
+  const runtime = await import("../../dist/native/reset-boundary.js");
+  return runtime.resolveActiveResetBoundary(...args);
 }
 
 async function ledger(context, value) {
@@ -567,13 +683,17 @@ export async function createGatewayAcceptanceAdapter(options = {}) {
       frame.event === "agent" && frame.payload.stream === "lifecycle" &&
       ["error", "aborted", "fallback", "fallback_cleared"].includes(frame.payload.data?.phase));
     if (bad) {
-      const error = new Error(`Owned Gateway turn failed (${bad.payload.state ?? bad.payload.data.phase}): ${
-        bad.payload.errorMessage ?? bad.payload.data?.error ?? "See scoped terminal event"}`);
+      const detail = bad.payload.errorMessage ?? bad.payload.data?.error;
+      const error = new Error(`Owned Gateway turn failed (${bad.payload.state ?? bad.payload.data.phase})`);
+      error.remoteUnsettled = /abort|timed?\s*out|timeout|fenc/i.test(typeof detail === "string" ? detail : "");
       const failureStatus = ["fallback", "fallback_cleared"].includes(bad.payload.data?.phase) ? "infrastructure_blocked" : "failed";
       const finals = frames.filter((frame) => frame.event === "chat" && frame.payload.state === "final");
       error.observedTurn = { outputText: textOf(finals.at(-1)?.payload.message ?? bad.payload.message),
         executionStatus: observedExecutionStatus(undefined, bad.payload, bad.payload.message,
-          { executionStatus: failureStatus }), terminalEvent: bad,
+          { executionStatus: failureStatus }), terminalEvent: {
+          event: bad.event, payload: { state: bad.payload.state,
+            ...(bad.payload.data ? { data: { phase: bad.payload.data.phase } } : {}) },
+        },
         delivery: { delivered: finals.length > 0, terminalOutputs: finals.length, receiptId: runId, recipient: sessionKey } };
       throw error;
     }
@@ -585,35 +705,43 @@ export async function createGatewayAcceptanceAdapter(options = {}) {
     const history = await request("chat.history", { sessionKey, agentId, limit: 50 }, signal);
     if (!history.sessionId || history.inFlightRun) return undefined;
     const raw = await owner.readTranscript({ sessionKey, agentId, sessionId: history.sessionId });
-    const boundary = resolveActiveResetBoundary(raw, history.sessionId);
+    const boundary = await resolveActiveResetBoundary(raw, history.sessionId);
     const stateId = boundary.kind === "clear" ? boundary.stateId : history.sessionId;
     const key = `${boundary.kind === "clear" ? boundary.assistantKeyPrefix : "dsh-native:"}${runId}:assistant`;
     const canonical = raw.findLast((row) => row.type === "message" && row.message?.idempotencyKey === key)?.message;
     const projected = history.messages?.find((message) =>
       (message.idempotencyKey ?? message.__openclaw?.idempotencyKey) === key);
     if (!canonical || !projected) return undefined;
-    assert.equal(textOf(canonical), textOf(projected), "Canonical and projected assistant differ");
     const directory = join(config.nativeStateDir, hash(stateId));
-    let binding;
-    try { binding = JSON.parse(await readFile(join(directory, "binding.json"), "utf8")); }
+    let binding, bindingBytes;
+    try {
+      const path = join(directory, "binding.json");
+      const info = await lstat(path);
+      assert.ok(info.isFile() && !info.isSymbolicLink() && info.size <= 1024 * 1024,
+        "Native binding must be a bounded regular file");
+      bindingBytes = await readFile(path, "utf8");
+      binding = JSON.parse(bindingBytes);
+    }
     catch (error) { if (error.code === "ENOENT") return undefined; throw error; }
     if (binding.status === "blocked") throw new Error("Native binding is blocked");
     if (binding.status !== "ready" || binding.lastRunId !== runId) return undefined;
-    return { history, raw, boundary, canonical, binding, directory, key };
+    assert.ok(["budgetFailure", "failureDiagnostic", "pendingCompact"].every((field) => !Object.hasOwn(binding, field)),
+      "Native binding is fenced or unsettled");
+    return { history, raw, boundary, canonical, projected, binding, bindingSha256: hash(bindingBytes), directory, key };
   }
 
   async function reset(state, context, afterTurn) {
     const before = await request("chat.history", { sessionKey: state.sessionKey, agentId: state.agentId, limit: 1 }, context.signal);
     const owner = await gateway();
     const raw = await owner.readTranscript({ sessionKey: state.sessionKey, agentId: state.agentId, sessionId: before.sessionId });
-    const prior = resolveActiveResetBoundary(raw, before.sessionId);
+    const prior = await resolveActiveResetBoundary(raw, before.sessionId);
     await ledger(context, { event: "reset_planned", sessionKey: state.sessionKey, afterTurn });
     const response = await request("sessions.reset", { key: state.sessionKey, agentId: state.agentId, reason: "new" }, context.signal, 120000);
     assert.equal(response.ok, true);
     assert.equal(response.key, state.sessionKey);
     state.hostSessionId = response.entry.sessionId;
     const next = await owner.readTranscript({ sessionKey: state.sessionKey, agentId: state.agentId, sessionId: response.entry.sessionId });
-    const boundary = resolveActiveResetBoundary(next, response.entry.sessionId);
+    const boundary = await resolveActiveResetBoundary(next, response.entry.sessionId);
     if (before.sessionId === response.entry.sessionId) {
       assert.deepEqual(next.slice(0, raw.length), raw, "Reset removed canonical history");
       assert.equal(boundary.kind, "clear");
@@ -630,6 +758,10 @@ export async function createGatewayAcceptanceAdapter(options = {}) {
     state.runtimeBudgetDirectory = undefined;
     state.budgetExpected = undefined;
     state.reservedBudget = undefined;
+    state.settlement = undefined;
+    state.bodyError = undefined;
+    state.executionKnown = false;
+    state.preparationKnown = false;
     state.observation = { agentProfile: testCase.agentProfile, prompt, runId,
       executionStatus: "unknown", ...(submissionId ? { submissionId } : {}) };
     const owner = await gateway();
@@ -638,35 +770,21 @@ export async function createGatewayAcceptanceAdapter(options = {}) {
     let expected;
     let directory;
     if (state.operationalBudget) {
-      const used = state.usage;
-      const available = {
-        modelRequests: state.operationalBudget.maxModelRequests - used.modelRequests,
-        inputTokens: state.operationalBudget.maxInputTokens - used.inputTokens - used.cacheReadTokens - used.cacheWriteTokens,
-        outputTokens: state.operationalBudget.maxOutputTokens - used.outputTokens,
-        toolCalls: state.operationalBudget.maxToolCalls - used.toolCalls,
-      };
-      const budgetUsage = {
-        modelRequests: used.modelRequests,
-        inputTokens: used.inputTokens + used.cacheReadTokens + used.cacheWriteTokens,
-        outputTokens: used.outputTokens,
-        toolCalls: used.toolCalls,
-      };
-      const inputAllocations = [testCase.limits.usage, context.budget].filter(Boolean).map((caps) =>
-        Object.fromEntries(["inputTokens", "cacheReadTokens", "cacheWriteTokens"]
-          .filter((key) => caps[key] !== undefined).map((key) => [key, caps[key] -
-            (key === "inputTokens" ? budgetUsage.inputTokens : used[key])])));
-      for (const key of Object.keys(available)) {
-        if (context.budget?.[key] !== undefined) available[key] = Math.min(available[key], context.budget[key] - budgetUsage[key]);
-      }
+      const inputAllocations = [testCase.limits.usage, context.budget].filter(Boolean)
+        .map((caps) => remainingNativeAllocation(caps, state.usage));
       let operationalBudget;
       try {
-        operationalBudget = Object.freeze(narrowOperationalBudget(state.operationalBudget, available,
-          state.deadlineAtMs - Date.now()));
+        operationalBudget = remainingOperationalBudget(state.operationalBudget, state.usage);
+        for (const caps of inputAllocations) operationalBudget = narrowOperationalBudget(operationalBudget, caps);
+        operationalBudget = narrowOperationalBudget(operationalBudget, {}, remainingDeadlineMs(state.deadline));
+        if (state.attemptBudget) operationalBudget = Object.fromEntries(operationalFields.map((key) =>
+          [key, Math.min(operationalBudget[key], state.attemptBudget[key])]));
+        operationalBudget = Object.freeze(operationalBudget);
         if (!state.prepareBudget) {
           operationalBudget = Object.freeze(assertConfiguredBudgetFits(
             resolveConfiguredOperationalBudget(owner.hostConfig, state.agentId), operationalBudget));
           for (const caps of inputAllocations) assertNativeBudgetFitsAllocation(operationalBudget, caps);
-          assertBudgetFitsDeadline(operationalBudget, state.deadlineAtMs);
+          assertBudgetFitsDeadline(operationalBudget, state.deadline);
         }
       } catch (error) {
         error.preDispatchBudgetBlock = true;
@@ -708,10 +826,14 @@ export async function createGatewayAcceptanceAdapter(options = {}) {
       ...(config.isolation ? {} : { expectedPermissionMode: "read-only" }), idempotencyKey: runId };
     await ledger(context, { event: "send_planned", caseId: testCase.id, runId, turn: index + 1,
       sessionKey: state.sessionKey, promptSha256: hash(message) });
-    const checkDispatch = () => {
+    const checkDispatch = (nativeAttempt = true) => {
       try {
-        if (expected) assertBudgetFitsDeadline(admission?.operationalBudget ?? expected.operationalBudget, state.deadlineAtMs);
-        assert.ok(Date.now() < state.deadlineAtMs, "Case deadline expired before dispatch");
+        if (expected) {
+          const attempt = admission?.operationalBudget ?? expected.operationalBudget;
+          assertBudgetFitsDeadline(attempt, state.deadline);
+          if (nativeAttempt) context.beforeDispatch?.(attempt);
+        }
+        assert.ok(remainingDeadlineMs(state.deadline) > 0, "Case deadline expired before dispatch");
       } catch (error) {
         error.preDispatchBudgetBlock = true;
         throw error;
@@ -733,10 +855,23 @@ export async function createGatewayAcceptanceAdapter(options = {}) {
       delivery: { delivered: true, terminalOutputs: 1, receiptId: runId, recipient: state.sessionKey } });
     const settled = await waitFor(() => inspect(state.sessionKey, state.agentId, runId, context.signal),
       context.signal, 30000, "native/canonical settlement");
-    assert.equal(textOf(final.payload.message), textOf(settled.canonical), "Live final differs from committed canonical text");
+    const mode = settled.binding.taskPreparation?.state?.mode;
+    Object.assign(state.observation, {
+      mode, executionStatus: observedExecutionStatus(mode, settled.canonical, final.payload, final.payload.message),
+    });
+    state.executionKnown = executionStatuses.includes(state.observation.executionStatus);
+    state.preparationKnown = preparationModes.includes(mode);
+    // Body judgment cannot discard independently verified provider settlement.
+    const bodyError = exactBodyError(textOf(final.payload.message), textOf(settled.canonical),
+      "GATEWAY_FINAL_CANONICAL_MISMATCH", "Live final differs from committed canonical text") ??
+      exactBodyError(textOf(settled.projected), textOf(settled.canonical),
+        "GATEWAY_PROJECTED_CANONICAL_MISMATCH", "Canonical and projected assistant differ");
+    state.bodyError = bodyError;
     let budgetProof;
     if (expected) {
       directory ??= settled.directory;
+      assert.ok(!expected.sessionKey || expected.sessionKey === settled.history.sessionId,
+        "Runtime settlement changed the owned session");
       expected = { ...expected, sessionKey: settled.history.sessionId };
       state.runtimeBudgetDirectory = directory;
       state.budgetExpected = expected;
@@ -745,6 +880,7 @@ export async function createGatewayAcceptanceAdapter(options = {}) {
         assert.deepEqual(budgetProof.operationalBudget, expected.operationalBudget,
           "Runtime budget differs from the pinned configured limits");
       }
+      state.budgetExpected = { ...expected, configSha256: budgetProof.configSha256 };
     }
     if (budgetProof) {
       assert.equal(await realpath(directory), await realpath(settled.directory),
@@ -758,12 +894,17 @@ export async function createGatewayAcceptanceAdapter(options = {}) {
     const loaded = advertised.filter((name) => business.some((call) =>
       call.name === "read" && !call.isError && typeof call.arguments?.path === "string" &&
       call.arguments.path.replace(/\\/g, "/").endsWith(`/${name}/SKILL.md`)));
-    const mode = settled.binding.taskPreparation?.state.mode;
     Object.assign(state.observation, {
-      mode, executionStatus: observedExecutionStatus(mode, settled.canonical, final.payload, final.payload.message),
       tools: native.calls, skill: { advertised, selected: loaded, loaded }, usage: native.usage,
+      provider: native.provider, model: native.model, sessionId: settled.history.sessionId,
+      nativeSessionId: settled.binding.sessionId, usageBasis: native.usageBasis,
+      dispatchedMessageSha256: hash(message),
     });
-    if (!["chat", "clarify", "draft", "execute"].includes(mode)) throw new Error("Missing actual native preparation mode");
+    state.settlement = { settled, budgetProof };
+    assert.ok(state.executionKnown, "Missing or unknown native execution status");
+    assert.ok(state.preparationKnown, "Missing actual native preparation mode");
+    if (bodyError) throw bodyError;
+    state.reportedRunIds.add(runId);
     context.reportUsage(native.usage);
     state.capturedInputs.set(index + 1, { prompt, message, runId });
     if (duplicate) {
@@ -771,7 +912,8 @@ export async function createGatewayAcceptanceAdapter(options = {}) {
         appliesToTurn: index + 1, ...(duplicateControl.replaySourceTurn !== undefined ?
           { replaySourceTurn: duplicateControl.replaySourceTurn } : {}) });
       const beforeHash = hash(JSON.stringify(rows));
-      const reply = await request("chat.send", args, context.signal, 30000, checkDispatch);
+      // Replaying the same admitted run does not authorize a second native attempt.
+      const reply = await request("chat.send", args, context.signal, 30000, () => checkDispatch(false));
       assert.equal(reply.runId, runId);
       await new Promise((done) => setTimeout(done, 1000));
       const after = await inspect(state.sessionKey, state.agentId, runId, context.signal);
@@ -804,9 +946,9 @@ export async function createGatewayAcceptanceAdapter(options = {}) {
 
   return {
     async executeCase(testCase, context) {
-      const startedAt = Date.now();
-      let deadlineAtMs = resolveDeadlineAtMs(startedAt, testCase.limits.timeoutMs, context.deadlineAtMs);
-      deadlineAtMs = resolveDeadlineAtMs(startedAt, context.timeoutMs, deadlineAtMs);
+      const startedAt = monotonicNowMs();
+      let deadline = captureBudgetDeadline({ ...context,
+        timeoutMs: Math.min(testCase.limits.timeoutMs, context.timeoutMs ?? Number.MAX_SAFE_INTEGER) }, startedAt);
       if (busy || fenced) throw new Error("Gateway adapter has active or uncertain work; further admission is fenced");
       busy = true;
       let campaignLock;
@@ -816,10 +958,10 @@ export async function createGatewayAcceptanceAdapter(options = {}) {
       context = { ...context, signal: context.signal ? AbortSignal.any([context.signal, controller.signal]) : controller.signal };
       const armDeadline = () => {
         clearTimeout(timer);
-        context.deadlineAtMs = deadlineAtMs;
+        Object.assign(context, deadline);
         // Local cancellation is not proof of remote abort or settlement.
         timer = setTimeout(() => controller.abort(new Error("Operational budget duration expired; settlement unproven")),
-          Math.max(0, Math.min(deadlineAtMs - Date.now(), 2147483647)));
+          Math.max(0, Math.min(remainingDeadlineMs(deadline), 2147483647)));
       };
       try {
       const agentId = config.agentMap[testCase.agentProfile];
@@ -835,16 +977,27 @@ export async function createGatewayAcceptanceAdapter(options = {}) {
       const prompts = turnInputsForCase(testCase);
       const controlPlan = validateGatewayControls(testCase, prompts);
       if (!controlPlan.ok) return block(controlPlan.reason);
-      const roots = [config.operationalBudget, context.operationalBudget].filter((value) => value !== undefined)
+      for (const key of ["caseBudget", "attemptBudget", "operationalBudget"]) {
+        if (context[key] !== undefined) validateOperationalBudget(context[key], key);
+      }
+      const roots = [config.caseBudget ?? config.operationalBudget, context.caseBudget ?? context.operationalBudget]
+        .filter((value) => value !== undefined)
         .map((value) => validateOperationalBudget(value));
-      for (const root of roots) deadlineAtMs = resolveDeadlineAtMs(startedAt, root.maxDurationMs, deadlineAtMs);
+      const attempts = [config.attemptBudget ?? (config.caseBudget ? config.operationalBudget : undefined),
+        context.attemptBudget ?? (context.caseBudget ? context.operationalBudget : undefined)]
+        .filter((value) => value !== undefined)
+        .map((value) => validateOperationalBudget(value, "attemptBudget"));
+      for (const root of roots) deadline = captureBudgetDeadline({ ...deadline, timeoutMs: root.maxDurationMs }, startedAt);
       armDeadline();
-      if (Date.now() >= deadlineAtMs) return block("Case deadline expired before Gateway setup; no input sent");
+      if (remainingDeadlineMs(deadline) <= 0) return block("Case deadline expired before Gateway setup; no input sent");
       const owner = await gateway();
       owner.assertHealthy();
       const runtimeRoot = resolveConfiguredOperationalBudget(owner.hostConfig, agentId);
       const prepareBudget = typeof owner.prepareOperationalBudget === "function";
-      if (runtimeRoot !== undefined && (!roots.length || prepareBudget)) roots.push(runtimeRoot);
+      if (runtimeRoot !== undefined && !roots.length) roots.push(runtimeRoot);
+      if (runtimeRoot !== undefined) attempts.push(runtimeRoot);
+      const attemptBudget = attempts.length ? Object.freeze(Object.fromEntries(operationalFields
+        .map((key) => [key, Math.min(...attempts.map((value) => value[key]))]))) : undefined;
       let operationalBudget;
       if (roots.length) {
         if (runtimeRoot === undefined) return block("Runtime budget proof unsupported without configured plugin " +
@@ -855,14 +1008,15 @@ export async function createGatewayAcceptanceAdapter(options = {}) {
           operationalBudget = narrowOperationalBudget(operationalBudget, context.budget, context.timeoutMs);
           if (!prepareBudget) {
             assertConfiguredBudgetFits(runtimeRoot, operationalBudget);
+            assertConfiguredBudgetFits(runtimeRoot, attemptBudget);
             assertNativeBudgetFitsAllocation(runtimeRoot, testCase.limits.usage);
             assertNativeBudgetFitsAllocation(runtimeRoot, context.budget);
           }
         } catch (error) { return block(error.message); }
-        deadlineAtMs = resolveDeadlineAtMs(startedAt, operationalBudget.maxDurationMs, deadlineAtMs);
+        deadline = captureBudgetDeadline({ ...deadline, timeoutMs: operationalBudget.maxDurationMs }, startedAt);
         armDeadline();
       }
-      if (Date.now() >= deadlineAtMs) return block("Case deadline expired during Gateway setup; no input sent");
+      if (remainingDeadlineMs(deadline) <= 0) return block("Case deadline expired during Gateway setup; no input sent");
       const token = hash(`${context.runId}:${testCase.id}`).slice(0, 24);
       await mkdir(context.runDir, { recursive: true, mode: 0o700 });
       campaignLock = await open(join(context.runDir, "gateway-admission.lock"), "wx", 0o600);
@@ -874,8 +1028,8 @@ export async function createGatewayAcceptanceAdapter(options = {}) {
         await marker.sync();
       } finally { await marker.close(); }
       state = { sessionKey: `agent:${agentId}:${config.ownedSessionPrefix}-${token}`, agentId, settled: false,
-        operationalBudget, prepareBudget, deadlineAtMs, proofs: [], usage: { ...zeroUsage(), priced: false },
-        capturedInputs: new Map() };
+        operationalBudget, attemptBudget, prepareBudget, deadline, proofs: [], usage: { ...zeroUsage(), priced: false },
+        capturedInputs: new Map(), reportedRunIds: new Set() };
       states.set(testCase.id, state);
       const turns = [];
       const controlReceipts = [];
@@ -941,12 +1095,89 @@ export async function createGatewayAcceptanceAdapter(options = {}) {
           outputText: turns.at(-1).outputText,
           turns, usage, sideEffects: effects.effects, unknownEffects: effects.unknown || undefined, controlReceipts,
           delivery: { delivered: true, terminalOutputs: turns.length, recipient: state.sessionKey },
-          policyFacts: { mode: turns.at(-1).mode, adapter: "real-Gateway-not-Feishu" }, latencyMs: Date.now() - startedAt,
+          policyFacts: { mode: turns.at(-1).mode, adapter: "real-Gateway-not-Feishu" }, latencyMs: monotonicNowMs() - startedAt,
           budgetAttestation: operationalBudget ? { status: "verified", hardLimitsVerified: true,
             quiescent: true, operationalBudget, contextWindow: Math.max(...state.proofs.map((proof) => proof.contextWindow)),
             proofs: state.proofs } : { status: "legacy-unattested", hardLimitsVerified: false, quiescent: false },
         };
-      } catch (error) {
+      } catch (caught) {
+        let error = safeFailure(state.bodyError ?? caught);
+        state.bodyError = undefined;
+        let recoveryRejected = false;
+        // Only a body judgment over a captured, complete native turn is recoverable here.
+        // Re-read the exact epoch/config/binding before releasing admission; cancellation
+        // or callback/control failures must never reuse an earlier settlement snapshot.
+        if (caught === error && error.diagnosis && state.settlement?.budgetProof &&
+            state.executionKnown && state.preparationKnown &&
+            !context.signal.aborted && remainingDeadlineMs(state.deadline) > 0 &&
+            !state.reportedRunIds.has(state.activeRunId)) {
+          try {
+            const checkFrames = () => {
+              const finals = assertFrames(state.sessionKey, state.activeRunId)
+                .filter((frame) => frame.event === "chat" && frame.payload.state === "final");
+              assert.ok(finals.length === 1 && textOf(finals[0].payload.message) === state.observation.outputText,
+                "Failure recovery requires the same single live final");
+            };
+            checkFrames();
+            const { settled: prior, budgetProof: pinned } = state.settlement;
+            const current = await inspect(state.sessionKey, state.agentId, state.activeRunId, context.signal);
+            assert.ok(current && current.binding.sessionId === prior.binding.sessionId &&
+              current.bindingSha256 === prior.bindingSha256 &&
+              Array.isArray(current.binding.consumedRunIds) &&
+              current.binding.consumedRunIds.at(-1) === state.activeRunId &&
+              current.binding.consumedRunIds.filter((id) => id === state.activeRunId).length === 1,
+            "Failure accounting requires an unfenced binding for the exact consumed run");
+            assert.equal(await realpath(current.directory), await realpath(prior.directory),
+              "Failure accounting changed native epoch");
+            const proof = await readRuntimeBudgetProof(state.runtimeBudgetDirectory,
+              { ...state.budgetExpected, configSha256: pinned.configSha256, settled: true });
+            assert.equal(proof.ledgerSha256, pinned.ledgerSha256, "Failure accounting changed runtime ledger");
+            const failedTurn = { ...state.observation, executionStatus: "failed", businessResult: "failed" };
+            const failedTurns = [...turns, failedTurn];
+            const effects = sideEffects(failedTurns.flatMap((item) => item.tools));
+            assert.ok(!effects.unknown && effects.effects.length === 0, "Failure accounting has uncertain effects");
+            context.signal.throwIfAborted();
+            state.reportedRunIds.add(state.activeRunId);
+            context.reportUsage(failedTurn.usage);
+            const after = await inspect(state.sessionKey, state.agentId, state.activeRunId, context.signal);
+            assert.ok(after && after.bindingSha256 === current.bindingSha256 &&
+              after.directory === current.directory, "Failure binding changed during accounting");
+            const afterProof = await readRuntimeBudgetProof(state.runtimeBudgetDirectory,
+              { ...state.budgetExpected, configSha256: pinned.configSha256, settled: true });
+            assert.equal(afterProof.ledgerSha256, pinned.ledgerSha256, "Failure proof changed during accounting");
+            context.signal.throwIfAborted();
+            checkFrames();
+            const total = sumUsage(usage, failedTurn.usage);
+            const proofs = [...state.proofs, proof];
+            const diagnosis = error.diagnosis;
+            await ledger(context, { event: "turn_settled", runId: state.activeRunId,
+              sessionKey: state.sessionKey, budgetProof: proof,
+              nativeSettlement: { directory: state.runtimeBudgetDirectory,
+                bindingSha256: after.bindingSha256, nativeSessionId: after.binding.sessionId },
+              judgment: { status: "failed", diagnosis } });
+            context.signal.throwIfAborted();
+            checkFrames();
+            const result = {
+              executionStatus: "failed", businessResult: "failed", outputText: failedTurn.outputText,
+              error: { code: error.code, message: error.message }, diagnosis,
+              turns: failedTurns, usage: total, sideEffects: [], controlReceipts,
+              delivery: { delivered: true, terminalOutputs: failedTurns.length, recipient: state.sessionKey },
+              policyFacts: { mode: failedTurn.mode, adapter: "real-Gateway-not-Feishu" },
+              budgetAttestation: { status: "verified", hardLimitsVerified: true, quiescent: true,
+                operationalBudget, contextWindow: Math.max(...proofs.map((value) => value.contextWindow)), proofs },
+              latencyMs: monotonicNowMs() - startedAt,
+            };
+            state.proofs = proofs;
+            state.usage = total;
+            state.activeRunId = undefined;
+            state.settled = true;
+            fenced = false;
+            return result;
+          } catch {
+            // Retain the first body failure, but never promote unsuccessful recovery to settlement.
+            recoveryRejected = true;
+          }
+        }
         const effects = sideEffects(turns.flatMap((item) => item.tools));
         if (error.preDispatchBudgetBlock && !state.activeRunId && !effects.unknown && !effects.effects.length) {
           state.settled = true;
@@ -967,7 +1198,7 @@ export async function createGatewayAcceptanceAdapter(options = {}) {
               undefined, 1000);
             assert.equal(history.sessionId, state.hostSessionId, "Failure accounting cannot substitute the owned session");
             const raw = await owner.readTranscript({ sessionKey: state.sessionKey, agentId: state.agentId, sessionId: history.sessionId });
-            const boundary = resolveActiveResetBoundary(raw, history.sessionId);
+            const boundary = await resolveActiveResetBoundary(raw, history.sessionId);
             state.runtimeBudgetDirectory = join(config.nativeStateDir, hash(boundary.kind === "clear" ? boundary.stateId : history.sessionId));
           } catch { /* A failed lookup cannot establish settlement or release reservations. */ }
         }
@@ -979,7 +1210,19 @@ export async function createGatewayAcceptanceAdapter(options = {}) {
             if (!state.prepareBudget) assert.deepEqual(proof.operationalBudget, state.budgetExpected.operationalBudget,
               "Runtime budget differs from the pinned configured limits");
             const terminal = error.observedTurn?.terminalEvent?.payload;
-            drained = proof.quiescent && proof.hardLimitsVerified && !context.signal.aborted &&
+            const snapshot = await inspect(state.sessionKey, state.agentId, state.activeRunId);
+            const binding = snapshot?.binding;
+            const executionStatus = observedExecutionStatus(undefined, snapshot?.canonical,
+              { ...state.observation, ...error.observedTurn });
+            // Provider settlement cannot establish execution or preparation semantics.
+            drained = executionStatuses.includes(executionStatus) &&
+              preparationModes.includes(binding?.taskPreparation?.state?.mode) && !recoveryRejected && snapshot &&
+              await realpath(snapshot.directory) === await realpath(state.runtimeBudgetDirectory) &&
+              binding.status === "ready" && binding.lastRunId === state.activeRunId &&
+              Array.isArray(binding.consumedRunIds) && binding.consumedRunIds.at(-1) === state.activeRunId &&
+              binding.consumedRunIds.filter((id) => id === state.activeRunId).length === 1 &&
+              ["budgetFailure", "failureDiagnostic", "pendingCompact"].every((key) => !Object.hasOwn(binding, key)) &&
+              proof.quiescent && proof.hardLimitsVerified && !context.signal.aborted && !error.remoteUnsettled &&
               !/abort|timed?\s*out|timeout|fenc/i.test(`${error.name} ${error.code ?? ""} ${error.message}`) &&
               terminal?.state !== "aborted" && !["abort", "aborted", "timeout", "fenced"].includes(terminal?.data?.phase);
           } catch (proofError) {
@@ -1000,16 +1243,18 @@ export async function createGatewayAcceptanceAdapter(options = {}) {
           error.budgetAccounting.observedLowerBound = sumUsage(state.usage,
             error.budgetAccounting.observedLowerBound ?? zeroUsage());
         }
-        const failedTurn = state.activeRunId ? { ...state.observation, ...error.observedTurn } : undefined;
+        const failedTurn = state.activeRunId ? failureTurnSummary({ ...state.observation, ...error.observedTurn }) : undefined;
+        if (error.observedTurn) error.observedTurn = failureTurnSummary(error.observedTurn);
         error.evidence = {
           executionStatus: failedTurn?.executionStatus ?? "unknown", businessResult: "failed",
-          turns: [...turns, ...(failedTurn ? [failedTurn] : [])], sideEffects: effects.effects,
+          turns: [...turns.map(failureTurnSummary), ...(failedTurn ? [failedTurn] : [])], sideEffects: effects.effects,
           unknownEffects: true, controlReceipts, budgetAccounting: error.budgetAccounting,
           budgetAttestation: { status: "unproven", hardLimitsVerified: false, quiescent: false },
         };
         await ledger(context, { event: "case_failed", caseId: testCase.id, reason: error.message,
+          ...(error.diagnosis ? { diagnosis: error.diagnosis } : {}),
           activeRunId: state.activeRunId, sessionKey: state.sessionKey, budgetAccounting: error.budgetAccounting,
-          evidence: error.evidence });
+          evidence: error.evidence }).catch(() => {});
         throw error;
       }
       } finally {

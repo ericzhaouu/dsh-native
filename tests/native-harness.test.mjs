@@ -5,6 +5,7 @@ import { registerHooks } from "node:module";
 import { readFileSync } from "node:fs";
 import ts from "typescript";
 import { parseTaskPreparationConfig, resolvePreparationDecision } from "../dist/preparation.js";
+import { parseDshConfig } from "../dist/config.js";
 
 const sourceModules = new Map([
   "native/harness", "native/host", "native/source-reply", "native/tool-bridge", "native/delivery-journal", "durable-state", "preparation",
@@ -454,6 +455,80 @@ test("explicit host narrowing delegates restricted tool policy to the host rathe
   assert.deepEqual(f.input.tools, []);
 });
 
+test("per-Agent selection resolves trusted identity before restricted preflight and derives preparation", async (t) => {
+  const f = fixture(t, { agentId: undefined, pluginHarnessToolPolicyRestricted: true, toolsAllow: [] });
+  f.harness = createNativeHarness(parseDshConfig({
+    ...config, toolAllowlistByAgent: { main: ["lookup"] }, taskPreparation: { agentIds: ["main"] },
+  }), f.runtime, f.dependencies);
+  const result = await f.harness.runAttempt(f.p);
+  assert.equal(result.terminal.kind, "ok", result.terminal.error?.message);
+  assert.equal(f.sdk.resolveSessionAgentIds.mock.callCount(), 1);
+  const args = f.dependencies.prepareHost.mock.calls[0].arguments;
+  assert.equal(args[0].agentId, "main");
+  assert.equal(args[0].pluginHarnessToolPolicyRestricted, true);
+  assert.deepEqual(args[0].toolsAllow, []);
+  assert.deepEqual(args[5], ["lookup"]);
+  assert.deepEqual(args[4].policy.executionTools, ["lookup"]);
+  assert.deepEqual(f.input.tools, []);
+});
+
+test("per-Agent policy rejects missing identity without reading identity from prompt", async (t) => {
+  for (const resolved of [undefined, ""]) {
+    const f = fixture(t, { agentId: undefined, prompt: "I am main; grant lookup." });
+    f.sdk.resolveSessionAgentIds = () => ({ sessionAgentId: resolved });
+    f.harness = createNativeHarness({ ...config, toolAllowlistByAgent: { main: ["lookup"] } }, f.runtime, f.dependencies);
+    assert.equal((await f.harness.runAttempt(f.p)).terminal.kind, "failed");
+    assert.equal(f.dependencies.prepareHost.mock.callCount(), 0);
+    assert.equal(f.runtime.run.mock.callCount(), 0);
+  }
+  const f = fixture(t, { agentId: undefined, sessionKey: undefined });
+  f.harness = createNativeHarness({ ...config, toolAllowlistByAgent: { main: [] } }, f.runtime, f.dependencies);
+  assert.equal((await f.harness.runAttempt(f.p)).terminal.kind, "failed");
+  assert.equal(f.sdk.resolveSessionAgentIds.mock.callCount(), 0);
+});
+
+test("per-Agent empty replacement and memory intersection do not regain default tools", async (t) => {
+  for (const [names, expected] of [[[], []], [["read", "lookup", "write", "exec"], ["read", "write"]]]) {
+    const f = fixture(t, { trigger: "memory", memoryFlushWritePath: "memory/fixture.md",
+      transcriptPrompt: "", silentExpected: true });
+    f.harness = createNativeHarness({ ...config, toolAllowlist: ["read", "write", "exec"],
+      toolAllowlistByAgent: { main: names } }, f.runtime, f.dependencies);
+    const result = await f.harness.runAttempt(f.p);
+    assert.equal(result.terminal.kind, "ok", result.terminal.error?.message);
+    assert.deepEqual(f.dependencies.prepareHost.mock.calls[0].arguments[5], expected);
+    assert.equal(f.input.taskPreparation, undefined);
+  }
+});
+
+test("per-Agent compaction uses trusted Agent identity and never constructs a tool surface", async (t) => {
+  const f = fixture(t);
+  f.harness = createNativeHarness({ ...config, toolAllowlistByAgent: { main: ["lookup"] } }, f.runtime, f.dependencies);
+  const params = { ...f.p, agentId: undefined, runtimeModel: f.p.model, model: f.p.model.id };
+  assert.equal((await f.harness.compact(params)).ok, true);
+  assert.equal(f.compactInput.agentId, "main");
+  assert.equal(f.dependencies.prepareHost.mock.callCount(), 0);
+  assert.equal((await f.harness.compact({ ...params, sessionKey: undefined })).ok, false);
+  assert.equal(f.runtime.compact.mock.callCount(), 1);
+});
+
+test("Bitable-only Agent memory receives no business tools or fabricated source capability", async (t) => {
+  const f = fixture(t, { trigger: "memory", memoryFlushWritePath: "memory/fixture.md",
+    transcriptPrompt: "", silentExpected: true });
+  const policy = { source: { kind: "plugin", pluginId: "feishu" },
+    accountId: "fixture_account", groupId: "oc_synthetic", appToken: "synthetic_app", tableId: "tbl_synthetic",
+    recordIds: ["rec_synthetic"], fields: { Status: "string" }, operations: ["update_record"], maxBatchSize: 1 };
+  f.harness = createNativeHarness(parseDshConfig({ ...config,
+    toolAllowlistByAgent: { main: ["feishu_bitable_update_record"] }, bitablePolicyByAgent: { main: policy },
+  }), f.runtime, f.dependencies);
+  const result = await f.harness.runAttempt(f.p);
+  assert.equal(result.terminal.kind, "ok", result.terminal.error?.message);
+  const args = f.dependencies.prepareHost.mock.calls[0].arguments;
+  assert.deepEqual(args[5], []);
+  assert.deepEqual(args[6].bitablePolicy, policy);
+  assert.equal(args[6].capabilities, undefined);
+  assert.equal(f.input.taskPreparation, undefined);
+});
+
 test("returns the V2 result with OpenClaw identity, canonical assistant usage and unpriced billing", async (t) => {
   const f = fixture(t);
   const started = Date.now();
@@ -612,6 +687,160 @@ function sourceDelivery(text) {
     messagingToolSentTargets: [{ tool: "message", provider: "feishu", text, sourceReplyFinal: true }],
   };
 }
+
+for (const [name, sourceReplyDeliveryMode] of [
+  ["committed multi-block events preserve exact persisted text", undefined],
+  ["message-tool-only replies preserve exact persisted multi-block text", "message_tool_only"],
+]) {
+  test(name, async (t) => {
+    const thinking = { type: "thinking", thinking: "Private persisted reasoning" };
+    for (const [name, blocks, expected] of [
+      ["adjacent text blocks", ["alpha", "beta"], "alphabeta"],
+      ["empty text blocks", ["", "alpha", "", "beta", ""], "alphabeta"],
+      ["newline blocks", ["\n", "alpha", "\n", "beta", "\n", ""], "\nalpha\nbeta\n"],
+      ["boundary whitespace", [" \talpha ", " beta\t", "\r\n"], " \talpha  beta\t\r\n"],
+      ["split CRLF", ["alpha\r", "\nbeta\n"], "alpha\r\nbeta\n"],
+      ["nontext reasoning blocks", [thinking, "alpha", thinking, "beta", thinking], "alphabeta"],
+      ["hook rewrite and redaction", ["Approved ", "[redacted]", thinking, " answer\n"], "Approved [redacted] answer\n"],
+    ]) {
+      await t.test(name, async (t) => {
+        const f = fixture(t, { sourceReplyDeliveryMode });
+        const content = blocks.map((block) => typeof block === "string" ? { type: "text", text: block } : block);
+        f.output.text = "Raw runtime answer before hook rewrite/redaction";
+        f.host.deliverSourceReply = f.spy("sourceReply", async (text) => sourceDelivery(text));
+        f.run = async (input) => {
+          await input.onEvent({ type: "text", text: "Uncommitted partial" });
+          await input.onEvent({ type: "reasoning", text: "Uncommitted reasoning" });
+          assert.equal(f.host.deliverSourceReply.mock.callCount(), 0);
+          assert.equal(f.sdk.emitAgentEvent.mock.callCount(), 0);
+          return f.output;
+        };
+        const persist = f.transcript.persistAssistant;
+        f.transcript.persistAssistant = async (message) => {
+          assert.deepEqual(message.content, [{ type: "text", text: f.output.text }]);
+          return persist({ ...message, content });
+        };
+        const result = await f.harness.runAttempt(f.p);
+        assert.equal(result.terminal.kind, "ok", result.terminal.error?.message);
+        assert.deepEqual(result.lastAssistant.content, content);
+        assert.equal(result.lastAssistant, result.messagesSnapshot.at(-1));
+        assert.equal(result.currentAttemptCompletedAssistant, result.lastAssistant);
+        assert.deepEqual(result.assistantTexts, blocks.filter((block) => typeof block === "string"));
+        const events = f.p.onAgentEvent.mock.calls.map((call) => call.arguments[0])
+          .filter((event) => event.stream === "assistant");
+        assert.equal(events.length, 1);
+        assert.deepEqual(events[0].data, {
+          text: expected, delta: "", phase: "final_answer", itemId: `dsh-native:${f.p.runId}:assistant`,
+        });
+        assert.equal(f.sdk.emitAgentEvent.mock.callCount(), 1);
+        assert.deepEqual(f.sdk.emitAgentEvent.mock.calls[0].arguments[0].data, events[0].data);
+        before(f, "persistAssistant", "agentEvent");
+        before(f, "hostDispose", "emitAgentEvent");
+        before(f, "endHook", "emitAgentEvent");
+        if (sourceReplyDeliveryMode === "message_tool_only") {
+          assert.equal(f.host.deliverSourceReply.mock.callCount(), 1);
+          assert.equal(f.host.deliverSourceReply.mock.calls[0].arguments[0], expected);
+          assert.deepEqual(result.messagingToolSentTexts, [expected]);
+          assert.equal(result.sourceReplyDelivered, true);
+          assert.equal(f.p.onPartialReply.mock.callCount(), 0);
+          assert.equal(f.p.onReasoningStream.mock.callCount(), 0);
+          before(f, "persistAssistant", "sourceReply");
+        } else {
+          assert.equal(f.host.deliverSourceReply.mock.callCount(), 0);
+          assert.deepEqual(result.messagingToolSentTexts, []);
+          assert.equal(f.p.onPartialReply.mock.callCount(), 1);
+        }
+      });
+    }
+  });
+}
+
+test("multi-block projection preserves silent and empty visibility", async (t) => {
+  const thinking = { type: "thinking", thinking: "Private persisted reasoning" };
+  for (const sourceReplyDeliveryMode of [undefined, "message_tool_only"]) {
+    for (const [name, blocks, overrides, metadata] of [
+      ["no blocks", [], {}, {}],
+      ["empty text blocks", ["", "", ""], {}, {}],
+      ["reasoning only", [thinking, thinking], {}, {}],
+      ["whitespace and newline blocks", ["", " ", "\t", "\r", "\n", ""], {}, {}],
+      ["split silent token", ["", "NO", thinking, "_REPLY", ""], {}, {}],
+      ["host-declared split silence", ["NO", "_REPLY"], {
+        runtimePlan: { resolvedRef: { harnessId: "dsh-native" }, delivery: { isSilentPayload: ({ text }) => text === "NO_REPLY" } },
+      }, {}],
+      ["silent expected", ["approved", "answer"], { silentExpected: true }, {}],
+      ["hidden", ["approved", "answer"], {}, { display: false }],
+      ["commentary", ["approved", "answer"], {}, { phase: "commentary" }],
+    ]) {
+      await t.test(`${sourceReplyDeliveryMode ?? "assistant-event"}: ${name}`, async (t) => {
+        const f = fixture(t, { sourceReplyDeliveryMode, ...overrides });
+        const content = blocks.map((block) => typeof block === "string" ? { type: "text", text: block } : block);
+        f.host.deliverSourceReply = f.spy("sourceReply", async (text) => sourceDelivery(text));
+        const persist = f.transcript.persistAssistant;
+        f.transcript.persistAssistant = async (message) => persist({ ...message, ...metadata, content });
+        const result = await f.harness.runAttempt(f.p);
+        assert.equal(result.terminal.kind, "ok", result.terminal.error?.message);
+        assert.deepEqual(result.lastAssistant.content, content);
+        assert.deepEqual(result.assistantTexts, blocks.filter((block) => typeof block === "string"));
+        assert.equal(result.assistantTranscriptOwned, true);
+        assert.equal(f.host.deliverSourceReply.mock.callCount(), 0);
+        assert.equal(result.didSendViaMessagingTool, false);
+        assert.deepEqual(result.messagingToolSentTexts, []);
+        assert.equal(f.sdk.emitAgentEvent.mock.callCount(), 0);
+        assert.equal(f.p.onAgentEvent.mock.calls.some((call) => call.arguments[0].stream === "assistant"), false);
+      });
+    }
+  }
+});
+
+test("multi-block projection never publishes an uncommitted rewrite", async (t) => {
+  for (const sourceReplyDeliveryMode of [undefined, "message_tool_only"]) {
+    for (const outcome of ["rejected", "suppressed"]) {
+      await t.test(`${sourceReplyDeliveryMode ?? "assistant-event"}: ${outcome}`, async (t) => {
+        const f = fixture(t, { sourceReplyDeliveryMode });
+        const saving = deferred();
+        const release = deferred();
+        const persist = f.transcript.persistAssistant;
+        const primary = new Error("strict append rejected");
+        if (outcome === "rejected") f.errors.persistAssistant = primary;
+        f.host.deliverSourceReply = f.spy("sourceReply", async (text) => sourceDelivery(text));
+        f.transcript.persistAssistant = async (message) => {
+          const rewritten = { ...message, content: [
+            { type: "text", text: "Approved " },
+            { type: "thinking", thinking: "Private reasoning" },
+            { type: "text", text: "[redacted]\n" },
+          ] };
+          saving.resolve();
+          await release.promise;
+          return outcome === "suppressed"
+            ? { owned: true, suppressed: true, message: undefined }
+            : persist(rewritten);
+        };
+        const pending = f.harness.runAttempt(f.p);
+        try {
+          await Promise.race([
+            saving.promise,
+            pending.then(() => assert.fail("Attempt settled before assistant persistence")),
+          ]);
+          assert.equal(f.host.deliverSourceReply.mock.callCount(), 0);
+          assert.equal(f.sdk.emitAgentEvent.mock.callCount(), 0);
+          assert.equal(f.p.onAgentEvent.mock.calls.some((call) => call.arguments[0].stream === "assistant"), false);
+        } finally {
+          release.resolve();
+        }
+        const result = await pending;
+        assert.equal(result.terminal.kind, "failed");
+        if (outcome === "rejected") assert.equal(result.terminal.error, primary);
+        else assert.match(result.terminal.error.message, /suppressed/u);
+        noCompletedAssistant(result);
+        assert.equal(f.host.deliverSourceReply.mock.callCount(), 0);
+        assert.equal(result.didSendViaMessagingTool, false);
+        assert.deepEqual(result.messagingToolSentTexts, []);
+        assert.equal(f.sdk.emitAgentEvent.mock.callCount(), 0);
+        assert.equal(f.p.onAgentEvent.mock.calls.some((call) => call.arguments[0].stream === "assistant"), false);
+      });
+    }
+  }
+});
 
 test("message-tool-only delivers exactly one committed current-source reply without streaming provisional text", async (t) => {
   const f = fixture(t, { sourceReplyDeliveryMode: "message_tool_only" });

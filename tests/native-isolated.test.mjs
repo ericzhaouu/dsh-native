@@ -102,6 +102,32 @@ test("isolated completion admission bounds parallel disposable runtimes before m
   });
 });
 
+test("per-Agent isolated completion validates identity but always exposes zero tools", async () => {
+  const root = stateRoot();
+  let runs = 0;
+  const service = createIsolatedCompletion(parseDshConfig({ stateDir: root,
+    toolAllowlistByAgent: { main: ["lookup"] } }), route, { runtimeFactory: () => ({
+    async run(input) {
+      runs++;
+      assert.equal(input.agentId, "main");
+      assert.deepEqual(input.tools, []);
+      assert.equal(input.taskPreparation, undefined);
+      await assert.rejects(input.executeTool({ name: "lookup" }), /no tool surface/);
+      return { text: "blocked", sessionId: input.sessionId,
+        usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 }, stopReason: "stop", toolCalls: 0 };
+    }, async dispose() {},
+  }) });
+  try {
+    await assert.rejects(service.run(params({ agentId: undefined })), /scope/);
+    assert.equal(runs, 0);
+    await assert.rejects(service.run(params()), /attempted to use tools/);
+    assert.equal(runs, 1);
+  } finally {
+    await service.dispose();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("isolated completion uses a fresh zero-tool private runtime call and cleans successful state", async (t) => {
   const calls = [];
   const configs = [];

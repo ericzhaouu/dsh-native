@@ -1,6 +1,6 @@
 # DSH Native for OpenClaw
 
-**发布候选版本 1.0.0-rc.2（非稳定版）**：把官方 DeepSeek Harness（DSH）的模型／工具循环接入 OpenClaw 的原生 `AgentHarnessV2`，并保留 OpenClaw 对模型、认证、工具授权与会话入口的控制。
+**发布候选版本 1.0.0-rc.3（非稳定版）**：把官方 DeepSeek Harness（DSH）的模型／工具循环接入 OpenClaw 的原生 `AgentHarnessV2`，并保留 OpenClaw 对模型、认证、工具授权与会话入口的控制。
 
 - 源码仓库：[ericzhaouu/dsh-native](https://github.com/ericzhaouu/dsh-native)
 - 作者：[ericzhaouu](https://github.com/ericzhaouu)
@@ -16,6 +16,7 @@
 
 ## 目录
 
+- [1.0.0-rc.3 模式、最终正文与验收控制](#100-rc3-模式最终正文与验收控制)
 - [1.0.0-rc.2 根因整改与诊断](#100-rc2-根因整改与诊断)
 - [1.0.0-rc.1 当前请求优先](#100-rc1-当前请求优先)
 - [0.7.4 执行预算与验收边界](#074-执行预算与验收边界)
@@ -45,6 +46,31 @@
 - [仓库结构](#仓库结构)
 - [排错](#排错)
 - [致谢与许可证](#致谢与许可证)
+
+## 1.0.0-rc.3 模式、最终正文与验收控制
+
+RC3 是源码候选，不是稳定版、生产升级或验收通过声明。本轮发布说明与版本元数据准备不部署插件、不应用宿主补丁、不修改真实飞书／业务记录；依赖版本保持固定。真实模型、飞书读写、完整语料与远程 CI 仍需对应制品的新证据，不能用局部 fixture 或历史报告代替。
+
+- **当前交互与模式**：用户要求现在直接提问／共同探索时属于 `chat`，不是因为答案是文本就改成 `draft`，也不是因为整体目标还有未知就进入阻断式 `clarify`。供以后使用的问题模板／访谈稿属于 `draft`；当前核实／执行确被材料或权限阻断时才澄清。普通聊天问题不占阻断澄清次数；未读取的 Skill、未检索的资料或未完成的人审不能声称已使用／核实。非执行模式保持零宿主工具。
+- **显式 v4 与可恢复 campaign**：`--source-corpus-version 4 --contract-version 2` 选择 `tests\acceptance\cases\v4` 的审阅增量，默认仍是 source-v1／contract-v2，不重判 v1–v3 的旧报告。新的等待、恢复与预算入口见下文“RC3：v4 语料与 campaign 等待恢复”；它们不改变现有 native 只读 source 验收路径或默认选择。
+- **精确工具覆盖与资源限界**：`toolAllowlistByAgent` 只替换命中 Agent 的候选清单，不突破宿主权限；`bitablePolicyByAgent` 默认关闭，要求精确资源策略与可信原始工具实例 capability。stock `prepareNativeHost` 不提供该 capability，相关 Bitable 工具保持 fail-closed，不能据配置示例宣称真实写入可用。保留下文完整的 newtool 配置与限制；不向全局追加工具，不修改已有业务／只读 Agent、原生当前来源投递路由或未配置时的默认行为。
+
+### DSH-only chat-final-text companion
+
+独立 `host-patch\chat-final-text` companion 只对可信运行上下文中显式设置 `runtime.type:"embedded"`、`runtime.harness:"dsh-native"` 的 Agent 保留普通最终正文的首尾空白；多 text block 按原顺序拼接，不额外插入换行。它不是所有输出的无条件原始字节通道：纯空白仍隐藏，已有控制 token、heartbeat、脱敏等规则继续生效；非 DSH 保持旧投影，legacy model-selected DSH 不获得这一正文保证。
+
+显式 Agent-pin 的 native preflight 只读检查 companion，缺失／partial／被改动时在模型执行前拒绝，不自动修补宿主。该补丁独立于 `source-reply` 所有权和 `table-policy` 格式策略，不扩大消息目标、source routing 或工具权限。准确范围、两个固定宿主文件及哈希见 `host-patch\chat-final-text\USAGE.txt` 和 `spec.mjs`。
+
+需要安装时，先在独占离线维护窗口停止／排空对应 Gateway，再对精确 OpenClaw 2026.9.2 制品执行；以下是操作模板，不表示已经应用：
+
+```powershell
+node .\host-patch\chat-final-text\apply.mjs --root C:\PATH\TO\openclaw --check
+node .\host-patch\chat-final-text\apply.mjs --root C:\PATH\TO\openclaw --apply --offline-confirmed
+# 仅需回退时，在同样的离线窗口执行：
+node .\host-patch\chat-final-text\apply.mjs --root C:\PATH\TO\openclaw --restore --offline-confirmed
+```
+
+保留独立 `.dsh-native-chat-final-text-patch-v1` 回执并协调插件回退；脚本不重启 Gateway。既有 `source-reply`／`table-policy`／`group-readonly` companion 的职责和默认策略不变，不将此 RC3 新要求追写为旧版本已具备的能力。
 
 ## 1.0.0-rc.2 根因整改与诊断
 
@@ -227,6 +253,48 @@ OpenClaw 的聊天 `/new` 可以保留原 `sessionId`，通过宿主转录中的
 - 构造、授权、执行 hooks、认证及资源清理由宿主负责；DSH 仅接收参数 schema 和获准的文本结果。原始结果仍在宿主执行链中，不能把 `details`、环境变量或认证对象整体发送给模型。
 - 名单不保证所有未入选的插件工厂都不会初始化；它约束最终暴露和执行。插件本身仍是需要信任的本机代码。
 - 同名冲突、来源变化、已绑定但无法安全插入最终校验的工具或不兼容参数 schema 不会被静默接受。插件替换和启停遵循宿主维护／重载规则，不给正在执行的尝试偷偷增加权限。
+
+### 精确 Agent 覆盖与默认关闭的 Bitable 资源门禁
+
+`toolAllowlistByAgent` 的精确条目**替换**该 Agent 的 DSH 候选清单，不是追加到全局；`[]` 明确无工具。最多 64 个 Agent、每项最多 64 个唯一工具名，无通配符、重复、原型键或非法 Agent ID。未配置／未匹配保持旧行为。身份来自宿主已解析 Agent 或 SDK 会话解析器，不能来自 prompt；启用覆盖却无法解析身份时拒绝，不退回全局清单。
+
+最终能力始终是候选清单 ∩ 宿主全局／Agent／渠道／会话允许 ∩ execution ceiling ∩ preparation gate。未显式配置 `taskPreparation.executionTools` 时，准备策略使用当前 Agent 的候选清单；显式配置时仅取交集，不自动扩权（原有全局名单冲突校验不变）。memory 仍只取 read/write，isolated 和 compact 仍零工具。
+
+下面是插件配置的**合成资源示例**，不是生产接线或已有权限证明。保留原全局列表、瑞比／辛巴及已有只读验收 Agent 的宿主策略；另设专用 writer Agent，宿主仅允许这两个工具，不允许 exec、HTTP、文件工具或替代 dispatcher。不要覆盖已有 preparation Agent 列表；按需将 writer 加入其中并省略 executionTools，或显式配置更窄上限。
+
+```json
+{
+  "toolAllowlist": ["read", "write", "edit", "apply_patch", "exec", "process", "web_search", "web_fetch"],
+  "toolAllowlistByAgent": {
+    "dsh-acceptance-writer": ["feishu_bitable_get_record", "feishu_bitable_update_record"]
+  },
+  "bitablePolicyByAgent": {
+    "dsh-acceptance-writer": {
+      "source": { "kind": "plugin", "pluginId": "feishu" },
+      "accountId": "fixture_account",
+      "groupId": "oc_synthetic",
+      "appToken": "synthetic_app",
+      "tableId": "tbl_synthetic",
+      "recordIds": ["rec_synthetic"],
+      "fields": { "Status": "string", "Count": "number", "Checked": "boolean" },
+      "operations": ["get_record", "update_record"],
+      "maxBatchSize": 1
+    }
+  }
+}
+```
+
+资源策略必须对应精确 override，且该 Agent 只能选择策略中列出的 record 工具。新 override 中的 `feishu_bitable_*` 没有资源策略时拒绝配置。当前契约故意只支持单记录 get/update；不支持 list/search/create/batch/delete、app/table/field 管理、权限修改或账号重定向。参数只能是 `app_token/table_id/record_id`，update 另带 `fields`。字段是大小写敏感的原样名称，只支持 string/有限 number/boolean；不接受 `fld...` ID 别名、复杂对象或隐式类型转换。每次最多一个记录；大于 1 的 batch 配置拒绝。
+
+在宿主 before-tool hook **之后、原实例 callback 之前**再次校验来源、可信上下文、目标与参数，并复制／冻结参数防止检查后漂移。读回也只能访问相同表与记录；返回契约限定为 JSON `{record:{record_id,fields}}`，只投影允许的字段，不返回其他字段、details 或服务端错误。未知返回格式失败，不虚报成功。
+
+**生产写入仍关闭：**只读检查本地精确 OpenClaw 2026.9.2 SDK 的 dist 后，找到 Feishu 外部插件目录声明，但未找到该安装内可验证的 Bitable 实现／资源 grants。公开 attempt 有 `agentAccountId/groupId/messageProvider/inputProvenance/currentMessageId` 等上下文；这不等于证明某个 Feishu 工具闭包实际使用该账号，也不能据此猜测可信群与真实前台请求的绑定。
+
+内部宿主接线 API 是 `src/native/host.ts` 的 `createNativeToolHost({ ..., bitableScope: { policy, capabilities } })`；类型位于 `src/native/bitable-gate.ts`。每个 `BitableToolCapability` 必须绑定**同一个原始工具实例**，包含 `agentId/accountId/groupId/channel:"feishu"/provenance:"external_user"/foreground:true/runId/sessionId/requestId/contract:"feishu-bitable-record-v1"` 和实时 `assertCurrent()`。这些不是模型参数，也不是可配置的自我声明。stock `prepareNativeHost` 只传 policy，**不制造 capabilities**，因此隐藏并拒绝相关工具。
+
+主 Session 须先核验版本固定的实际 Feishu 工具契约、真实账号闭包、认证来源群／请求／前台生命周期及既有资源 grants，再通过可信宿主入口接线；任何一项不可验证则保持关闭。需用两个专用合成目标做正反例，不能用生产业务记录、prompt 或 exec wrapper 代替 ACL。这里的 capability fixture 测试不证明生产写入已可用。
+
+当前 binding 新增可选 `toolPolicyFingerprint`，只绑定命中的 Agent override、有效 preparation 和资源策略，不加入整张 Agent 映射。增加／修改／删除目标策略须 `/new` 或可信清空 reset epoch；compact/recovery 也检查。其他 Agent 仍保留原绑定格式，不要求全体迁移。
 
 **工具缺失不是需求不清楚。** 请求但未能获得的工具会进入有界的不可用说明；不能证明具体原因时，只说“不可用或被宿主策略过滤”，不猜测是否缺凭据。缺少专用业务工具名，不等于宿主已有的授权 CLI 路线必然不可用；但该说明本身也不证明 CLI 获准使用。仅在本轮提供 `exec`、任务授权该操作且宿主权限与审批允许时，才可使用已经安装、已经授权的 CLI。明确被拒绝的操作不能通过命令、其他账号、新连接或安装新能力绕过。
 
@@ -618,7 +686,7 @@ Copilot 默认列表：
 
 `maxDurationMs` 到期停止准入并请求取消，**不等于远端模型／宿主工具已停止**；实际未确认收敛时保留隔离，不把等待超时当作清理成功。验收 runner 的 case／campaign 分配仅是上限；适配器必须在每次派发前证明已安装的运行时预算能容纳剩余额度与剩余时间，runner 不会自行改插件配置。额度过小、未知消耗或缺少证明都明确阻断。
 
-独立评审的控制器总时限默认是 120 秒；私有 scope 可用 `reviewOperationalBudget.maxDurationMs` 显式指定更长或更短的时限，但仍受该 case 的 `limits.timeoutMs` 限制。初始化、资源和认证准备都计入同一个绝对截止时间，必须为已配置的原生执行上限留出余量；这不会修改插件的原生时限或请求、token、工具额度。
+独立评审未配置预算 root 时，控制器总时限默认是 120 秒，并受该 case 的 `limits.timeoutMs` 限制。RC3 私有 scope 可用 `reviewCaseBudget.maxDurationMs`，兼容旧 `reviewOperationalBudget.maxDurationMs`；`reviewAttemptBudget` 单独描述原生单次上限。只提供 attempt 时，case 资源额度按轮数推导、时限取 case timeout；评审按一次计算。初始化、资源和认证准备都计入同一个绝对截止时间，必须为已配置的原生执行上限留出余量；这些分配不会修改插件的原生时限或请求、token、工具额度。
 
 ## 能力边界与 Dashboard
 
@@ -775,6 +843,46 @@ npm.cmd run acceptance:dry-run -- --manifest "$PlanRoot\manifest.json" --run-roo
 V2 报告将业务、模式和结果不匹配记入独立的策略／期望指标；用例与关键用例仍失败，但不因此单独宣称发生了安全违规。实际副作用、授权、评分来源与证据完整性错误仍失败关闭。
 
 Gateway 的 `duplicate_inbound_delivery` 默认仍重复当前轮请求。显式 `controlVersion: 1` 配合 `replaySourceTurn` 才会取用本用例内此前已结算的输入载荷，包括当时的资源上下文；目标轮自己的幂等键用于验证重复提交。回执分别绑定原始／实际载荷哈希及 reset 边界，控制说明不作为用户业务输入发送。这是 Gateway 控制证据，不代替真实飞书重连或业务写入幂等证明。
+
+### RC3：v4 语料与 campaign 等待恢复
+
+以下使用源码仓库实际入口；验收脚本／语料不是 npm 安装包中的通用运维命令。先用 `node .\scripts\compile-acceptance.mjs --help`、`node .\scripts\run-acceptance.mjs --help`、`node .\scripts\run-acceptance-campaign.mjs --help` 核对当前参数和私有配置结构。
+
+v4 文件是 `tests\acceptance\cases\v4\single-turn.json`、`multi-turn.json`、`feishu-canary.json` 与 `review-map.json`，保留基线来源、审阅原因及逐轮期望。v4 是**源语料版本**，不是 `--contract-version 4`；下面只编译／预演，不调用模型或飞书，也不产生通过证明。输出目录须为新的私有绝对路径：
+
+```powershell
+$PlanRoot = 'C:\PRIVATE\rc3-v4-plan'
+node .\scripts\compile-acceptance.mjs --output-root $PlanRoot --source-corpus-version 4 --contract-version 2
+node .\scripts\run-acceptance.mjs --manifest "$PlanRoot\manifest.json" --run-root "$PlanRoot\runs" --dry-run
+```
+
+`scripts\run-acceptance-campaign.mjs` 的公开子命令只有 `prepare`、`start`、`resume`、`status`；`--detach` 仅用于 `start`／`resume`，没有额外的 `--wait`／`--budget`／`--timeout` 开关。健康等待与预算由 `--config` 指向的私有 JSON 配置；`--help` 列出完整结构。先固定候选源码、已构建 runtime／host dist、依赖制品和 SHA-256 pins，再 prepare；版本元数据变化也会使旧 pins 失效，不能直接复用旧准备结果。
+
+必须显式配置独立 adapter／reviewer、manifest／oracles、授权 scope、健康端点及子进程 `env`，不自动继承 ambient 环境或发现凭据。内建预算策略使用已有共享 `budget.accountRoot`、固定哈希的 authorization／baseline；不能为新 campaign 复制／重置账户。campaign root 必须在冻结的 source root 之外；Windows 私有 ACL 须由操作员预先配置，不宣称目录 fsync 已认证。
+
+以下模板需要这些前置条件；`start`／`resume` 可能调用模型，只有取得授权后才能运行。此次版本准备不执行这些命令：
+
+```powershell
+node .\scripts\run-acceptance-campaign.mjs prepare --config C:\PRIVATE\rc3-campaign-config.json
+node .\scripts\run-acceptance-campaign.mjs start --root C:\PRIVATE\rc3-campaign --detach
+node .\scripts\run-acceptance-campaign.mjs status --root C:\PRIVATE\rc3-campaign
+# 审计旧执行并确认需要恢复后：
+node .\scripts\run-acceptance-campaign.mjs resume --root C:\PRIVATE\rc3-campaign --detach
+```
+
+- **等待而非强制重启**：仅明确的临时健康故障退避重试，认证／配置错误不重试；健康成功要求连续样本（默认且至少 3）。`health.totalWaitMs` 到期持久化 `paused / health-wait-expired`。这不是覆盖所有静态工作的硬超时，也不重启 Gateway。
+- **显式恢复、不重放**：`start` 不接管旧 claim；`resume` 先核验旧 controller／child 的 PID 与 OS 启动身份、journal、回执、report 和 dispatch ledger。心跳陈旧不等于进程已死；已派发、成功或结果未知的 case 不自动重跑。完整证据可补结算；身份、用量或副作用不明仍隔离，不删锁“修复”。
+- **看证据而非退出码**：前台仅 `completed` 返回 0，`paused`／`failed` 返回 1；`completed` 也可能包含已结算的失败／阻塞 case。后台 `launch-requested` 与 `status` 的成功退出不证明运行中或通过。核对 `campaign.json`、`pins.json`、`status.json`、`controller.jsonl`、`receipts` 和 `cases` 下实际 run 的 `report.json`／适用的 `gateway-acceptance-ledger.jsonl`；预算事件在同一 `controller.jsonl`，不是另一个 `budget.json`。
+
+### RC3：case、attempt 与共享预算
+
+`scripts\run-acceptance.mjs --help` 中的私有 scope 分开 `caseBudget`／`attemptBudget`，评审使用 `reviewCaseBudget`／`reviewAttemptBudget` 和独立 `reviewBudgets`。显式 case root 优先于兼容的 `operationalBudget`（评审为 `reviewOperationalBudget`）；在该情况下旧键可作为 attempt 上限的 fallback。未启用预算的 legacy/default 执行仍为 `unattested`，不自动改变运行时默认值。
+
+内建 campaign 预算把 T 轮 DUT 分为 T 份原生 attempt，另为一次 reviewer 预留；两者在子进程派发前一起持久化。共享 `userTurns` 只计 DUT 输入，评审的物理请求和 token 仍记账。共享 input 是 input＋cache-read＋cache-write 的**一次聚合额度**，不是给各报告字段再授权三份或六份。历史已知消耗与未结算暴露均占用同一授权账户。
+
+`prepare`／执行前静态预检核对已安装的全局与 exact-Agent 原生 cap，并要求 primary／全部 fallback 模型显式声明完整 `contextWindow`；不会替操作员扩大 cap。每次派发还必须证明有效原生上限适配剩余 case／campaign 额度、完整窗口及剩余时间。`budget.caseSetupMs`／`reviewSetupMs` 各须是大于 25 的整数，`runnerTimeoutMs` 须大于 DUT、reviewer 原生时长与各自 setup 余量之和；这些是等待／分配配置，不是新的原生额度。
+
+`runnerTimeoutMs` 到期**不杀子进程，也不证明远端已停止**；未结算执行保留暴露并暂停。成功静态预检不能代替实际 runtime ledger、完整 accounting 与 quiescent cleanup 证明；未知消耗不能当作零，实际超额不能裁剪为预留数，溢出失败关闭。不得用调大等待时间、重置 baseline 或重复发送绕过预算／所有权隔离。
 
 ### 有界原生运行压测
 

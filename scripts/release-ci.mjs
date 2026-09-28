@@ -58,6 +58,12 @@ export function sdkTransportRequirement(platform, optIn) {
   return platform === "linux";
 }
 
+export function sdkCompanionPaths(root = process.cwd()) {
+  const companions = ["", "compact-auth", "source-reply", "table-policy", "chat-final-text"];
+  if (existsSync(join(root, "host-patch", "group-readonly"))) companions.push("group-readonly");
+  return companions.map((name) => join(root, "host-patch", name, "apply.mjs"));
+}
+
 async function fixtures() {
   let ok = false;
   try {
@@ -118,10 +124,8 @@ async function full() {
     const target = resolve("node_modules", "openclaw");
     if (existsSync(target)) throw new Error("Refusing to replace an existing SDK installation.");
     symlinkSync(join(sdkRoot, "node_modules", "openclaw"), target, process.platform === "win32" ? "junction" : "dir");
-    const companions = ["", "compact-auth", "source-reply", "table-policy"];
-    if (existsSync(join("host-patch", "group-readonly"))) companions.push("group-readonly");
-    for (const companion of companions) {
-      run(process.execPath, [join("host-patch", companion, "apply.mjs"), "--root", target, "--check"]);
+    for (const companion of sdkCompanionPaths()) {
+      run(process.execPath, [companion, "--root", target, "--check"]);
     }
     npm(["run", "typecheck"]);
     npm(["run", "build"]);

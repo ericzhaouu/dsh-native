@@ -61,4 +61,25 @@ test("preparation skill catalog is explicit, exact-name scoped and empty by defa
   assert.doesNotMatch(filtered, /web-helper|Unfiltered catalog/);
   assert.match(filtered, /guidance, not permission/);
   assert.match(filtered, /does not require skill loading or execute mode for an explanation or draft/);
+  assert.match(filtered, /direct conversational question is also tool-free/);
+  assert.match(filtered, /explicitly requested skill.*actual tool ceiling/);
+});
+
+test("optional and explicit skill decisions cannot manufacture read or network capabilities", () => {
+  const policy = resolvePreparationPolicy(parseTaskPreparationConfig({
+    agentIds: ["experiment"], executionTools: ["read"], skillAllowlist: ["local-helper"],
+  }), "experiment");
+  for (const [mode, supplied] of [["chat", ["read"]], ["draft", ["read"]], ["execute", ["read"]], ["execute", []]]) {
+    const userText = mode === "execute" ? "Use local-helper to summarize the supplied text." : "Ask me one question.";
+    const value = resolvePreparationDecision({ version: 1, policy, userText }, {
+      version: 1, revision: 0, mode, task: "new", goal: userText, deliverables: ["A response"],
+      constraints: ["No network"], assumptions: [], unresolved: [], question: "", enhancedPrompt: userText,
+      evidence: { source: "current", quote: userText },
+    }, "skill-contrast", [...supplied, "web_search"]);
+    const gate = createPreparationGate(policy);
+    gate.resolve(value);
+    assert.throws(() => gate.start("web_search"), /not authorized/);
+    if (mode === "execute" && supplied.includes("read")) assert.doesNotThrow(() => gate.start("read"));
+    else assert.throws(() => gate.start("read"), /not authorized/);
+  }
 });

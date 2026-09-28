@@ -16,6 +16,37 @@ const v1Corpus = new Map(Object.entries({
   },
 }));
 
+const versionedCorpus = new Map(Object.entries({
+  "v2/single-turn.json": {
+    materialized: "c959002b2e85d10a335ddb88147845316012a6471f13963aa15c848657066863",
+    lfBlob: "8f9fc3b1da6db645fee797ec61ef794bb509a483705f6ff7ec703bee6521488f",
+  },
+  "v3/single-turn.json": {
+    materialized: "5343a40b68abde23ab35fa0b6d76d7bc13dd29b1f511192fff656e70ab2816e6",
+    crlfCheckout: "c5464eb0e73f724f47ca2c6babcd46c3b0004d33c4e2af25c89933428b1c35db",
+  },
+  "v3/multi-turn.json": {
+    materialized: "4c24294d3b7c4bb0f8f6f1cab8bbf257c504665a56431757e197358c80b8472c",
+    crlfCheckout: "b55e3a183407017c07ca692c2596b0178fdbbab63d1990921ddbe26d02d63967",
+  },
+  "v4/single-turn.json": {
+    materialized: "aa796ae19fb5bd73e34b3e3acdf15b7b28ab04497f6da159efb8a5d101d3508d",
+    crlfCheckout: "0d2be6ae8d3d7db4b2c7ca8dbc61daefeedba1dc07b5ea230dbd795e37f43e64",
+  },
+  "v4/multi-turn.json": {
+    materialized: "2641c95b23f09db0a50b4f0baeed16e54c1032c853177c5c6cfe848c5db9731d",
+    crlfCheckout: "c9091c3dcf15d4cfb3b734a5abf5141ee7daaa2608461a1c1e36325885f3b0c4",
+  },
+  "v4/feishu-canary.json": {
+    materialized: "9521bf74b79c4c0d899f38ce4e4e58eda741525dea93bd8d7954a884501acedb",
+    crlfCheckout: "4ca9f021845a21b49306020615936d71fe7fa865b477ce84a63eff453df232dd",
+  },
+  "v4/review-map.json": {
+    materialized: "4309b53d74e49dc00983941035793f7533822e34641a27248d527a7bcd732789",
+    crlfCheckout: "2d95f3105b53000fc58aea5857666e5046e45936dba185260ef2466ac5ebf6ff",
+  },
+}));
+
 const acceptanceFixtures = new Map(Object.entries({
   "synthetic-article.txt": {
     materialized: "453747775d22ae05035142a823b35097855be8a86c438b4c59d0e7f86f2b98df",
@@ -41,6 +72,7 @@ const acceptanceFixtures = new Map(Object.entries({
 
 export const acceptanceByteContract = Object.freeze({
   v1Corpus: Object.freeze(Object.fromEntries([...v1Corpus].map(([name, contract]) => [name, Object.freeze({ ...contract })]))),
+  versionedCorpus: Object.freeze(Object.fromEntries([...versionedCorpus].map(([name, contract]) => [name, Object.freeze({ ...contract })]))),
   fixtures: Object.freeze(Object.fromEntries([...acceptanceFixtures].map(([name, contract]) => [name, Object.freeze({ ...contract })]))),
 });
 
@@ -67,7 +99,10 @@ function materializeReviewedBytes(name, bytes, contract, convert, sourceDescript
 
 export function materializeAcceptanceCorpusBytes(name, bytes) {
   const contract = v1Corpus.get(name);
-  return contract ? materializeReviewedBytes(name, bytes, contract, toCrLf, "corpus") : bytes;
+  if (contract) return materializeReviewedBytes(name, bytes, contract, toCrLf, "corpus");
+  const versioned = versionedCorpus.get(name);
+  if (!versioned) throw new Error(`Unknown acceptance corpus byte contract ${name}`);
+  return materializeReviewedBytes(name, bytes, versioned, name.startsWith("v2/") ? toCrLf : toLf, "corpus");
 }
 
 export function materializeAcceptanceFixtureBytes(name, bytes) {

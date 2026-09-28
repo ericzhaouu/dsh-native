@@ -10,9 +10,91 @@ import { readAcceptanceCorpusBytes, readAcceptanceFixtureBytes } from "./lib/acc
 const corpusRoot = new URL("../tests/acceptance/cases/", import.meta.url);
 const fixtureRoot = new URL("../tests/fixtures/acceptance/", import.meta.url);
 const CORPUS_VERSION = "approved1.0testplan.acceptanceCorpus.v1";
-const sourceCorpusVersions = { 1: CORPUS_VERSION, 2: "approved-v2", 3: "approved-v3" };
-const usage = "Usage: node scripts\\compile-acceptance.mjs --output-root <new-absolute-dir> [--subset all|single|multi|canary] [--contract-version 1|2] [--source-corpus-version 1|2|3]";
+const sourceCorpusVersions = { 1: CORPUS_VERSION, 2: "approved-v2", 3: "approved-v3", 4: "approved-v4" };
+const usage = "Usage: node scripts\\compile-acceptance.mjs --output-root <new-absolute-dir> [--subset all|single|multi|canary] [--contract-version 1|2] [--source-corpus-version 1|2|3|4]";
 const modes = new Set(["chat", "clarify", "draft", "execute"]);
+
+// V4 is a reviewed delta over immutable source bytes, not a regrading of old runs.
+export function materializeV4Corpus(base, revision, kind) {
+  const check = (condition) => { if (!condition) throw new Error("Invalid v4 corpus revision"); };
+  const keys = (value, allowed) => value && typeof value === "object" && !Array.isArray(value) &&
+    Object.keys(value).every((key) => allowed.includes(key));
+  const text = (value) => typeof value === "string" && value.trim().length > 0;
+  const texts = (value) => Array.isArray(value) && value.length > 0 && value.every(text);
+  check(["single", "multi", "canary"].includes(kind));
+  check(keys(revision, ["schemaVersion", "baseSource", "sourceReview", "changes", "scriptControls"]));
+  check(revision.schemaVersion === sourceCorpusVersions[4] && Array.isArray(revision.changes));
+  const doc = structuredClone(base);
+  doc.schemaVersion = revision.schemaVersion;
+  doc.sourceReview = revision.sourceReview;
+  const targets = new Map();
+  const unchanged = () => ({
+    kind: "reviewed-unchanged", previousSourceCorpusVersion: base.schemaVersion,
+    baseSource: revision.baseSource,
+  });
+  for (const item of kind === "multi" ? doc.scripts : doc.cases) {
+    item.schemaVersion = revision.schemaVersion;
+    item.sourceRevision = unchanged();
+    if (kind === "single") {
+      item.variantContracts = item.modelVisible.variants.map((prompt, index) => {
+        const row = { prompt, expected: structuredClone(item.expected), oracle: structuredClone(item.oracle),
+          sourceRevision: unchanged() };
+        targets.set(`${item.caseId}-v${index + 1}`, row);
+        return row;
+      });
+    } else if (kind === "multi") {
+      for (const turn of item.turns) {
+        turn.sourceRevision = unchanged();
+        targets.set(turn.turnId, turn);
+      }
+    } else targets.set(item.caseId, item);
+  }
+  const changed = new Set();
+  for (const change of revision.changes) {
+    check(keys(change, ["targets", "reason", "prompt", "appendPrompt", "expected",
+      "businessAssertions", "addSafetyAssertions"]));
+    check(texts(change.targets) && text(change.reason));
+    check(!(Object.hasOwn(change, "prompt") && Object.hasOwn(change, "appendPrompt")));
+    for (const field of ["prompt", "appendPrompt"]) if (Object.hasOwn(change, field)) check(text(change[field]));
+    for (const field of ["businessAssertions", "addSafetyAssertions"]) {
+      if (Object.hasOwn(change, field)) check(texts(change[field]));
+    }
+    if (Object.hasOwn(change, "expected")) {
+      check(keys(change.expected, ["modes", "permittedOutcomes"]));
+      check(texts(change.expected.modes) && change.expected.modes.every((mode) => modes.has(mode)));
+      check(texts(change.expected.permittedOutcomes) &&
+        change.expected.permittedOutcomes.every((outcome) => ["completed", "correctly_blocked"].includes(outcome)));
+    }
+    for (const id of change.targets) {
+      check(targets.has(id) && !changed.has(id));
+      changed.add(id);
+      const row = targets.get(id);
+      const before = kind === "single" ? row.prompt : row.modelVisible.text;
+      const prompt = change.prompt ?? (change.appendPrompt ? `${before}${change.appendPrompt}` : before);
+      if (kind === "single") row.prompt = prompt;
+      else row.modelVisible.text = prompt;
+      if (change.expected) row.expected = structuredClone(change.expected);
+      if (change.businessAssertions) row.oracle.businessAssertions = [...change.businessAssertions];
+      if (change.addSafetyAssertions) row.oracle.safetyAssertions.push(...change.addSafetyAssertions);
+      row.sourceRevision = { ...unchanged(), kind: "revised", reason: change.reason };
+    }
+  }
+  check(revision.scriptControls === undefined || kind === "multi" && Array.isArray(revision.scriptControls));
+  const controlled = new Set();
+  for (const change of revision.scriptControls ?? []) {
+    check(keys(change, ["scriptId", "reason", "add"]) && text(change.reason));
+    const script = doc.scripts.find((item) => item.scriptId === change.scriptId);
+    check(script && !controlled.has(change.scriptId));
+    controlled.add(change.scriptId);
+    check(keys(change.add, ["type", "appliesAfterTurn", "visibleToModel"]) &&
+      change.add.type === "new_context" && change.add.visibleToModel === false &&
+      Number.isInteger(change.add.appliesAfterTurn) && change.add.appliesAfterTurn > 0 &&
+      change.add.appliesAfterTurn < script.turns.length);
+    script.adapterControls = [...(script.adapterControls ?? []), structuredClone(change.add)];
+    script.sourceRevision = { ...unchanged(), kind: "revised", reason: change.reason };
+  }
+  return doc;
+}
 
 function category(taskClass = "") {
   if (/skill|distill/.test(taskClass)) return "skill";
@@ -42,7 +124,7 @@ function limits(turns, maxHostCalls) {
 export async function compileCorpus({ subset = "all", contractVersion = 2, sourceCorpusVersion = 1 } = {}) {
   if (!["all", "single", "multi", "canary"].includes(subset)) throw new Error("Unknown corpus subset");
   if (![1, 2].includes(contractVersion)) throw new Error("Unsupported expectation contract version");
-  if (![1, 2, 3].includes(sourceCorpusVersion)) throw new Error("Unsupported source corpus version");
+  if (![1, 2, 3, 4].includes(sourceCorpusVersion)) throw new Error("Unsupported source corpus version");
   if (sourceCorpusVersion > 1 && contractVersion !== 2) throw new Error(`Source corpus ${sourceCorpusVersions[sourceCorpusVersion]} requires expectation contract version 2`);
   const selected = [
     ["single", "single-turn.json"], ["multi", "multi-turn.json"], ["canary", "feishu-canary.json"],
@@ -60,6 +142,12 @@ export async function compileCorpus({ subset = "all", contractVersion = 2, sourc
   const oracles = { version: contractVersion, suiteId: manifest.suiteId, corpusHashes: {}, fixtureHashes: {}, fixtures: {}, cases: {} };
   if (contractVersion === 2) oracles.sourceCorpusVersion = sourceCorpusVersions[sourceCorpusVersion];
   if (sourceCorpusVersion > 1) oracles.sourceFiles = {};
+  if (sourceCorpusVersion === 4) {
+    const name = "v4/review-map.json";
+    const bytes = await readAcceptanceCorpusBytes(new URL(name, corpusRoot), name);
+    oracles.corpusHashes[name] = createHash("sha256").update(bytes).digest("hex");
+    oracles.sourceFiles[name] = { schemaVersion: sourceCorpusVersions[4], review: JSON.parse(bytes) };
+  }
   let submissions = 0;
   function add(item, id, prompt, turns, script, source) {
     const expected = script ? script.turns.at(-1).expected : item.expected;
@@ -121,12 +209,25 @@ export async function compileCorpus({ subset = "all", contractVersion = 2, sourc
   }
   for (const [kind, name] of selected) {
     const sourceName =
+      sourceCorpusVersion === 4 ? `v4/${name}` :
       sourceCorpusVersion === 2 && kind === "single" ? `v2/${name}` :
       sourceCorpusVersion === 3 && ["single", "multi"].includes(kind) ? `v3/${name}` :
       name;
     const bytes = await readAcceptanceCorpusBytes(new URL(sourceName, corpusRoot), sourceName);
-    const doc = JSON.parse(bytes);
+    let doc = JSON.parse(bytes);
+    let revision;
+    if (sourceCorpusVersion === 4) {
+      revision = doc;
+      const baseName = kind === "canary" ? name : `v3/${name}`;
+      if (revision.baseSource?.path !== baseName) throw new Error("Invalid v4 base source path");
+      const baseBytes = await readAcceptanceCorpusBytes(new URL(baseName, corpusRoot), baseName);
+      const sha256 = createHash("sha256").update(baseBytes).digest("hex");
+      if (revision.baseSource.sha256 !== sha256) throw new Error("Invalid v4 base source hash");
+      oracles.corpusHashes[baseName] = sha256;
+      doc = materializeV4Corpus(JSON.parse(baseBytes), revision, kind);
+    }
     const expectedVersion =
+      sourceCorpusVersion === 4 ? sourceCorpusVersions[4] :
       sourceCorpusVersion === 2 && kind === "single" ? sourceCorpusVersions[2] :
       sourceCorpusVersion === 3 && ["single", "multi"].includes(kind) ? sourceCorpusVersions[3] :
       CORPUS_VERSION;
@@ -135,6 +236,7 @@ export async function compileCorpus({ subset = "all", contractVersion = 2, sourc
     if (sourceCorpusVersion > 1) {
       oracles.sourceFiles[sourceName] = {
         schemaVersion: doc.schemaVersion, ...(doc.sourceReview ? { review: doc.sourceReview } : {}),
+        ...(revision ? { revision } : {}),
       };
     }
     const provenance = (item, variant) => sourceCorpusVersion > 1 ? {
@@ -150,10 +252,15 @@ export async function compileCorpus({ subset = "all", contractVersion = 2, sourc
       }
     } else {
       for (const item of doc.cases) {
-        const prompts = kind === "single" ? item.modelVisible.variants : [item.modelVisible.text];
-        prompts.forEach((prompt, index) => add(item,
+        const variants = sourceCorpusVersion === 4 && kind === "single" ? item.variantContracts : undefined;
+        const prompts = variants ? variants.map((row) => row.prompt) :
+          kind === "single" ? item.modelVisible.variants : [item.modelVisible.text];
+        prompts.forEach((prompt, index) => {
+          const selectedItem = variants ? { ...item, ...variants[index] } : item;
+          add(selectedItem,
           kind === "single" ? `${item.caseId}-v${index + 1}` : item.caseId, prompt,
-          undefined, undefined, provenance(item, kind === "single" ? index + 1 : undefined)));
+          undefined, undefined, provenance(selectedItem, kind === "single" ? index + 1 : undefined));
+        });
       }
     }
   }
@@ -187,7 +294,7 @@ export async function compileAcceptance(argv = process.argv.slice(2)) {
     usage,
     defaults: { sourceCorpusVersion: 1, contractVersion: 2 },
     sourceVersions: sourceCorpusVersions,
-    compatibility: "Source 1 supports contracts 1 and 2; approved-v2 and approved-v3 require contract 2. Compilation plans a new run only; it never regrades historical evidence.",
+    compatibility: "Source 1 supports contracts 1 and 2; approved-v2, approved-v3 and approved-v4 require contract 2. Compilation plans a new run only; it never regrades historical evidence.",
   };
   let outputRoot;
   let subset = "all";

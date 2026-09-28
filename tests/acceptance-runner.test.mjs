@@ -7,11 +7,13 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
 import { pathToFileURL } from "node:url";
+import { performance } from "node:perf_hooks";
 import { compileManifestValidator } from "../scripts/lib/acceptance-contract.mjs";
+import { compileExpectationContract, compileFixtureScope } from "../scripts/lib/acceptance-expectations.mjs";
 import { evaluateAcceptance } from "../scripts/evaluate-acceptance.mjs";
-import { runAcceptance } from "../scripts/run-acceptance.mjs";
+import { runAcceptance, resolveCaseBudgetAllocation, preflightConfiguredOperationalBudget } from "../scripts/run-acceptance.mjs";
 
-const root = resolve("artifacts", "acceptance-runner-test");
+const root = resolve(process.env.DSH_ACCEPTANCE_TEST_ROOT ?? "artifacts", "acceptance-runner-test");
 const adapter = resolve("scripts", "lib", "local-fixture-adapter.mjs");
 let counter = 0;
 
@@ -164,6 +166,7 @@ test("runner resource preparation consumes the inherited case deadline before Ga
     await t.test(`${elapsed}ms resource preparation`, async (t) => {
       let now = 10000;
       t.mock.method(Date, "now", () => now);
+      t.mock.method(performance, "now", () => now);
       const map = join(root, `deadline-resources-${++counter}.json`);
       await mkdir(root, { recursive: true });
       await writeFile(map, JSON.stringify({ version: 1, resources: { sample: {
@@ -232,7 +235,7 @@ async function corpusFixture(actualMode = "chat", options = {}) {
     usage: observedUsage, sideEffects: [], delivery: { delivered: true, terminalOutputs: 1 },
     policyFacts: { independentOracleEvaluated: true, businessAssertionsPassed: true, safetyAssertionsPassed: true,
       expectedModesSatisfied: true, agentPolicyMatched: true },
-    turns: [{ outputText: "fixture ok", mode: actualMode, executionStatus: "completed", agentProfile: "agent-a",
+    turns: [{ prompt: "Summarize the synthetic fixture.", outputText: "fixture ok", mode: actualMode, executionStatus: "completed", agentProfile: "agent-a",
       tools: [], skill: { advertised: [], selected: [], loaded: [] },
       usage: observedUsage, delivery: { delivered: true, terminalOutputs: 1 } }],
   };
@@ -249,12 +252,22 @@ async function corpusFixture(actualMode = "chat", options = {}) {
   const oracle = { version: 1, suiteId: suite.suiteId, corpusHashes: { source: "a".repeat(64) }, cases: {
     [id]: { agentProfile: { agentId: "agent-a", skillAllowlist: [] },
       fixtureRefs: options.fixtureName ? [options.fixtureName] : [], reviews: [{
-      expected: { modes: ["chat"], permittedOutcomes: ["completed"] },
+      submissionId: "review-turn-1", expected: { modes: ["chat"], permittedOutcomes: ["completed"] },
       oracle: { businessAssertions: ["answers with the supplied fact"], safetyAssertions: ["no tools"],
         forbiddenEffects: ["no writes"], answerChecks: [] },
     }] },
   } };
   for (const extra of suite.cases.slice(1)) oracle.cases[extra.id] = structuredClone(oracle.cases[id]);
+  if (options.version === 2) {
+    suite.version = oracle.version = 2;
+    for (const testCase of suite.cases) {
+      const oracleCase = oracle.cases[testCase.id];
+      const contract = compileExpectationContract(oracleCase.reviews, oracleCase.reviews.map((review) => review.submissionId));
+      testCase.expected = { ...contract, authorityAndSafety: "passed", delivery: { delivered: true, terminalOutputs: 1 } };
+      oracleCase.expectationContract = contract;
+      oracleCase.fixtureScope = compileFixtureScope({});
+    }
+  }
   const bytes = `${JSON.stringify(oracle, null, 2)}\n`;
   const oraclePath = join(root, `oracle-${++counter}.json`);
   await mkdir(root, { recursive: true });
@@ -277,8 +290,9 @@ async function corpusFixture(actualMode = "chat", options = {}) {
   const grading = await writeAdapter("independent-reviewer", `
     import { evidenceDigest } from ${JSON.stringify(pathToFileURL(resolve("scripts/lib/acceptance-oracles.mjs")).href)};
     import { writeFile } from "node:fs/promises";
-    let reviewContext;
+    let reviewContext, reviewCalls=0;
     export function createReviewer(){${options.reviewInitialize ?? ""} return {async reviewCase({testCase,oracleCase,evidence},context){
+      reviewCalls++;
       reviewContext=context;
       await writeFile(${JSON.stringify(reviewSeen)},JSON.stringify({budget:context.budget,
         operationalBudget:context.operationalBudget,timeoutMs:context.timeoutMs,
@@ -287,10 +301,11 @@ async function corpusFixture(actualMode = "chat", options = {}) {
       ${options.review ?? ""}
       ${options.catchUsage ? "try { context.reportUsage(usage); } catch {}" : "context.reportUsage(usage);"}
       return {caseId:testCase.id,evidenceSha256:evidenceDigest(evidence),usage,${options.reviewResult ?? ""}
-        turns:oracleCase.reviews.map(({oracle})=>Object.fromEntries(
+        turns:oracleCase.reviews.map(({oracle,submissionId})=>({submissionId,
+          verdict:{executionStatus:"completed",businessResult:"passed"},...Object.fromEntries(
           [["business","businessAssertions"],["safety","safetyAssertions"],["forbiddenEffects","forbiddenEffects"]]
             .map(([key,source])=>[key,oracle[source].map((_,assertionIndex)=>({
-              assertionIndex,passed:true,rationale:"Separate unit reviewer inspected supplied observation."}))])))};
+              assertionIndex,passed:true,rationale:"Separate unit reviewer inspected supplied observation."}))]))}))};
     },async close(){${options.reviewClose ?? ""}}};}`);
   const s = await writeScope(scope({ trustedIndependentReviewer: true, reviewBudgets: cap(), ...options.scope }));
   const args = ["--execute", "--live", "--trusted-capable-adapter", "--scope", s,
@@ -299,11 +314,148 @@ async function corpusFixture(actualMode = "chat", options = {}) {
   return { args, seen, reviewSeen, oraclePath, file, scopePath: s };
 }
 
+const reviewAttestation = `budgetAttestation:{status:"verified",hardLimitsVerified:true,quiescent:true,
+  operationalBudget:context.operationalBudget,contextWindow:10},cleanup:{cleaned:true,quiescent:true},`;
+
+function parseFailureReview({ accountingKey = "budgetAccounting", mutate = "", text = "PRIVATE_BAD_REVIEW_OUTPUT" } = {}) {
+  return `
+    if(reviewCalls===1){
+      const {parseReviewLines}=await import(${JSON.stringify(pathToFileURL(resolve("scripts", "lib", "gateway-corpus-reviewer.mjs")).href)});
+      context.reportUsage(usage);
+      const reviewer={usageStatus:"complete",quiescent:true,hardLimitsVerified:true};
+      await context.recordReviewCompletion({caseId:testCase.id,evidenceSha256:evidenceDigest(evidence),
+        text:${JSON.stringify(text)},usage,receipt:reviewer});
+      try{parseReviewLines(${JSON.stringify(text)},oracleCase.reviews);}
+      catch(error){
+        Object.assign(error,{usage:{...usage},reviewer,${reviewAttestation}
+          ${accountingKey}:{usageStatus:"complete",observedLowerBound:{...usage},
+            reserved:{modelRequests:0,inputTokens:0,outputTokens:0,toolCalls:0},
+            unresolvedExposure:{modelRequests:0,inputTokens:0,outputTokens:0,toolCalls:0}}});
+        ${mutate}
+        throw error;
+      }
+      throw new Error("expected invalid reviewer output");
+    }`;
+}
+
+test("settled reviewer parse failures are FAIL with once-only usage and unrelated case continuation", async (t) => {
+  for (const version of [1, 2]) {
+    for (const accountingKey of ["budgetAccounting", "accounting"]) {
+      await t.test(`v${version} ${accountingKey}`, async () => {
+        const f = await corpusFixture("chat", { version, caseCount: 2,
+          scope: { reviewOperationalBudget: operationalBudget() },
+          review: parseFailureReview({ accountingKey }), reviewResult: reviewAttestation });
+        const result = await runAcceptance(f.args);
+        assert.equal(result.code, 1);
+        assert.equal(result.report.stopReason, undefined);
+        assert.deepEqual(result.report.cases.map((item) => item.outcome), ["failed", "passed"]);
+        assert.equal(result.report.cases[0].business_result, "failed");
+        assert.notEqual(result.report.cases[0].execution_status, "infrastructure_blocked");
+        for (const role of ["dut", "review"]) {
+          const accounting = result.report.budgetAccounting[role];
+          assert.equal(accounting.status, "complete");
+          assert.equal(accounting.totals.modelRequests, 2);
+          assert.equal(accounting.cases.length, 2);
+          assert.ok(accounting.cases.every((entry) => entry.executionSettled && !entry.aborted && !entry.error));
+        }
+        assert.equal(result.report.budgetAccounting.review.cases[0].hardLimits.status, "adapter-attested");
+        assert.equal(result.report.independentReviewUsage.modelRequests, 2);
+        assert.equal(JSON.parse(await readFile(f.reviewSeen, "utf8")).budget.inputTokens, 90);
+        const firstId = result.report.cases[0].id;
+        const receiptPath = join(result.reportPath, "..", `review-${createHash("sha256").update(firstId).digest("hex")}.private.json`);
+        const receipt = JSON.parse(await readFile(receiptPath, "utf8"));
+        assert.equal(receipt.text, "PRIVATE_BAD_REVIEW_OUTPUT");
+        assert.equal(receipt.usage.modelRequests, 1);
+        const traceText = await readFile(result.tracePath, "utf8");
+        assert.doesNotMatch(traceText, /PRIVATE_BAD_REVIEW_OUTPUT/);
+        const events = traceText.trim().split("\n").map(JSON.parse);
+        const failed = events.find((event) => event.event === "independent_review");
+        assert.equal(failed.grading.status, "failed");
+        assert.match(failed.grading.errors.join("\n"), /invalid JSON/);
+        const firstEvidence = events.find((event) => event.event === "case_evidence").evidence;
+        assert.notEqual(firstEvidence.unknownEffects, true);
+        assert.equal(firstEvidence.cleanup.quiescent, true);
+        assert.deepEqual(JSON.parse(await readFile(result.reportPath, "utf8")).budgetAccounting, result.report.budgetAccounting);
+        assert.equal((await evaluateAcceptance(["--report", result.reportPath])).code, 1);
+      });
+    }
+  }
+});
+
+test("settled invalid review records also fail grading rather than stop the campaign", async () => {
+  const f = await corpusFixture("chat", { caseCount: 2, review: parseFailureReview({ text: "{}" }),
+    scope: { reviewOperationalBudget: operationalBudget() }, reviewResult: reviewAttestation });
+  const result = await runAcceptance(f.args);
+  assert.deepEqual(result.report.cases.map((item) => item.outcome), ["failed", "passed"]);
+  assert.equal(result.report.stopReason, undefined);
+  assert.equal(result.report.budgetAccounting.review.status, "complete");
+});
+
+test("review parse recovery rejects incomplete or contradictory accounting and unsafe cleanup", async (t) => {
+  const mutations = {
+    "no accounting": "delete error.budgetAccounting;",
+    "unknown accounting": 'error.budgetAccounting.usageStatus="unknown";',
+    "missing usage": "delete error.usage;",
+    "partial usage": "delete error.usage.inputTokens;",
+    "missing bound": "delete error.budgetAccounting.observedLowerBound;",
+    "inconsistent bound": "error.budgetAccounting.observedLowerBound.inputTokens++;",
+    "conflicting totals": "error.budgetAccounting.usage={...usage,inputTokens:11};",
+    "missing reservations": "delete error.budgetAccounting.reserved;",
+    "partial reservations": "delete error.budgetAccounting.reserved.inputTokens;",
+    "pending reservation": "error.budgetAccounting.reserved.modelRequests=1;",
+    "unresolved exposure": "error.budgetAccounting.unresolvedExposure.inputTokens=100;",
+    "conflicting aliases": 'error.accounting={...error.budgetAccounting,usageStatus:"unknown"};',
+    "missing attestation": "delete error.budgetAttestation;",
+    "booleans only": "delete error.budgetAttestation.operationalBudget;",
+    "wide attestation": "error.budgetAttestation.operationalBudget={...context.operationalBudget,maxInputTokens:999};",
+    "unproven context": "delete error.budgetAttestation.contextWindow;",
+    "not quiescent": "error.cleanup.quiescent=false;",
+    "not cleaned": "error.cleanup.cleaned=false;",
+    "cleanup error": 'error.cleanup.error="runtime fenced";',
+    "unknown effects": "error.unknownEffects=true;",
+    "unknown live state": "error.liveUnknown=true;",
+    "not parse failure": 'error.code="REVIEW_PROOF_INVALID";',
+    "caught usage failure": "try{context.reportUsage({...usage,modelRequests:999});}catch{}",
+    "callback underreport": "error.usage.modelRequests=0;error.budgetAccounting.observedLowerBound.modelRequests=0;",
+  };
+  for (const [label, mutate] of Object.entries(mutations)) {
+    await t.test(label, async () => {
+      const f = await corpusFixture("chat", { caseCount: 2,
+        scope: { reviewOperationalBudget: operationalBudget() },
+        review: parseFailureReview({ mutate }), reviewResult: reviewAttestation });
+      const result = await runAcceptance(f.args);
+      assert.equal(result.code, 1);
+      assert.equal(result.report.cases[1].outcome, "blocked");
+      assert.equal(result.report.budgetAccounting.review.status, "unknown");
+      assert.equal(result.report.independentReviewUsage, null);
+      assert.equal(result.report.budgetAccounting.review.cases[0].hardLimits.status, "unattested");
+      assert.equal(result.report.budgetAccounting.dut.cases.length, 1);
+      assert.match(result.report.stopReason, label === "caught usage failure" ? /exceeds cap/ : /invalid JSON/);
+      assert.ok(result.report.budgetAccounting.review.observedLowerBound.modelRequests >= 1);
+    });
+  }
+});
+
+test("unattested parse errors and late usage after recovered review remain fail-closed", async () => {
+  for (const late of [false, true]) {
+    const f = await corpusFixture("chat", { caseCount: late ? 1 : 2, review: parseFailureReview(),
+      scope: late ? { reviewOperationalBudget: operationalBudget() } : {},
+      reviewClose: late ? "try{reviewContext.reportUsage({modelRequests:4});}catch{}" : "" });
+    const result = await runAcceptance(f.args);
+    assert.equal(result.code, 1);
+    assert.equal(result.report.budgetAccounting.review.status, "unknown");
+    assert.equal(result.report.independentReviewUsage, null);
+    assert.equal(result.report.budgetAccounting.review.observedLowerBound.modelRequests, 1);
+    assert.match(result.report.stopReason, late ? /after accounting closed/ : /invalid JSON/);
+  }
+});
+
 test("runner review deadline includes reviewer initialization and does not hand out a fresh timeout", async (t) => {
   const key = `reviewDeadline${++counter}`;
   const clock = globalThis[key] = { now: 10000, sends: 0 };
   t.after(() => { delete globalThis[key]; });
   t.mock.method(Date, "now", () => clock.now);
+  t.mock.method(performance, "now", () => clock.now);
   const f = await corpusFixture("chat", {
     reviewInitialize: `globalThis[${JSON.stringify(key)}].now += 800;`,
     review: `
@@ -435,6 +587,138 @@ test("accidental account secrets in private review references fail before execut
   const result = await runAcceptance(f.args);
   assert.equal(result.report.passed, false);
   await assert.rejects(readFile(f.seen), /ENOENT/);
+});
+
+test("settled business failures preserve FAIL and usage while unrelated cases continue", async (t) => {
+  for (const thrown of [false, true]) {
+    await t.test(thrown ? "thrown with complete recovery evidence" : "returned business failure", async () => {
+      const a = await writeAdapter("settled-business", `let calls=0;export function createAdapter(){return {
+        async executeCase(testCase,context){
+          calls++;
+          const evidence={...context.fixtureEvidence,${reviewAttestation}};
+          context.reportUsage(evidence.usage);
+          if(calls===1){
+            evidence.businessResult="failed";
+            evidence.error={message:"Live final differs from committed canonical text"};
+            ${thrown ? `const error=new Error(evidence.error.message);error.evidence=evidence;
+              error.budgetAccounting={usageStatus:"complete",observedLowerBound:evidence.usage,
+                reserved:{modelRequests:0,inputTokens:0,outputTokens:0,toolCalls:0}};
+              throw error;` : ""}
+          }
+          return evidence;
+        },async cleanupCase(){return {cleaned:true,quiescent:true};}};}`);
+      const file = await writeManifest(manifest({ cases: [caseDef(), caseDef()] }));
+      const s = await writeScope(scope({ operationalBudget: operationalBudget() }));
+      const result = await runAcceptance(["--execute", "--manifest", file, "--scope", s,
+        "--adapter", a, "--run-root", resolve(root, "settled-business")]);
+      assert.equal(result.code, 1);
+      assert.equal(result.report.stopReason, undefined);
+      assert.deepEqual(result.report.cases.map((item) => item.outcome), ["failed", "passed"]);
+      assert.equal(result.report.budgetAccounting.dut.status, "complete");
+      assert.equal(result.report.budgetAccounting.dut.totals.modelRequests, 2);
+      assert.ok(result.report.budgetAccounting.dut.cases.every((item) =>
+        item.executionSettled && !item.aborted && !item.error && item.hardLimits.status === "adapter-attested"));
+      const events = (await readFile(result.tracePath, "utf8")).trim().split("\n").map(JSON.parse);
+      const evidence = events.find((event) => event.event === "case_evidence").evidence;
+      assert.match(evidence.policyFacts.executionError, /Live final differs/);
+      assert.notEqual(evidence.unknownEffects, true);
+      assert.equal(result.report.cleanupReceipts.length, 2);
+    });
+  }
+});
+
+test("business errors never hide accounting or cleanup risk and preserve their first cause", async (t) => {
+  const variants = {
+    "missing usage": "delete evidence.usage;",
+    "partial usage": "evidence.usage={modelRequests:1};",
+    "infrastructure blocked": 'evidence.executionStatus="infrastructure_blocked";',
+    "unknown effects": "evidence.unknownEffects=true;",
+    "unknown accounting": `evidence.budgetAccounting={usageStatus:"unknown",observedLowerBound:evidence.usage,
+      reserved:{modelRequests:0,inputTokens:0,outputTokens:0,toolCalls:0}};`,
+    "unresolved exposure": `evidence.accounting={usageStatus:"complete",observedLowerBound:evidence.usage,
+      reserved:{modelRequests:0,inputTokens:0,outputTokens:0,toolCalls:0},
+      unresolvedExposure:{modelRequests:1,inputTokens:100,outputTokens:100,toolCalls:1}};`,
+    "missing attestation": "delete evidence.budgetAttestation;",
+    "cleanup throws": "",
+    "cleanup not quiescent": "",
+    "cleanup late callback": "",
+  };
+  for (const [label, mutate] of Object.entries(variants)) {
+    await t.test(label, async () => {
+      const a = await writeAdapter("unsafe-business", `let reportUsage;export function createAdapter(){return {
+        async executeCase(testCase,context){
+          reportUsage=context.reportUsage;
+          const evidence={...context.fixtureEvidence,businessResult:"failed",
+            error:{message:"FIRST_BUSINESS_FAILURE"},${reviewAttestation}};
+          context.reportUsage(evidence.usage);
+          ${mutate}
+          return evidence;
+        },async cleanupCase(){
+          ${label === "cleanup throws" ? 'throw new Error("SECOND_CLEANUP_FAILURE");' : ""}
+          ${label === "cleanup late callback" ? "try{reportUsage({modelRequests:4});}catch{}" : ""}
+          return {cleaned:true,quiescent:${label !== "cleanup not quiescent"}};
+        }}};`);
+      const file = await writeManifest(manifest({ cases: [caseDef(), caseDef()] }));
+      const s = await writeScope(scope({ operationalBudget: operationalBudget() }));
+      const result = await runAcceptance(["--execute", "--manifest", file, "--scope", s,
+        "--adapter", a, "--run-root", resolve(root, "unsafe-business")]);
+      assert.equal(result.code, 1);
+      assert.equal(result.report.stopReason, "FIRST_BUSINESS_FAILURE");
+      assert.equal(result.report.cases[1].outcome, "blocked");
+      assert.equal(result.report.budgetAccounting.dut.status, "unknown");
+      assert.equal(result.report.budgetAccounting.dut.totals, null);
+      assert.equal(result.report.budgetAccounting.dut.observedLowerBound.modelRequests, 1);
+      assert.equal(result.report.budgetAccounting.dut.cases[0].hardLimits.status, "unattested");
+      assert.equal(result.report.cleanupReceipts.length, 1);
+      if (label === "cleanup throws") {
+        assert.equal(result.report.cleanupReceipts[0].receipt.error, "SECOND_CLEANUP_FAILURE");
+      }
+    });
+  }
+});
+
+test("cleanup failure after a recovered DUT rejection still latches without replacing the original cause", async () => {
+  const a = await writeAdapter("recovered-cleanup-failure", `export function createAdapter(){return {
+    async executeCase(testCase,context){
+      const evidence={...context.fixtureEvidence,businessResult:"failed",${reviewAttestation}};
+      context.reportUsage(evidence.usage);
+      const error=new Error("FIRST_SETTLED_BUSINESS_FAILURE");
+      error.evidence=evidence;
+      error.budgetAccounting={usageStatus:"complete",observedLowerBound:evidence.usage,
+        reserved:{modelRequests:0,inputTokens:0,outputTokens:0,toolCalls:0}};
+      throw error;
+    },async cleanupCase(){throw new Error("SECOND_CLEANUP_FAILURE");}};}`);
+  const file = await writeManifest(manifest({ cases: [caseDef(), caseDef()] }));
+  const s = await writeScope(scope({ operationalBudget: operationalBudget() }));
+  const result = await runAcceptance(["--execute", "--manifest", file, "--scope", s,
+    "--adapter", a, "--run-root", resolve(root, "recovered-cleanup-failure")]);
+  assert.equal(result.report.stopReason, "FIRST_SETTLED_BUSINESS_FAILURE");
+  assert.equal(result.report.cases[1].outcome, "blocked");
+  assert.equal(result.report.budgetAccounting.dut.status, "unknown");
+  assert.match(result.report.budgetAccounting.dut.cases[0].error, /cleanup/);
+  assert.equal(result.report.cleanupReceipts[0].receipt.error, "SECOND_CLEANUP_FAILURE");
+  assert.equal(result.report.budgetAccounting.dut.observedLowerBound.modelRequests, 1);
+});
+
+test("independent passing review cannot erase an already failed DUT business result", async () => {
+  for (const version of [1, 2]) {
+    const f = await corpusFixture("chat", { version, caseCount: 2,
+      execute: `if(!testCase.id.endsWith("-1")) return {
+        executionStatus:"completed",businessResult:"failed",error:{message:"FIRST_CANONICAL_MISMATCH"},
+        outputText:"fixture ok",usage:${JSON.stringify(usage({ toolCalls: 0 }))},sideEffects:[],
+        delivery:{delivered:true,terminalOutputs:1},turns:[{mode:"chat",executionStatus:"completed",
+          agentProfile:"agent-a",outputText:"fixture ok",tools:[],skill:{advertised:[],selected:[],loaded:[]},
+          usage:${JSON.stringify(usage({ toolCalls: 0 }))},delivery:{delivered:true,terminalOutputs:1}}]};` });
+    const result = await runAcceptance(f.args);
+    assert.equal(result.code, 1);
+    assert.equal(result.report.stopReason, undefined);
+    assert.deepEqual(result.report.cases.map((item) => item.outcome), ["failed", "passed"]);
+    assert.equal(result.report.cases[0].business_result, "failed");
+    assert.equal(result.report.budgetAccounting.dut.status, "complete");
+    assert.equal(result.report.budgetAccounting.review.status, "complete");
+    const events = (await readFile(result.tracePath, "utf8")).trim().split("\n").map(JSON.parse);
+    assert.match(events.find((event) => event.event === "independent_review").grading.errors[0], /FIRST_CANONICAL_MISMATCH/);
+  }
 });
 
 test("suite budget accumulation prevents starting the next case", async () => {
@@ -671,7 +955,8 @@ test("malformed and partial operational roots fail before initializing an adapte
   for (const value of [0, -1, 1.5, "1", Number.MAX_SAFE_INTEGER + 1]) {
     invalid.push(operationalBudget(Object.fromEntries(fields.map((key) => [key, value]))));
   }
-  for (const field of ["operationalBudget", "reviewOperationalBudget"]) {
+  for (const field of ["operationalBudget", "caseBudget", "attemptBudget",
+    "reviewOperationalBudget", "reviewCaseBudget", "reviewAttemptBudget"]) {
     for (const value of invalid) {
       const s = await writeScope(scope({ [field]: value }));
       const result = await runAcceptance(["--execute", "--scope", s, "--manifest", file, "--adapter", a,
@@ -707,11 +992,11 @@ test("operational ceilings reserve uncached input while usage allocations retain
   const contexts = (await readFile(seen, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
   assert.deepEqual(contexts.map((value) => value.operationalBudget), [
     operationalBudget({ maxModelRequests: 2, maxInputTokens: 15, maxOutputTokens: 12, maxToolCalls: 2, maxDurationMs: 750 }),
-    operationalBudget({ maxModelRequests: 1, maxInputTokens: 11, maxOutputTokens: 9, maxToolCalls: 1, maxDurationMs: 750 }),
+    operationalBudget({ maxModelRequests: 1, maxInputTokens: 8, maxOutputTokens: 9, maxToolCalls: 1, maxDurationMs: 750 }),
   ]);
   assert.equal(contexts[0].budget.cacheReadTokens, 3);
   assert.equal(contexts[0].budget.cacheWriteTokens, 4);
-  assert.equal(contexts[1].budget.inputTokens, 11);
+  assert.equal(contexts[1].budget.inputTokens, 8);
   assert.equal(contexts[0].timeoutMs, 750);
   assert.equal(result.report.budgetAccounting.dut.status, "complete");
   assert.equal(result.report.budgetAccounting.dut.totals.modelRequests, 2);
@@ -730,6 +1015,137 @@ test("operational ceilings reserve uncached input while usage allocations retain
     assert.ok(trace.indexOf(event) < trace.findIndex((item) =>
       item.event === "case_evidence" && item.caseId === event.caseId));
   });
+});
+
+test("offline runner allocation separates T-turn roots from native attempts and once-per-case review", () => {
+  const attemptBudget = { maxModelRequests: 8, maxInputTokens: 2000000, maxOutputTokens: 8000,
+    maxToolCalls: 12, maxDurationMs: 90000 };
+  const caps = cap({ modelRequests: 24, inputTokens: 6000000, cacheReadTokens: 6000000,
+    cacheWriteTokens: 6000000, outputTokens: 24000, toolCalls: 36, userTurns: 3 });
+  const task = caseDef({ turns: ["one", "two", "three"], limits: { timeoutMs: 300000, usage: caps } });
+  const allocation = resolveCaseBudgetAllocation(task, { attemptBudget, budgets: caps });
+  assert.deepEqual(allocation.caseBudget, { maxModelRequests: 24, maxInputTokens: 6000000,
+    maxOutputTokens: 24000, maxToolCalls: 36, maxDurationMs: 300000 });
+  assert.deepEqual(allocation.attemptBudget, attemptBudget);
+  const hostConfig = { plugins: { entries: { "dsh-native": { config: { operationalBudget: attemptBudget } } } } };
+  assert.deepEqual(preflightConfiguredOperationalBudget({ hostConfig, agentId: "agent-a", ...allocation,
+    contextWindow: 1000000 }), attemptBudget);
+  const explicit = resolveCaseBudgetAllocation(task, {
+    caseBudget: allocation.caseBudget, operationalBudget: attemptBudget, budgets: caps,
+  });
+  assert.deepEqual(explicit, allocation);
+  const reviewCaps = cap({ modelRequests: 8, inputTokens: 2000000, cacheReadTokens: 2000000,
+    cacheWriteTokens: 2000000, outputTokens: 8000, toolCalls: 0, userTurns: 0 });
+  const review = resolveCaseBudgetAllocation(task, { reviewAttemptBudget: attemptBudget, reviewBudgets: reviewCaps },
+    { review: true });
+  assert.deepEqual(review.caseBudget, { ...attemptBudget, maxDurationMs: 300000 });
+  assert.equal(review.budget.toolCalls, 0);
+  assert.deepEqual(preflightConfiguredOperationalBudget({ hostConfig, agentId: "agent-a", ...review,
+    contextWindow: 1000000, zeroTools: true }), attemptBudget);
+  const legacy = resolveCaseBudgetAllocation(task, { operationalBudget: attemptBudget, budgets: caps });
+  assert.deepEqual(legacy.caseBudget, attemptBudget);
+  assert.equal(legacy.attemptBudget, undefined);
+  assert.throws(() => resolveCaseBudgetAllocation(task, {
+    attemptBudget: { ...attemptBudget, maxInputTokens: Number.MAX_SAFE_INTEGER }, budgets: caps,
+  }), /safe integer/);
+});
+
+test("runner gates every DUT turn against aggregate case and pool input without shrinking native attempts", async () => {
+  const attemptBudget = operationalBudget({ maxModelRequests: 8, maxInputTokens: 128,
+    maxOutputTokens: 32, maxToolCalls: 2, maxDurationMs: 100 });
+  const caps = cap({ modelRequests: 16, inputTokens: 256, cacheReadTokens: 256, cacheWriteTokens: 256,
+    outputTokens: 64, toolCalls: 4, userTurns: 2 });
+  const delta = usage({ modelRequests: 3, inputTokens: 40, cacheReadTokens: 40, cacheWriteTokens: 40,
+    outputTokens: 2, toolCalls: 1 });
+  const total = Object.fromEntries(Object.entries(delta).map(([key, value]) =>
+    [key, typeof value === "number" ? value * 2 : value]));
+  for (const poolInput of [256, 240]) {
+    const seen = join(root, `turn-dispatch-${++counter}.jsonl`);
+    const a = await writeAdapter("native-turn-gates", `import {appendFile} from "node:fs/promises";
+      export function createAdapter(){return {async executeCase(testCase,context){
+        for (let i=0;i<2;i++){
+          context.beforeDispatch(context.attemptBudget);
+          await appendFile(${JSON.stringify(seen)},JSON.stringify(context.attemptBudget)+"\\n");
+          context.reportUsage(${JSON.stringify(delta)});
+        }
+        return {...context.fixtureEvidence,usage:${JSON.stringify(total)},
+          budgetAttestation:{status:"verified",hardLimitsVerified:true,quiescent:true,
+            operationalBudget:context.caseBudget,contextWindow:128}};
+      },async cleanupCase(){return {cleaned:true,quiescent:true};}};}`);
+    const file = await writeManifest(manifest({ cases: [caseDef({
+      turns: ["first", "second"], limits: { timeoutMs: 1000, usage: caps },
+    })] }));
+    const s = await writeScope(scope({ attemptBudget, budgets: { ...caps, inputTokens: poolInput } }));
+    const result = await runAcceptance(["--execute", "--scope", s, "--manifest", file, "--adapter", a,
+      "--run-root", resolve(root, `native-turn-gates-${counter}`)]);
+    const dispatches = (await readFile(seen, "utf8")).trim().split("\n").map(JSON.parse);
+    assert.deepEqual(dispatches, Array(poolInput === 256 ? 2 : 1).fill(attemptBudget));
+    assert.equal(result.code, poolInput === 256 ? 0 : 1, JSON.stringify(result.report));
+    if (poolInput === 240) assert.match(result.report.stopReason, /maxInputTokens.*remaining/);
+    else assert.equal(result.report.budgetAccounting.dut.totals.cacheReadTokens, 80);
+  }
+});
+
+test("runner admits actual configured caps rather than requiring the larger attempt ceiling", async () => {
+  const configured = operationalBudget({ maxModelRequests: 2, maxInputTokens: 128,
+    maxOutputTokens: 32, maxToolCalls: 2, maxDurationMs: 100 });
+  const ceiling = { ...configured, maxInputTokens: 1024, maxDurationMs: 5000 };
+  const caps = cap({ modelRequests: 2, inputTokens: 128, cacheReadTokens: 128, cacheWriteTokens: 128,
+    outputTokens: 32, toolCalls: 2, userTurns: 1 });
+  const a = await writeAdapter("actual-not-ceiling", `export function createAdapter(){return {
+    async executeCase(testCase,context){
+      context.beforeDispatch(${JSON.stringify(configured)});
+      context.reportUsage(context.fixtureEvidence.usage);
+      return {...context.fixtureEvidence,budgetAttestation:{status:"verified",hardLimitsVerified:true,
+        quiescent:true,operationalBudget:${JSON.stringify(configured)},contextWindow:128}};
+    },async cleanupCase(){return {cleaned:true,quiescent:true};}};}`);
+  const file = await writeManifest(manifest({ cases: [caseDef({ limits: { timeoutMs: 1000, usage: caps } })] }));
+  const s = await writeScope(scope({ attemptBudget: ceiling, budgets: caps }));
+  const result = await runAcceptance(["--execute", "--scope", s, "--manifest", file, "--adapter", a,
+    "--run-root", resolve(root, `actual-not-ceiling-${counter}`)]);
+  assert.equal(result.code, 0, JSON.stringify(result.report));
+});
+
+test("review pool boundary charges aggregate cache once and leaves DUT authorization separate", async () => {
+  const reviewAttemptBudget = operationalBudget({ maxModelRequests: 2, maxInputTokens: 128,
+    maxOutputTokens: 32, maxToolCalls: 1, maxDurationMs: 100 });
+  const reviewCaps = cap({ modelRequests: 4, inputTokens: 240, cacheReadTokens: 256,
+    cacheWriteTokens: 256, outputTokens: 64, toolCalls: 0, userTurns: 0 });
+  const f = await corpusFixture("chat", { caseCount: 2,
+    scope: { reviewAttemptBudget, reviewBudgets: reviewCaps },
+    review: `context.beforeDispatch(context.attemptBudget);
+      Object.assign(usage,{inputTokens:40,cacheReadTokens:40,cacheWriteTokens:40});`,
+    reviewResult: `budgetAttestation:{status:"verified",hardLimitsVerified:true,quiescent:true,
+      operationalBudget:context.attemptBudget,contextWindow:128},cleanup:{cleaned:true,quiescent:true},`,
+  });
+  const result = await runAcceptance(f.args);
+  assert.equal(result.code, 1);
+  assert.match(result.report.stopReason, /maxInputTokens.*remaining/);
+  assert.equal(result.report.budgetAccounting.dut.status, "complete");
+  assert.equal(result.report.budgetAccounting.dut.totals.modelRequests, 2);
+  assert.equal(result.report.budgetAccounting.review.completeUsage.modelRequests, 1);
+  assert.equal(result.report.budgetAccounting.review.completeUsage.cacheReadTokens, 40);
+  const trace = (await readFile(result.tracePath, "utf8")).trim().split("\n").map(JSON.parse);
+  assert.equal(trace.filter((entry) => entry.event === "independent_review").length, 1);
+});
+
+test("runner monotonic deadlines cannot be extended by a backward wall jump during initialization", async (t) => {
+  let wall = 10000, monotonic = 1000;
+  t.mock.method(Date, "now", () => wall);
+  t.mock.method(performance, "now", () => monotonic);
+  const key = `backwardRunner${++counter}`;
+  globalThis[key] = { advance() { wall -= 9000; monotonic += 1100; }, calls: 0 };
+  t.after(() => { delete globalThis[key]; });
+  const a = await writeAdapter("backward-wall", `export function createAdapter(){
+    const state=globalThis[${JSON.stringify(key)}]; state.advance();
+    return {async executeCase(){state.calls++;throw new Error("must not dispatch");},
+      async cleanupCase(){return {cleaned:true,quiescent:true};}};}`);
+  const file = await writeManifest(manifest());
+  const result = await runAcceptance(["--execute", "--manifest", file, "--adapter", a,
+    "--run-root", resolve(root, `backward-wall-${counter}`)]);
+  assert.equal(result.code, 1);
+  assert.equal(globalThis[key].calls, 0);
+  assert.match(result.report.stopReason, /timed out/);
 });
 
 test("declining ceilings require adapter-side configured-cap admission without changing prompts or native limits", async () => {

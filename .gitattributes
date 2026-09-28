@@ -1,5 +1,6 @@
 tests/acceptance/cases/*.json text eol=crlf
 tests/acceptance/cases/v2/*.json text eol=crlf
 tests/acceptance/cases/v3/*.json text eol=lf
+tests/acceptance/cases/v4/*.json text eol=lf
 tests/fixtures/acceptance/*.json text eol=lf
 tests/fixtures/acceptance/*.txt text eol=lf

@@ -871,3 +871,90 @@ test("optional skill relevance cannot promote a supplied non-execution decision 
   assert.match(instructions, /do not claim the full method was applied unless it was loaded/);
   assert.throws(() => parsePreparationResolution({ ...result, allowedTools: ["read"] }), /only execute/);
 });
+
+test("instructions distinguish a direct conversational question from a question template and blocking preparation", () => {
+  const instructions = renderPreparationInstructions(policy());
+  for (const pattern of [
+    /Directly asking the user a question now is conversational chat/,
+    /not a draft merely because the answer is text/,
+    /not blocking clarification merely because the wider idea still has unknowns/,
+    /Leave the decision.question field empty/,
+    /question template, interview script, or sample wording is a draft/,
+    /not the presence of question marks/,
+    /Only blocking clarify decisions consume this count/,
+    /cap-induced draft is not proof that the gaps were resolved/,
+  ]) assert.match(instructions, pattern);
+  const definition = createPreparationTool(request()).parameters.properties.question;
+  assert.match(definition.description, /Blocking preparation question for clarify only/);
+  assert.match(definition.description, /conversational question belongs in the answer after preparation/);
+  assert.doesNotMatch(instructions, /st-dsh-|mt-dsh-|oracle|approved-v[1-4]|404|golden-search/);
+});
+
+test("supplied chat questions preserve an exhausted blocking brief without consuming or clearing its gaps", () => {
+  const gaps = Array.from({ length: 12 }, (_, index) => `Unconfirmed requirement ${index}`);
+  const previous = state({ mode: "clarify", clarificationTurns: 3, question: "Which source?",
+    unresolved: gaps, assumptions: ["Not confirmed"] });
+  const input = request({ previous, userText: "Ask me one question about a different idea." });
+  const chat = resolve(input, decision({ revision: 1, task: "none", mode: "chat",
+    evidence: { source: "current", quote: input.userText } }));
+  assert.equal(chat.decision.mode, "chat");
+  assert.equal(chat.decision.question, "");
+  assert.equal(chat.state.clarificationTurns, 3);
+  assert.deepEqual(chat.state.unresolved, gaps);
+  assert.deepEqual(chat.state.assumptions, previous.assumptions);
+  assert.equal(chat.state.question, previous.question);
+  assert.deepEqual(chat.allowedTools, []);
+  const capped = resolve(request({ previous: chat.state }), decision({
+    revision: 2, mode: "clarify", task: "continue", question: "Which source?", unresolved: gaps,
+  }));
+  assert.equal(capped.decision.mode, "draft");
+  assert.equal(capped.state.clarificationTurns, 3);
+  assert.deepEqual(capped.state.unresolved, gaps);
+  assert.match(capped.decision.enhancedPrompt, /unresolved items remain unconfirmed.*\nUnanswered question: Which source/);
+  assert.deepEqual(capped.allowedTools, []);
+});
+
+test("supplied output-intent decisions enforce mechanics, not model semantic classification", () => {
+  const examples = [
+    ["Ask me one useful question now.", "chat", ""],
+    ["Write a question template for later interviews.", "draft", ""],
+    ["Explain why the missing source prevents verification. Do not use the network.", "chat", ""],
+    ["Verify the unavailable source now.", "clarify", "Can you supply the source?"],
+    ["Read the authorized local fixture.", "execute", ""],
+  ];
+  for (const [userText, mode, question] of examples) {
+    const result = resolve(request({ userText, policy: policy({ executionTools: ["read"] }) }),
+      decision({ mode, question, goal: userText, evidence: { source: "current", quote: userText },
+        unresolved: mode === "clarify" ? ["Missing source"] : [] }), ["read", "web_search"]);
+    assert.equal(result.decision.mode, mode);
+    assert.equal(result.state.clarificationTurns, mode === "clarify" ? 1 : 0);
+    assert.deepEqual(result.allowedTools, mode === "execute" ? ["read"] : []);
+  }
+});
+
+test("new conversational topics reset old counters while continuing questions do not increment them", () => {
+  for (const task of ["new", "continue"]) {
+    const previous = state({ mode: "clarify", question: "Which source?", clarificationTurns: 3,
+      unresolved: ["Missing source"] });
+    const result = resolve(request({ previous }), decision({ revision: 1, mode: "chat", task,
+      unresolved: task === "continue" ? previous.unresolved : [] }));
+    assert.equal(result.decision.mode, "chat");
+    assert.equal(result.state.clarificationTurns, task === "new" ? 0 : 3);
+    assert.deepEqual(result.state.unresolved, task === "new" ? [] : previous.unresolved);
+    assert.deepEqual(result.allowedTools, []);
+  }
+});
+
+test("source-boundary guidance does not invent network access, mandatory follow-ups, or material-only restrictions", () => {
+  const instructions = renderPreparationInstructions(policy({ executionTools: [] }));
+  for (const pattern of [
+    /Never access the network when forbidden/,
+    /complete without asking for replacement material/,
+    /general method knowledge is not retrieved evidence/,
+    /does not by itself restrict an explanation to user-provided material/,
+    /honor that restriction when the user imposes it/,
+    /Do not invent facts, access, searches, or verification/,
+    /explain needed human review without claiming it happened/,
+    /No exec route is declared/,
+  ]) assert.match(instructions, pattern);
+});

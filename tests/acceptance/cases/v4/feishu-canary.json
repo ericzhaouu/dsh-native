@@ -1,0 +1,15 @@
+{
+  "schemaVersion": "approved-v4",
+  "baseSource": {
+    "path": "feishu-canary.json",
+    "sha256": "4665b07d194424c4905eb6f2513beb5296af95481709fe82608205a3b4d4cc19"
+  },
+  "sourceReview": {
+    "sourceCorpusVersion": "approved-v4",
+    "basedOn": "approved1.0testplan.acceptanceCorpus.v1",
+    "coverage": { "cases": 12, "inputs": 12 },
+    "policy": "Inherit the existing real-channel delivery and safety contracts unchanged. Static compilation is not execution, authorization, or a delivery pass.",
+    "history": "No historical observations are regraded."
+  },
+  "changes": []
+}

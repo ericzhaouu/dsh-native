@@ -22,6 +22,8 @@ const sourceHooks = registerHooks({
 const { createNativeToolHost, projectNativeToolResult } = await import("../dist/native/host.js");
 const { resolveHostToolAllowlist, buildHostToolNotices, renderHostToolNotices, snapshotHostToolSource } =
   await import("../dist/native/tool-bridge.js");
+const { createPreparationGate } = await import("../dist/native/preparation.js");
+const { resolvePreparationDecision } = await import("../dist/preparation.js");
 sourceHooks.deregister();
 
 const schema = { type: "object", properties: { query: { type: "string" } }, required: ["query"], additionalProperties: false };
@@ -85,6 +87,226 @@ function fixture(tools, toolAllowlist, options = {}) {
   });
   return { host, runtime, before, after, terminal, results, classified, bound, pluginMeta, channelMeta };
 }
+
+function bitableFixture(options = {}) {
+  const policy = {
+    source: { kind: "plugin", pluginId: "feishu" }, accountId: "fixture_account", groupId: "oc_synthetic",
+    appToken: "synthetic_app", tableId: "tbl_synthetic", recordIds: ["rec_synthetic"],
+    fields: { Status: "string", Count: "number", Checked: "boolean" },
+    operations: ["get_record", "update_record"], maxBatchSize: 1,
+  };
+  let callbacks = 0;
+  const target = tool(options.name ?? "feishu_bitable_update_record", {
+    plugin: options.plugin ?? { pluginId: "feishu" }, parameters: { type: "object", additionalProperties: true },
+    execute: async () => {
+      callbacks++;
+      if (options.callbackError) throw new Error("PRIVATE-ACCOUNT-TOKEN");
+      if (options.result) return options.result;
+      return text(JSON.stringify({ record: { record_id: "rec_synthetic",
+        fields: { Status: "Done", Count: 3, Checked: true, Private: "BUSINESS-SECRET" } } }));
+    },
+  });
+  const capability = {
+    tool: target, agentId: "writer", accountId: "fixture_account", groupId: "oc_synthetic",
+    channel: "feishu", foreground: true, provenance: "external_user",
+    runId: "run", sessionId: "session", requestId: "inbound_synthetic",
+    contract: "feishu-bitable-record-v1", assertCurrent() {}, ...options.context,
+  };
+  const f = fixture([target, tool("exec"), tool("web_fetch")],
+    [target.name, "exec", "web_fetch"], {
+      ...options, ...(options.sdkReplaySafe ? { replaySafe: [target] } : {}),
+      host: { agentId: "writer", bitableScope: { policy,
+        capabilities: options.noCapability ? [] : [capability] }, ...options.host },
+    });
+  const args = { app_token: "synthetic_app", table_id: "tbl_synthetic", record_id: "rec_synthetic",
+    ...(target.name.endsWith("update_record") ? { fields: { Status: "Done" } } : {}) };
+  return { ...f, target, capability, args, callbacks: () => callbacks,
+    invoke: (argsOverride = args) => f.host.executeTool(call(target.name, "bitable", argsOverride), signal()) };
+}
+
+test("Bitable exact-instance capability dispatches once through host hook; readback removes unapproved fields", async () => {
+  for (const name of ["feishu_bitable_update_record", "feishu_bitable_get_record"]) {
+    const f = bitableFixture({ name });
+    assert.deepEqual(f.host.tools.map((entry) => entry.name), [name]);
+    assert.equal(f.classified[0], f.target);
+    const result = await f.invoke();
+    assert.equal(result.isError, false);
+    assert.equal(f.callbacks(), 1);
+    assert.equal(f.before.length, 1);
+    assert.doesNotMatch(JSON.stringify([result, f.after, f.results]), /BUSINESS-SECRET|Private/);
+    await assert.rejects(f.host.executeTool(call("exec", "bypass"), signal()), /unavailable/);
+    await assert.rejects(f.host.executeTool(call("web_fetch", "http"), signal()), /unavailable/);
+    await f.host.dispose();
+  }
+});
+
+test("Bitable v1 does not mistake Feishu's external-content envelope or raw details for verified readback", async () => {
+  const body = { record: { record_id: "rec_synthetic", fields: { Status: "Done", Private: "BUSINESS-SECRET" } } };
+  // @openclaw/feishu 2026.8.2 wraps JSON text and retains the original object in details.
+  const result = {
+    content: [{ type: "text", text: [
+      '<<<EXTERNAL_UNTRUSTED_CONTENT id="synthetic">>>', "Source: API", "---",
+      JSON.stringify(body), '<<<END_EXTERNAL_UNTRUSTED_CONTENT id="synthetic">>>',
+    ].join("\n") }],
+    details: body,
+  };
+  for (const name of ["feishu_bitable_get_record", "feishu_bitable_update_record"]) {
+    const f = bitableFixture({ name, result });
+    try {
+      const projected = await f.invoke();
+      assert.equal(projected.isError, true);
+      assert.equal(f.callbacks(), 1);
+      assert.doesNotMatch(JSON.stringify([projected, f.after, f.results]), /BUSINESS-SECRET|Private|EXTERNAL_UNTRUSTED/);
+      if (name.endsWith("update_record")) assert.equal(f.host.getReplayState().hadPotentialSideEffects, true);
+    } finally {
+      await f.host.dispose();
+    }
+  }
+});
+
+test("Bitable unknown, mismatched or non-foreground context never calls the original instance", async (t) => {
+  for (const [name, options] of [
+    ["absent", { noCapability: true }], ["agent", { context: { agentId: "other" } }],
+    ["account", { context: { accountId: "other" } }], ["group", { context: { groupId: "oc_other_synthetic" } }],
+    ["channel", { context: { channel: "dashboard" } }], ["memory", { context: { foreground: false } }],
+    ["provenance", { context: { provenance: "internal" } }], ["request", { context: { requestId: "" } }],
+    ["run", { context: { runId: "other" } }], ["session", { context: { sessionId: "other" } }],
+    ["contract", { context: { contract: "unknown" } }], ["same-name replacement", { context: { tool: tool("feishu_bitable_update_record") } }],
+    ["foreign plugin source", { plugin: { pluginId: "another-provider" } }],
+    ["MCP alias source", { plugin: { pluginId: "feishu", mcp: { serverName: "synthetic", toolName: "update", operation: "tool" } } }],
+    ["unknown operation", { name: "feishu_bitable_delete_table" }],
+  ]) await t.test(name, async () => {
+    const f = bitableFixture(options);
+    await assert.rejects(f.invoke(), /unavailable/);
+    assert.equal(f.callbacks(), 0);
+    assert.equal(f.host.getToolCounts().startedCount, 0);
+    await f.host.dispose();
+  });
+});
+
+test("Bitable foreign synthetic targets, fields, account redirects and batches fail after hook rewrites", async (t) => {
+  const edits = {
+    app: (args) => ({ ...args, app_token: "synthetic_other_app" }),
+    table: (args) => ({ ...args, table_id: "tbl_other_synthetic" }),
+    record: (args) => ({ ...args, record_id: "rec_other_synthetic" }),
+    field: (args) => ({ ...args, fields: { Private: "x" } }),
+    alias: (args) => ({ ...args, fields: { fldStatus: "x" } }),
+    type: (args) => ({ ...args, fields: { Status: 2 } }),
+    number: (args) => ({ ...args, fields: { Count: Infinity } }),
+    batch: (args) => ({ ...args, records: [args, args] }),
+    redirect: (args) => ({ ...args, account_id: "other" }),
+    operation: (args) => ({ ...args, action: "delete_app" }),
+    permissions: (args) => ({ ...args, permissions: ["all"] }),
+    prototype: (args) => ({ ...args, fields: JSON.parse('{"__proto__":"x"}') }),
+  };
+  for (const [name, rewrite] of Object.entries(edits)) await t.test(name, async () => {
+    const f = bitableFixture({ rewrite });
+    const result = await f.invoke();
+    assert.equal(result.isError, true);
+    assert.equal(result.text, "DSH tool scope denied or unverifiable.");
+    assert.equal(f.callbacks(), 0);
+    assert.equal(f.terminal[0].executionStarted, false);
+    await f.host.dispose();
+  });
+  const read = bitableFixture({ name: "feishu_bitable_get_record", rewrite: edits.table });
+  assert.equal((await read.invoke()).isError, true);
+  assert.equal(read.callbacks(), 0);
+  await read.host.dispose();
+});
+
+test("Bitable source mutation, stale capability, host deny and execution deny never invoke writes", async () => {
+  for (const options of [
+    { rewrite: (args, source) => { source.plugin.pluginId = "replacement"; return args; } },
+    { context: { assertCurrent() { throw new Error("PRIVATE-TOKEN"); } } },
+    { block: true }, { host: { toolExecutionAllow: [] } },
+  ]) {
+    const f = bitableFixture(options);
+    try { assert.equal((await f.invoke()).isError, true); } catch (error) { assert.match(error.message, /scope|unavailable/); }
+    assert.equal(f.callbacks(), 0);
+    await f.host.dispose();
+  }
+  const f = bitableFixture({ callbackError: true });
+  assert.equal((await f.invoke()).text, "DSH tool scope denied or unverifiable.");
+  assert.equal(f.callbacks(), 1);
+  await f.host.dispose();
+  const write = bitableFixture({ sdkReplaySafe: true });
+  assert.equal((await write.invoke()).isError, false);
+  assert.equal(write.host.getReplayState().replaySafe, false);
+  assert.equal(write.host.getReplayState().hadPotentialSideEffects, true);
+  await write.host.dispose();
+});
+
+test("Bitable capability is revalidated after hook revocation; hook-held arguments cannot drift after validation", async () => {
+  let active = true;
+  const revoked = bitableFixture({
+    context: { assertCurrent() { if (!active) throw new Error("PRIVATE"); } },
+    rewrite: (args) => { active = false; return args; },
+  });
+  assert.equal((await revoked.invoke()).isError, true);
+  assert.equal(revoked.callbacks(), 0);
+  await revoked.host.dispose();
+  let held;
+  const frozen = bitableFixture({ rewrite: (args) => { held = args; return args; } });
+  const result = await frozen.invoke();
+  held.fields.Status = "changed after call";
+  assert.equal(result.isError, false);
+  assert.equal(frozen.after[0].startArgs.fields.Status, "Done");
+  assert.equal(Object.isFrozen(frozen.after[0].startArgs), true);
+  assert.equal(Object.isFrozen(frozen.after[0].startArgs.fields), true);
+  await frozen.host.dispose();
+  let foreignWrites = 0;
+  const replaced = bitableFixture({ rewrite: (args, source) => {
+    source.execute = async () => { foreignWrites++; return text("foreign write"); };
+    return args;
+  } });
+  assert.equal((await replaced.invoke()).isError, true);
+  assert.equal(replaced.callbacks(), 0);
+  assert.equal(foreignWrites, 0);
+  assert.throws(() => { replaced.bound[0].execute = async () => { foreignWrites++; }; }, TypeError);
+  assert.equal(foreignWrites, 0);
+  await replaced.host.dispose();
+});
+
+test("genuine SDK global and Agent policies remain ceilings on per-Agent DSH candidates", async () => {
+  const { createOpenClawCodingTools } = await import("openclaw/plugin-sdk/agent-harness");
+  const sdk = await import("openclaw/plugin-sdk/agent-harness-runtime");
+  const { resolveAgentToolPolicy } = await import("../dist/tool-policy.js");
+  const requested = resolveAgentToolPolicy({ toolAllowlist: ["exec"],
+    toolAllowlistByAgent: { target: ["read", "write"] } }, "target").toolAllowlist;
+  for (const config of [
+    { tools: { deny: ["write"] }, agents: { entries: { target: { tools: { allow: ["read", "write"] } } } } },
+    { tools: { allow: ["read", "write"] }, agents: { entries: { target: { tools: { deny: ["write"] } } } } },
+  ]) {
+    const tools = createOpenClawCodingTools({ agentId: "target", policyAgentId: "target", config,
+      workspaceDir: process.cwd(), cwd: process.cwd(), sessionKey: "agent:target:synthetic",
+      wrapBeforeToolCallHook: false, runtimeToolAllowlist: requested,
+      toolConstructionPlan: { includeBaseCodingTools: true, includeShellTools: false,
+        includeOpenClawTools: false, includePluginTools: false, includeChannelTools: false } });
+    assert.ok(tools.some((entry) => entry.name === "read"));
+    assert.equal(tools.some((entry) => entry.name === "write"), false);
+    assert.deepEqual(sdk.applyEmbeddedAttemptToolsAllow(tools, [], { toolMeta: sdk.getPluginToolMeta }), []);
+  }
+});
+
+test("Bitable preparation has zero callback in chat, clarify and draft, including after hooks", async () => {
+  const policy = { version: 1, executionTools: ["feishu_bitable_update_record"],
+    skillAllowlist: [], maxClarificationTurns: 3, maxToolCalls: 1 };
+  for (const mode of ["chat", "clarify", "draft"]) {
+    const gate = createPreparationGate(policy);
+    const userText = "Explain the synthetic record without changing it.";
+    const resolution = resolvePreparationDecision({ version: 1, policy, userText }, {
+      version: 1, revision: 0, mode, task: mode === "chat" ? "none" : "new", goal: mode === "chat" ? "" : "Explain",
+      deliverables: [], constraints: [], assumptions: [], unresolved: mode === "clarify" ? ["scope"] : [],
+      question: mode === "clarify" ? "Which scope?" : "", enhancedPrompt: mode === "chat" ? "" : userText,
+      evidence: { source: "current", quote: userText },
+    }, "run", policy.executionTools);
+    gate.resolve(resolution);
+    const f = bitableFixture({ host: { preparationGate: gate } });
+    await assert.rejects(f.invoke(), /preparation/);
+    assert.equal(f.callbacks(), 0);
+    await f.host.dispose();
+  }
+});
 
 test("generic core web callbacks are exact-selected; unlisted factories are never bound or instrumented", async () => {
   const search = tool("web_search");

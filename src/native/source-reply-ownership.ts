@@ -35,7 +35,7 @@ export async function prepareSourceReplyOwnership(
   return Object.freeze({
     version: 1, agentId, sessionId: p.sessionId, sessionKey,
     runId: p.runId, nativeStateId: context.nativeStateId, assistantKey,
-    text: assistant.content.filter((block) => block.type === "text").map((block) => block.text).join("\n"),
+    text: assistant.content.filter((block) => block.type === "text").map((block) => block.text).join(""),
     assertCurrent: context.assertCurrent,
   });
 }

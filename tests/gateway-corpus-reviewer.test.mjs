@@ -5,11 +5,15 @@ import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { registerHooks } from "node:module";
 import { dirname, join, resolve } from "node:path";
 import test from "node:test";
+import { performance } from "node:perf_hooks";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import ts from "typescript";
+import { inspect } from "node:util";
 import { buildReviewPrompt, createGatewayCorpusReviewer, parseReviewLines } from "../scripts/lib/gateway-corpus-reviewer.mjs";
 import { evidenceDigest } from "../scripts/lib/acceptance-oracles.mjs";
+import { readRuntimeBudgetProof } from "../scripts/lib/gateway-acceptance-adapter.mjs";
 import { startResponsesServer } from "./fixtures/responses-server.mjs";
+
+const scratchRoot = process.env.DSH_ACCEPTANCE_TEST_ROOT ?? resolve("artifacts");
 
 const input = () => ({
   testCase: { id: "unit", prompt: "Synthetic task" },
@@ -38,7 +42,7 @@ const reviewContext = (extra = {}) => ({
 });
 
 async function runtimeCompleter(t, options = {}) {
-  const directory = resolve(dirname(fileURLToPath(import.meta.url)), "..", "artifacts", `reviewer-test-${randomUUID()}`);
+  const directory = resolve(scratchRoot, `reviewer-test-${randomUUID()}`);
   await mkdir(directory, { recursive: true });
   t.after(() => rm(directory, { recursive: true, force: true }));
   const state = { directory, prepares: 0, calls: 0 };
@@ -72,6 +76,13 @@ async function runtimeCompleter(t, options = {}) {
     append({ type: "settled", providerSettled: true, toolsSettled: true });
     if (options.mutateSettlement) options.mutateSettlement(state);
     await save();
+    if (options.binding) {
+      await writeFile(join(directory, "binding.json"), JSON.stringify({
+        status: "ready", lastRunId: state.runtimeConfig.runId, sessionId: state.runtimeConfig.sessionKey,
+        consumedRunIds: [state.runtimeConfig.runId], ...options.binding,
+      }));
+    }
+    await options.afterSettlement?.(state, context);
     if (options.failureAfterJournal) throw new Error("Synthetic completion failed after journal update");
     return { text: reviewText, zeroToolsEnforced: !options.tool,
       receipt: { kind: "test-runtime" }, runtimeBudgetDirectory: directory, ...options.result };
@@ -96,7 +107,7 @@ async function runtimeCompleter(t, options = {}) {
 }
 
 async function isolatedSdkFixture(t, { pluginConfig = {}, model = {} } = {}) {
-  const directory = resolve(dirname(fileURLToPath(import.meta.url)), "..", "artifacts", `reviewer-sdk-test-${randomUUID()}`);
+  const directory = resolve(scratchRoot, `reviewer-sdk-test-${randomUUID()}`);
   const sdkDirectory = join(directory, "dist", "plugin-sdk");
   await mkdir(sdkDirectory, { recursive: true });
   const configPath = join(directory, "host-config.json");
@@ -142,8 +153,11 @@ async function isolatedSdkFixture(t, { pluginConfig = {}, model = {} } = {}) {
   return Object.assign((result) => writeFile(resultPath, JSON.stringify(result)), { directory, configPath, state });
 }
 
-const hostRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..", "node_modules", "openclaw");
 const localDistRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..", "dist");
+// An explicit override names a built package root containing dist; never fall back to external source.
+const builtRoot = process.env.DSH_TEST_BUILT_ROOT ? resolve(process.env.DSH_TEST_BUILT_ROOT) : dirname(localDistRoot);
+const builtDistRoot = join(builtRoot, "dist");
+const hostRoot = join(builtRoot, "node_modules", "openclaw");
 
 function copilotModel(overrides = {}) {
   return {
@@ -204,7 +218,8 @@ function resolvedNativeBudget(cfg, agentId) {
 }
 
 async function boundedSdkFixture(t, options = {}) {
-  const directory = resolve(dirname(fileURLToPath(import.meta.url)), "..", "artifacts", `reviewer-bounded-sdk-${randomUUID()}`);
+  const ts = options.distOnly ? undefined : (await import("typescript")).default;
+  const directory = resolve(scratchRoot, `reviewer-bounded-sdk-${randomUUID()}`);
   const moduleDirectory = join(directory, "modules");
   await mkdir(moduleDirectory, { recursive: true });
   await mkdir(join(directory, "main-workspace"), { recursive: true });
@@ -247,7 +262,7 @@ async function boundedSdkFixture(t, options = {}) {
   const actualSimple = `${pathToFileURL(join(hostRoot, "dist", "plugin-sdk", "simple-completion-runtime.js")).href}?actual=${randomUUID()}`;
   const actualHarness = `${pathToFileURL(join(hostRoot, "dist", "plugin-sdk", "agent-harness-runtime.js")).href}?actual=${randomUUID()}`;
   const actualAgentRuntime = `${pathToFileURL(join(hostRoot, "dist", "plugin-sdk", "agent-runtime.js")).href}?actual=${randomUUID()}`;
-  const actualConfig = `${pathToFileURL(join(localDistRoot, "config.js")).href}?${options.distOnly ? "dist" : "source"}=${randomUUID()}`;
+  const actualConfig = `${pathToFileURL(join(options.distOnly ? builtDistRoot : localDistRoot, "config.js")).href}?${options.distOnly ? "dist" : "source"}=${randomUUID()}`;
   const simpleWrapper = join(moduleDirectory, `simple-${randomUUID()}.mjs`);
   const harnessWrapper = join(moduleDirectory, `harness-${randomUUID()}.mjs`);
   const agentRuntimeWrapper = join(moduleDirectory, `agent-runtime-${randomUUID()}.mjs`);
@@ -378,6 +393,9 @@ async function boundedSdkFixture(t, options = {}) {
       budgetReceipt: { directory, runId, sessionKey, agentId } };
     if (options.mutate) await options.mutate({ result, runtimeConfig, ledger, params, route });
     await writeRuntimeProof(directory, runtimeConfig, ledger);
+    await writeFile(join(directory, "binding.json"), JSON.stringify({
+      status: "ready", lastRunId: runId, sessionId: sessionKey, consumedRunIds: [runId],
+    }));
     return result;
   };
   const targets = new Map([
@@ -837,6 +855,7 @@ test("default SDK keeps the original absolute deadline across auth prep and bloc
     await t.test(name, async (t) => {
       let now = 1000;
       t.mock.method(Date, "now", () => now);
+      t.mock.method(performance, "now", () => now);
       const fixture = await configuredSdkFixture(t, { configured });
       fixture.state.prepare = async () => { now += advanceMs; };
       const reviewer = await createGatewayCorpusReviewer();
@@ -866,6 +885,7 @@ test("default SDK dispatch wait timeout uses the earliest absolute deadline with
       let now = 1000;
       t.mock.timers.enable({ apis: ["setTimeout"] });
       t.mock.method(Date, "now", () => now);
+      t.mock.method(performance, "now", () => now);
       const fixture = await configuredSdkFixture(t, { configured: { ...configuredBudget, maxDurationMs: 200 } });
       fixture.state.prepare = async () => { now += 300; };
       const reviewer = await createGatewayCorpusReviewer();
@@ -1124,12 +1144,20 @@ test("elapsed configured duration without terminal drain remains unknown, not se
 });
 
 async function sourceNativeReviewFixture(t, options = {}) {
+  const ts = options.distOnly ? undefined : (await import("typescript")).default;
+  if (options.distOnly) {
+    for (const path of ["config.js", join("native", "isolated.js"), join("native", "route.js"),
+      "runtime.js", join("bridge", "budget-ledger.js")]) {
+      await readFile(join(builtDistRoot, path));
+    }
+    await readFile(join(hostRoot, "package.json"));
+  }
   const childProcess = (await import("node:child_process")).default;
   const { syncBuiltinESMExports } = await import("node:module");
   const distRoot = new URL("../dist/", import.meta.url);
   const srcRoot = new URL("../src/", import.meta.url);
   const loaded = new Set();
-  const directory = resolve(dirname(fileURLToPath(import.meta.url)), "..", "artifacts", `reviewer-source-native-${randomUUID()}`);
+  const directory = resolve(scratchRoot, `reviewer-${options.distOnly ? "dist" : "source"}-native-${randomUUID()}`);
   const moduleDirectory = join(directory, "modules");
   await mkdir(moduleDirectory, { recursive: true });
   await mkdir(join(directory, "main-workspace"), { recursive: true });
@@ -1147,7 +1175,7 @@ async function sourceNativeReviewFixture(t, options = {}) {
       return writeHead.call(this, status, ...args);
     });
   }
-  const model = await startResponsesServer(async ({ body, text, finish, request, response }) => {
+  const model = await startResponsesServer(async ({ body, text, reasoning, finish, request, response }) => {
     try {
       assert.ok(request.headers.authorization === "Bearer synthetic-fixture-key", "only fixture auth may reach loopback");
       assert.equal(request.headers.authorization.includes("oc-sent"), false);
@@ -1158,7 +1186,8 @@ async function sourceNativeReviewFixture(t, options = {}) {
         response.end(JSON.stringify({ error: { message: "local retryable fixture error" } }));
         return;
       }
-      text(reviewText);
+      if (options.reasoning) reasoning(options.reasoning);
+      text(options.text ?? reviewText);
       finish({
         input_tokens: 20,
         output_tokens: 10,
@@ -1241,11 +1270,11 @@ async function sourceNativeReviewFixture(t, options = {}) {
     `export function resolveAgentDir(...args) { state.agentDirCalls.push(args); return actual.resolveAgentDir(...args); }`,
     `export function resolveAgentWorkspaceDir(...args) { state.workspaceDirCalls.push(args); return actual.resolveAgentWorkspaceDir(...args); }`,
   ].join("\n"));
-  const preload = join(moduleDirectory, `source-preload-${randomUUID()}.mjs`);
-  await writeFile(preload, [
+  const preload = options.distOnly ? undefined : join(moduleDirectory, `source-preload-${randomUUID()}.mjs`);
+  if (preload) await writeFile(preload, [
     `import { existsSync, readFileSync } from "node:fs";`,
     `import { registerHooks } from "node:module";`,
-    `import ts from "typescript";`,
+    `import ts from ${JSON.stringify(import.meta.resolve("typescript"))};`,
     `const distRoot = ${JSON.stringify(distRoot.href)};`,
     `const srcRoot = ${JSON.stringify(srcRoot.href)};`,
     `function sourceFor(url) {`,
@@ -1275,9 +1304,40 @@ async function sourceNativeReviewFixture(t, options = {}) {
     [pathToFileURL(join(hostRoot, "dist", "plugin-sdk", "agent-harness-runtime.js")).href, pathToFileURL(harnessWrapper).href],
     [pathToFileURL(join(hostRoot, "dist", "plugin-sdk", "agent-runtime.js")).href, pathToFileURL(agentRuntimeWrapper).href],
   ]);
+  if (options.distOnly) {
+    const isolatedWrapper = join(moduleDirectory, `native-isolated-${randomUUID()}.mjs`);
+    const actualIsolated = `${pathToFileURL(join(builtDistRoot, "native", "isolated.js")).href}?actual-dist=${randomUUID()}`;
+    globalThis[stateKey].afterNativeRun = options.afterNativeRun;
+    globalThis[stateKey].nativeRuns = 0;
+    globalThis[stateKey].nativeDisposals = 0;
+    await writeFile(isolatedWrapper, [
+      `import { createIsolatedCompletion as actual } from ${JSON.stringify(actualIsolated)};`,
+      `const state = globalThis[${JSON.stringify(stateKey)}];`,
+      `export function createIsolatedCompletion(...args) {`,
+      `  const service = actual(...args);`,
+      `  return {`,
+      `    async run(params) {`,
+      `      if (state.replayNativeResult) return structuredClone(state.replayNativeResult);`,
+      `      state.nativeRuns++;`,
+      `      const result = await service.run(params);`,
+      `      state.nativeResult = structuredClone(result);`,
+      `      await state.afterNativeRun?.(result, state);`,
+      `      return result;`,
+      `    },`,
+      `    async dispose() { state.nativeDisposals++; await service.dispose(); },`,
+      `  };`,
+      `}`,
+    ].join("\n"));
+    remap.set(new URL("native/isolated.js", distRoot).href, pathToFileURL(isolatedWrapper).href);
+    for (const path of ["config.js", "native/route.js"]) {
+      remap.set(new URL(path, distRoot).href,
+        `${pathToFileURL(join(builtDistRoot, ...path.split("/"))).href}?actual-dist=${randomUUID()}`);
+    }
+  }
   const hooks = registerHooks({
     resolve(specifier, context, next) {
       if (remap.has(specifier)) return { url: remap.get(specifier), shortCircuit: true };
+      if (options.distOnly) return next(specifier, context);
       const clean = specifier.split("?")[0];
       if (clean.startsWith(distRoot.href) && clean.endsWith(".js")) {
         const source = new URL(`${clean.slice(distRoot.href.length, -3)}.ts`, srcRoot);
@@ -1290,7 +1350,7 @@ async function sourceNativeReviewFixture(t, options = {}) {
       }
       return next(specifier, context);
     },
-    load(url, context, next) {
+    ...(options.distOnly ? {} : { load(url, context, next) {
       const clean = url.split("?")[0];
       if (!clean.startsWith(distRoot.href) || !clean.endsWith(".js")) return next(url, context);
       const source = new URL(`${clean.slice(distRoot.href.length, -3)}.ts`, srcRoot);
@@ -1299,10 +1359,10 @@ async function sourceNativeReviewFixture(t, options = {}) {
       return { format: "module", shortCircuit: true, source: ts.transpileModule(readFileSync(source, "utf8"), {
         compilerOptions: { target: ts.ScriptTarget.ES2023, module: ts.ModuleKind.ESNext },
       }).outputText };
-    },
+    } }),
   });
   const actualSpawn = childProcess.spawn;
-  const spawnMock = t.mock.method(childProcess, "spawn", (command, args, options) => {
+  const spawnMock = options.distOnly ? undefined : t.mock.method(childProcess, "spawn", (command, args, options) => {
     if (command === process.execPath && /[/\\]@deepseek-ai[/\\]dsh[/\\]lib[/\\]bin\.js$/u.test(args[0] ?? "")) {
       const preloadArg = process.platform === "win32" ? pathToFileURL(preload).href : preload;
       const child = actualSpawn(command, ["--import", preloadArg, ...args], options);
@@ -1319,7 +1379,7 @@ async function sourceNativeReviewFixture(t, options = {}) {
       assert.equal(globalThis[stateKey].sdkRunCalls, 0);
     } finally {
       hooks.deregister();
-      spawnMock.mock.restore();
+      spawnMock?.mock.restore();
       syncBuiltinESMExports();
       await model.close();
       delete globalThis[stateKey];
@@ -1331,19 +1391,25 @@ async function sourceNativeReviewFixture(t, options = {}) {
     }
   });
   if (options.prepare) globalThis[stateKey].prepare = (params) => options.prepare(params, { baseUrl: model.baseUrl });
-  const reported = [];
+  const reported = [], recorded = [];
   const reviewer = await createGatewayCorpusReviewer();
   let result, error;
   try {
-    result = await reviewer.reviewCase(input(), reviewContext({
+    result = await reviewer.reviewCase(options.input ?? input(), reviewContext({
       ...(options.context ?? {}),
-      reportUsage: (value) => reported.push(value),
+      async reportUsage(value) {
+        reported.push(value);
+        await options.context?.reportUsage?.(value);
+      },
+      async recordReviewCompletion(value) {
+        recorded.push(value);
+        await options.context?.recordReviewCompletion?.(value);
+      },
     }));
   } catch (caught) {
-    if (globalThis[stateKey].childStderr) caught.message += `\nchild stderr:\n${globalThis[stateKey].childStderr}`;
     error = caught;
   }
-  if (!options.skipLoadedAssert) {
+  if (!options.distOnly && !options.skipLoadedAssert) {
     for (const path of ["native/isolated.ts", "native/route.ts", "config.ts", "runtime.ts", "bridge/budget-ledger.ts"]) {
       assert.ok(loaded.has(new URL(path, srcRoot).href), `must execute ${path} source, not stale dist`);
     }
@@ -1351,11 +1417,16 @@ async function sourceNativeReviewFixture(t, options = {}) {
   assert.deepEqual(serverErrors, []);
   assert.equal(globalThis[stateKey].prepares, 1);
   assert.equal(globalThis[stateKey].sdkRunCalls, 0);
+  if (options.distOnly) {
+    assert.equal(loaded.size, 0, "dist-native fixture must not transpile source");
+    assert.equal(preload, undefined, "dist-native child must not receive a source preload");
+    assert.equal(spawnMock, undefined, "dist-native child spawn must be unmodified");
+  }
   if (!options.expectPrepareFailure) {
     assert.equal(globalThis[stateKey].agentDirCalls.length >= 1, true);
     assert.equal(globalThis[stateKey].workspaceDirCalls.length >= 1, true);
   }
-  if (error) return { error, reported, state: globalThis[stateKey], model, directory, reviewer };
+  if (error) return { error, reported, recorded, state: globalThis[stateKey], model, directory, reviewer };
   assert.ok(result, "source-native review must either return a result or throw");
   assert.equal(result.reviewer.budgetStatus, "verified");
   assert.equal(result.reviewer.hardLimitsVerified, true);
@@ -1376,7 +1447,7 @@ async function sourceNativeReviewFixture(t, options = {}) {
     await readFile(join(history, "operational-budget-config.json"), "utf8"));
   assert.equal(await readFile(join(result.reviewer.runtimeBudgetDirectory, "operational-budget-ledger.json"), "utf8"),
     await readFile(join(history, "operational-budget-ledger.json"), "utf8"));
-  return { result, reported, state: globalThis[stateKey], model, directory, reviewer };
+  return { result, reported, recorded, state: globalThis[stateKey], model, directory, reviewer };
 }
 
 async function sourceNativeBudgetDirectories(directory) {
@@ -1694,6 +1765,7 @@ test("timeout or abort does not prove settlement and permanently prevents review
 test("custom runtime admission rechecks the admitted duration before invoking completion", async (t) => {
   let now = 2000;
   t.mock.method(Date, "now", () => now);
+  t.mock.method(performance, "now", () => now);
   const { complete, state } = await runtimeCompleter(t, { mutateAdmission(state) {
     now += 600;
     state.at = now - 100;
@@ -1712,6 +1784,66 @@ test("custom runtime admission rechecks the admitted duration before invoking co
   assert.equal(state.prepares, 1);
   assert.equal(state.calls, 0);
   await assert.rejects(reviewer.reviewCase(input(), reviewContext({ timeoutMs: 1000 })), /cannot be reused/);
+});
+
+test("review case headroom never widens the native attempt or enables tools", async (t) => {
+  const { complete, state } = await runtimeCompleter(t);
+  const reviewer = await createGatewayCorpusReviewer({ complete });
+  const attemptBudget = { maxModelRequests: 2, maxInputTokens: 2048, maxOutputTokens: 64,
+    maxToolCalls: 1, maxDurationMs: 500 };
+  const gates = [];
+  const result = await reviewer.reviewCase(input(), reviewContext({
+    caseBudget: operationalBudget, attemptBudget, timeoutMs: 2000,
+    beforeDispatch: (configured) => gates.push(configured),
+  }));
+  assert.equal(state.calls, 1);
+  assert.deepEqual(state.prepareContext.operationalBudget, attemptBudget);
+  assert.deepEqual(gates, [attemptBudget]);
+  assert.deepEqual(result.budgetAttestation.operationalBudget, attemptBudget);
+  assert.equal(state.completionContext.timeoutMs, 2000);
+  assert.equal(state.completionContext.budget.toolCalls, 0);
+  assert.equal(result.usage.toolCalls, 0);
+});
+
+test("review dispatch must pass the runner pool gate after native admission and before completion", async (t) => {
+  const { complete, state } = await runtimeCompleter(t);
+  const reviewer = await createGatewayCorpusReviewer({ complete });
+  let checks = 0;
+  await assert.rejects(reviewer.reviewCase(input(), reviewContext({
+    beforeDispatch() { checks++; throw new Error("review aggregate pool exhausted"); },
+  })), /review aggregate pool exhausted/);
+  assert.equal(checks, 1);
+  assert.equal(state.prepares, 1);
+  assert.equal(state.calls, 0);
+});
+
+test("explicit reviewer attempt ceilings reject wider installed defaults before model preparation", async (t) => {
+  const fixture = await configuredSdkFixture(t);
+  const reviewer = await createGatewayCorpusReviewer();
+  await assert.rejects(reviewer.reviewCase(input(), reviewContext({
+    caseBudget: operationalBudget,
+    attemptBudget: { ...operationalBudget, maxModelRequests: 1 },
+  })), /Configured maxModelRequests.*remaining/);
+  assert.equal(fixture.state.prepares, 0);
+  assert.equal(fixture.state.calls, 0);
+});
+
+test("backward wallclock movement during review preparation cannot renew the native dispatch budget", async (t) => {
+  let wall = 10000, monotonic = 1000;
+  t.mock.method(Date, "now", () => wall);
+  t.mock.method(performance, "now", () => monotonic);
+  const { complete, state } = await runtimeCompleter(t, { mutateAdmission(state) {
+    wall -= 5000;
+    monotonic += 600;
+    state.at = wall - 100;
+    state.ledger.entries[0].at = state.at;
+  } });
+  const reviewer = await createGatewayCorpusReviewer({ complete });
+  await assert.rejects(reviewer.reviewCase(input(), reviewContext({
+    timeoutMs: 2000, deadlineAtMs: wall + 1000,
+  })), /Configured maxDurationMs.*remaining/);
+  assert.equal(state.prepares, 1);
+  assert.equal(state.calls, 0);
 });
 
 test("trusted runtime hook receives narrowed immutable caps and separately enforces zero tools", async (t) => {
@@ -1841,8 +1973,7 @@ test("completion must identify the admitted durable proof directory rather than 
   const reviewer = await createGatewayCorpusReviewer({ complete });
   await assert.rejects(reviewer.reviewCase(input(), reviewContext({ reportUsage: (delta) => reported.push(delta) })),
     /same trusted runtimeBudgetDirectory/);
-  assert.equal(reported.length, 1);
-  assert.equal(reported[0].inputTokens, 20);
+  assert.deepEqual(reported, [], "an unbound completion cannot report settled usage");
   assert.equal(JSON.parse(await readFile(join(state.directory, "operational-budget-ledger.json"), "utf8"))
     .entries.at(-1).type, "settled");
   await assert.rejects(reviewer.reviewCase(input(), reviewContext()), /cannot be reused/);
@@ -1855,8 +1986,8 @@ const admittedBudget = { maxModelRequests: 2, maxInputTokens: 2048, maxOutputTok
   maxToolCalls: 1, maxDurationMs: 1000 };
 
 async function distBudgetCompleter(t, { configured = admittedBudget, run, prepare } = {}) {
-  const { BudgetLedger } = await import("../dist/bridge/budget-ledger.js");
-  const directory = resolve(dirname(fileURLToPath(import.meta.url)), "..", "artifacts", `reviewer-dist-ledger-${randomUUID()}`);
+  const { BudgetLedger } = await import(pathToFileURL(join(builtDistRoot, "bridge", "budget-ledger.js")).href);
+  const directory = resolve(scratchRoot, `reviewer-dist-ledger-${randomUUID()}`);
   await mkdir(directory, { recursive: true });
   t.after(() => rm(directory, { recursive: true, force: true }));
   const state = { directory, prepares: 0, calls: 0 };
@@ -1885,7 +2016,7 @@ async function settleDistRequest(state) {
 test("dist reviewer journals retain measured usage and exact reservations plus full unresolved exposure", async (t) => {
   for (const mode of ["admission only", "pending", "partial after usage", "active after usage", "malformed", "fenced", "owner lock",
     "source reply lock", "config mismatch", "config bytes changed", "unknown admission identity", "no proof",
-    "settled completion error", "completion timeout", "completion abort", "completion fence"]) {
+    "settled completion error", "settled completion missing binding", "completion timeout", "completion abort", "completion fence"]) {
     await t.test(mode, async (t) => {
       // Journal states must not depend on wall-clock corrections or durable I/O latency.
       t.mock.timers.enable({ apis: ["Date"], now: 2000 });
@@ -1933,7 +2064,14 @@ test("dist reviewer journals retain measured usage and exact reservations plus f
           if (mode === "config bytes changed") {
             await writeFile(join(state.directory, "operational-budget-config.json"), JSON.stringify(state.config, null, 2));
           }
-          if (mode === "settled completion error") throw new Error("Synthetic completion error");
+          if (mode === "settled completion error") {
+            await writeFile(join(state.directory, "binding.json"), JSON.stringify({
+              status: "ready", lastRunId: state.config.runId, sessionId: state.config.sessionKey,
+              consumedRunIds: [state.config.runId],
+            }));
+            throw new Error("Synthetic completion error");
+          }
+          if (mode === "settled completion missing binding") throw new Error("Synthetic completion error");
           if (mode.startsWith("completion ")) throw Object.assign(new Error("Synthetic completion interrupted"), {
             name: mode === "completion timeout" ? "TimeoutError" : mode === "completion abort" ? "AbortError" : "FencedError",
           });
@@ -2156,6 +2294,680 @@ test("dist default journal failures preserve installed exposure independently of
       assert.equal(fixture.state.calls, 1);
       assert.equal(fixture.state.sdkRunCalls, 0);
       await assert.rejects(reviewer.reviewCase(input(), reviewContext()), /cannot be reused/);
+    });
+  }
+});
+
+const reviewCanaries = {
+  prompt: "REVIEW-PROMPT-CANARY-PRIVATE",
+  output: "REVIEW-OUTPUT-CANARY-PRIVATE",
+  reasoning: "REVIEW-REASONING-CANARY-PRIVATE",
+  secret: "REVIEW-SECRET-CANARY-SYNTHETIC",
+};
+const malformedReviewText = `${reviewText}\r\n${reviewCanaries.output} π🧪 ${reviewCanaries.secret}`;
+const invalidBusinessReviewText = [
+  { ...reviewRecords[0], submissionId: reviewCanaries.output }, ...reviewRecords.slice(1),
+].map((record) => JSON.stringify(record)).join("\n");
+const settledReviewUsage = { modelRequests: 1, inputTokens: 20, outputTokens: 10, cacheReadTokens: 3,
+  cacheWriteTokens: 2, userTurns: 0, toolCalls: 0, priced: false };
+const nativeReviewUsage = { ...settledReviewUsage, inputTokens: 17, cacheWriteTokens: 0 };
+const sha256 = (value) => createHash("sha256").update(value).digest("hex");
+const outputIdentity = (text) => ({ sha256: sha256(text), utf8Bytes: Buffer.byteLength(text, "utf8") });
+
+function privateReviewInput() {
+  const source = input();
+  source.testCase.prompt = reviewCanaries.prompt;
+  source.evidence.turns[0].outputText = reviewCanaries.output;
+  source.evidence.turns[0].reasoning = reviewCanaries.reasoning;
+  return source;
+}
+
+function assertNoReviewPayload(value) {
+  const visible = inspect(value, { depth: null, showHidden: true });
+  for (const canary of [...Object.values(reviewCanaries), "synthetic-fixture-key"]) {
+    assert.equal(visible.includes(canary), false, "diagnostics and proof must not contain private payloads");
+  }
+}
+
+function assertParseFailure(error, text, code) {
+  assert.ok(error instanceof Error);
+  assert.equal(error.code, code);
+  if (code === "REVIEW_JSON_INVALID") {
+    assert.ok(error instanceof SyntaxError);
+    assert.deepEqual(error.diagnosis, { code, ...outputIdentity(text) });
+  }
+  assert.equal(error.cause, undefined, "raw JSON.parse failures must not survive as a cause");
+  assertNoReviewPayload(error);
+}
+
+function assertCompleteReviewAccounting(error, measured, receipt) {
+  assert.deepEqual(error.budgetAccounting, {
+    usageStatus: "complete", usage: measured, observedLowerBound: measured,
+    reserved: noReservations, unresolvedExposure: noReservations,
+  });
+  assert.deepEqual(error.usage, measured);
+  assert.deepEqual(error.reviewer, receipt);
+  assert.deepEqual(error.budgetAttestation, {
+    status: "verified", hardLimitsVerified: true, quiescent: true,
+    operationalBudget: receipt.operationalBudget, contextWindow: receipt.contextWindow,
+  });
+  assert.deepEqual(error.cleanup, { cleaned: true, quiescent: true });
+  assert.equal(error.turns, undefined, "a failed business review cannot become a successful verdict");
+}
+
+function assertUnreleasedReviewAccounting(error) {
+  assert.ok(error instanceof Error);
+  assert.equal(error.budgetAccounting.usageStatus, "unknown");
+  assert.equal(error.budgetAccounting.usage, undefined);
+  assert.ok(error.budgetAccounting.unresolvedExposure.modelRequests > 0);
+  assert.ok(error.budgetAccounting.unresolvedExposure.inputTokens > 0);
+  assert.ok(error.budgetAccounting.unresolvedExposure.outputTokens > 0);
+  assert.notEqual(error.budgetAttestation?.status, "verified");
+  assert.notEqual(error.cleanup?.quiescent, true);
+  assert.equal(error.reviewer?.reviewerProofPath, undefined);
+  assertNoReviewPayload(error);
+}
+
+async function assertDurableReviewProof(receipt, source, text, measured) {
+  const directory = receipt.runtimeBudgetDirectory;
+  assert.equal(receipt.reviewerProofPath, join(directory, "reviewer-proof.json"));
+  const bytes = await readFile(receipt.reviewerProofPath, "utf8");
+  const saved = JSON.parse(bytes);
+  assert.equal(saved.version, 1);
+  assert.equal(saved.caseId, source.testCase.id);
+  assert.equal(saved.evidenceSha256, evidenceDigest(source.evidence));
+  assert.equal(saved.completionStatus, "complete");
+  assert.deepEqual(saved.output, outputIdentity(text));
+  assert.deepEqual(saved.usage, measured);
+  assert.deepEqual(saved.receipt, receipt);
+  assert.deepEqual(saved.cleanup, { cleaned: true, quiescent: true });
+  assert.deepEqual(saved.budgetAttestation, {
+    status: "verified", hardLimitsVerified: true, quiescent: true,
+    operationalBudget: receipt.operationalBudget, contextWindow: receipt.contextWindow,
+  });
+  const nativeProof = await readRuntimeBudgetProof(directory, { ...receipt, settled: true });
+  assert.deepEqual(saved.nativeProof, nativeProof, "retain the entire verified native proof, not selected usage counters");
+  assert.deepEqual(nativeProof.usage, measured);
+  assert.equal(nativeProof.status, "settled");
+  assert.equal(nativeProof.quiescent, true);
+  assert.equal(nativeProof.hardLimitsVerified, true);
+  for (const key of ["runId", "sessionKey", "agentId", "configSha256"]) {
+    assert.equal(nativeProof[key], receipt[key]);
+  }
+  for (const [file, key] of [["operational-budget-config.json", "configSha256"],
+    ["operational-budget-ledger.json", "ledgerSha256"]]) {
+    const value = JSON.parse(await readFile(join(directory, file), "utf8"));
+    assert.equal(nativeProof[key], sha256(JSON.stringify(value)));
+  }
+  const bindingBytes = await readFile(join(directory, "binding.json"), "utf8");
+  const binding = JSON.parse(bindingBytes);
+  assert.equal(binding.status, "ready");
+  assert.equal(binding.lastRunId, receipt.runId);
+  assert.ok(typeof binding.sessionId === "string" && binding.sessionId.length > 0);
+  assert.ok(binding.consumedRunIds.includes(receipt.runId));
+  for (const key of ["budgetFailure", "failureDiagnostic", "pendingCompact"]) assert.equal(binding[key], undefined);
+  assert.deepEqual(saved.binding, {
+    status: "ready", lastRunId: receipt.runId, sessionId: binding.sessionId, sha256: sha256(bindingBytes),
+  });
+  assertNoReviewPayload(saved);
+  return bytes;
+}
+
+test("review parser failures expose only fixed diagnostics and whole-output fingerprints", async (t) => {
+  let jsonMessage;
+  for (const text of [malformedReviewText, `${reviewCanaries.secret} {"turn":`,
+    `${reviewCanaries.reasoning}\n${reviewCanaries.output}`]) {
+    await t.test(`malformed JSON ${outputIdentity(text).utf8Bytes} bytes`, () => {
+      assert.throws(() => parseReviewLines(text, input().oracleCase.reviews), (error) => {
+        assertParseFailure(error, text, "REVIEW_JSON_INVALID");
+        jsonMessage ??= error.message;
+        assert.equal(error.message, jsonMessage, "safe parser message must not vary with raw output");
+        return true;
+      });
+    });
+  }
+  for (const [name, text, message] of [
+    ["business identity", invalidBusinessReviewText, "Independent reviewer returned an invalid or duplicate verdict/submissionId"],
+    ["missing coverage", reviewRecords.slice(0, -1).map(JSON.stringify).join("\n"),
+      "Independent review is missing turn 0 forbiddenEffects assertions"],
+    ["invalid assertion", [...reviewRecords, { turn: 0, category: reviewCanaries.secret }].map(JSON.stringify).join("\n"),
+      "Independent reviewer returned an invalid assertion record"],
+  ]) {
+    await t.test(name, () => {
+      assert.throws(() => parseReviewLines(text, input().oracleCase.reviews), (error) => {
+        assertParseFailure(error, text, "REVIEW_RECORD_INVALID");
+        assert.equal(error.message, message);
+        return true;
+      });
+    });
+  }
+});
+
+test("bound parser failures retain complete accounting and durable reviewer proof without certifying business success", async (t) => {
+  for (const [name, text, code] of [
+    ["malformed JSON", malformedReviewText, "REVIEW_JSON_INVALID"],
+    ["invalid business identity", invalidBusinessReviewText, "REVIEW_RECORD_INVALID"],
+  ]) {
+    await t.test(name, async (t) => {
+      const source = privateReviewInput();
+      const { complete, state } = await runtimeCompleter(t, { binding: {}, result: { text } });
+      const reviewer = await createGatewayCorpusReviewer({ complete });
+      const reported = [], recorded = [], proofBytes = [];
+      let failure;
+      await assert.rejects(reviewer.reviewCase(source, reviewContext({
+        reportUsage: (value) => reported.push(value),
+        async recordReviewCompletion(value) {
+          recorded.push(value);
+          proofBytes.push(await assertDurableReviewProof(value.receipt, source, text, settledReviewUsage));
+        },
+      })), (error) => {
+        failure = error;
+        assertParseFailure(error, text, code);
+        return true;
+      });
+      assert.deepEqual(reported, [settledReviewUsage]);
+      assert.equal(recorded.length, 1);
+      const receipt = recorded[0].receipt;
+      assert.deepEqual(Object.keys(recorded[0]).sort(), ["caseId", "evidenceSha256", "receipt", "text", "usage"]);
+      assert.deepEqual(recorded[0], { caseId: source.testCase.id, evidenceSha256: evidenceDigest(source.evidence),
+        text, usage: settledReviewUsage, receipt });
+      assert.equal(receipt.kind, "test-runtime");
+      assert.equal(receipt.budgetStatus, "verified");
+      assert.equal(receipt.usageStatus, "complete");
+      assert.equal(receipt.runId, state.runtimeConfig.runId);
+      assertCompleteReviewAccounting(failure, settledReviewUsage, receipt);
+      assert.equal(await assertDurableReviewProof(receipt, source, text, settledReviewUsage), proofBytes[0],
+        "proof must remain durable and unchanged after parsing rejects");
+      assert.equal(state.calls, 1);
+    });
+  }
+});
+
+test("bound successful review preserves the existing completion callback shape with additive proof path", async (t) => {
+  const source = input();
+  const { complete } = await runtimeCompleter(t, { binding: {} });
+  const reviewer = await createGatewayCorpusReviewer({ complete });
+  const recorded = [], reported = [];
+  const result = await reviewer.reviewCase(source, reviewContext({
+    reportUsage: (value) => reported.push(value),
+    recordReviewCompletion: (value) => recorded.push(value),
+  }));
+  assert.deepEqual(recorded, [{ caseId: source.testCase.id, evidenceSha256: evidenceDigest(source.evidence),
+    text: reviewText, usage: settledReviewUsage, receipt: result.reviewer }]);
+  assert.deepEqual(reported, [settledReviewUsage]);
+  assert.deepEqual(result.turns, parseReviewLines(reviewText, source.oracleCase.reviews));
+  await assertDurableReviewProof(result.reviewer, source, reviewText, settledReviewUsage);
+});
+
+test("parser recovery requires a ready unfenced exact-identity binding, not a settled custom ledger alone", async (t) => {
+  for (const mode of ["missing", "invalid JSON", "running", "blocked", "foreign run", "missing native session",
+    "unconsumed run", "budgetFailure", "failureDiagnostic", "pendingCompact"]) {
+    await t.test(mode, async (t) => {
+      const { complete, state } = await runtimeCompleter(t, {
+        binding: {}, result: { text: malformedReviewText },
+        async afterSettlement(state) {
+          const path = join(state.directory, "binding.json");
+          if (mode === "missing") return rm(path);
+          if (mode === "invalid JSON") return writeFile(path, "{");
+          const binding = JSON.parse(await readFile(path, "utf8"));
+          if (["running", "blocked"].includes(mode)) binding.status = mode;
+          if (mode === "foreign run") binding.lastRunId = "other-run";
+          if (mode === "missing native session") delete binding.sessionId;
+          if (mode === "unconsumed run") binding.consumedRunIds = [];
+          if (mode === "budgetFailure") binding.budgetFailure = "DSH_BUDGET_UNCERTAIN";
+          if (mode === "failureDiagnostic") binding.failureDiagnostic = { reason: "termination-unconfirmed" };
+          if (mode === "pendingCompact") binding.pendingCompact = { runId: state.runtimeConfig.runId };
+          await writeFile(path, JSON.stringify(binding));
+        },
+      });
+      const reviewer = await createGatewayCorpusReviewer({ complete });
+      const reported = [];
+      await assert.rejects(reviewer.reviewCase(privateReviewInput(), reviewContext({
+        reportUsage: (value) => reported.push(value),
+      })), (error) => {
+        assertUnreleasedReviewAccounting(error);
+        return true;
+      });
+      assert.ok(reported.length <= 1);
+      assert.equal(existsSync(join(state.directory, "reviewer-proof.json")), false);
+    });
+  }
+});
+
+test("parser recovery never releases missing incomplete cross-identity or locked native proof", async (t) => {
+  for (const mode of ["missing ledger", "admission only", "pending request", "fenced", "foreign runId",
+    "foreign sessionKey", "foreign agentId", "config fingerprint", "config bytes", "owner.lock", "source-reply.lock"]) {
+    await t.test(mode, async (t) => {
+      const { complete, state } = await runtimeCompleter(t, {
+        binding: {}, result: { text: malformedReviewText },
+        async afterSettlement(state) {
+          const path = join(state.directory, "operational-budget-ledger.json");
+          if (mode === "missing ledger") return rm(path);
+          if (mode.endsWith(".lock")) return writeFile(join(state.directory, mode), "{}");
+          if (mode === "config bytes") {
+            return writeFile(join(state.directory, "operational-budget-config.json"), JSON.stringify(state.runtimeConfig, null, 2));
+          }
+          const ledger = JSON.parse(await readFile(path, "utf8"));
+          if (mode === "admission only") ledger.entries = ledger.entries.slice(0, 1);
+          if (mode === "pending request") ledger.entries = ledger.entries.slice(0, 2);
+          if (mode === "fenced") ledger.entries.at(-1).type = "fenced";
+          if (mode.startsWith("foreign ")) ledger[mode.slice("foreign ".length)] = "other-identity";
+          if (mode === "config fingerprint") ledger.configSha256 = "0".repeat(64);
+          await writeFile(path, JSON.stringify(ledger));
+        },
+      });
+      const reviewer = await createGatewayCorpusReviewer({ complete });
+      const reported = [], recorded = [];
+      await assert.rejects(reviewer.reviewCase(privateReviewInput(), reviewContext({
+        reportUsage: (value) => reported.push(value), recordReviewCompletion: (value) => recorded.push(value),
+      })), (error) => {
+        assertUnreleasedReviewAccounting(error);
+        return true;
+      });
+      assert.deepEqual(reported, []);
+      assert.deepEqual(recorded, []);
+      assert.equal(existsSync(join(state.directory, "reviewer-proof.json")), false);
+    });
+  }
+});
+
+test("review callbacks report usage at most once and cannot turn callback errors into parser recovery", async (t) => {
+  for (const callback of ["reportUsage", "recordReviewCompletion"]) {
+    await t.test(callback, async (t) => {
+      const { complete } = await runtimeCompleter(t, { binding: {}, result: { text: malformedReviewText } });
+      const reviewer = await createGatewayCorpusReviewer({ complete });
+      const reported = [], recorded = [];
+      const callbackError = new SyntaxError("Synthetic callback failure");
+      await assert.rejects(reviewer.reviewCase(input(), reviewContext({
+        reportUsage(value) {
+          reported.push(value);
+          if (callback === "reportUsage") throw callbackError;
+        },
+        recordReviewCompletion(value) {
+          recorded.push(value);
+          throw callbackError;
+        },
+      })), (error) => {
+        assert.equal(error, callbackError);
+        assert.notEqual(error.budgetAccounting?.usageStatus, "complete");
+        assert.notEqual(error.budgetAttestation?.status, "verified");
+        assert.notEqual(error.code, "REVIEW_JSON_INVALID");
+        return true;
+      });
+      assert.deepEqual(reported, [settledReviewUsage]);
+      assert.equal(recorded.length, callback === "reportUsage" ? 0 : 1);
+    });
+  }
+});
+
+test("reviewer revalidates native proof and binding after each completion callback before parser recovery", async (t) => {
+  for (const callback of ["reportUsage", "recordReviewCompletion"]) {
+    for (const mutation of ["binding", "ledger", "config", "lock"]) {
+      await t.test(`${callback}: ${mutation}`, async (t) => {
+        const { complete, state } = await runtimeCompleter(t, { binding: {}, result: { text: malformedReviewText } });
+        const reviewer = await createGatewayCorpusReviewer({ complete });
+        const reported = [], recorded = [];
+        const mutate = async () => {
+          if (mutation === "lock") return writeFile(join(state.directory, "owner.lock"), "{}");
+          const name = mutation === "binding" ? "binding.json" :
+            mutation === "ledger" ? "operational-budget-ledger.json" : "operational-budget-config.json";
+          const path = join(state.directory, name);
+          const value = JSON.parse(await readFile(path, "utf8"));
+          if (mutation === "binding") value.lastRunId = "other-run";
+          if (mutation === "ledger") value.entries.at(-1).type = "fenced";
+          if (mutation === "config") value.operationalBudget.maxOutputTokens--;
+          await writeFile(path, JSON.stringify(value));
+        };
+        await assert.rejects(reviewer.reviewCase(privateReviewInput(), reviewContext({
+          async reportUsage(value) { reported.push(value); if (callback === "reportUsage") await mutate(); },
+          async recordReviewCompletion(value) { recorded.push(value); if (callback === "recordReviewCompletion") await mutate(); },
+        })), (error) => {
+          assertUnreleasedReviewAccounting(error);
+          return true;
+        });
+        assert.deepEqual(reported, [settledReviewUsage]);
+        assert.ok(recorded.length <= 1);
+      });
+    }
+  }
+});
+
+test("bound parser recovery never overwrites an existing reviewer proof", async (t) => {
+  const previous = '{"version":1,"caseId":"previous-case","sentinel":"must-not-overwrite"}\n';
+  const { complete, state } = await runtimeCompleter(t, {
+    binding: {}, result: { text: malformedReviewText },
+    afterSettlement: (state) => writeFile(join(state.directory, "reviewer-proof.json"), previous),
+  });
+  const reviewer = await createGatewayCorpusReviewer({ complete });
+  const reported = [];
+  await assert.rejects(reviewer.reviewCase(input(), reviewContext({
+    reportUsage: (value) => reported.push(value),
+  })), (error) => {
+    assert.notEqual(error.budgetAccounting?.usageStatus, "complete");
+    assert.notEqual(error.budgetAttestation?.status, "verified");
+    assert.notEqual(error.code, "REVIEW_JSON_INVALID");
+    return true;
+  });
+  assert.equal(await readFile(join(state.directory, "reviewer-proof.json"), "utf8"), previous);
+  assert.ok(reported.length <= 1);
+});
+
+test("bound reviewer proof is synced before callbacks and sync failure cannot release accounting", async (t) => {
+  for (const failSync of [false, true]) {
+    await t.test(failSync ? "sync failure" : "synced proof", async (t) => {
+      const { default: fs } = await import("node:fs/promises");
+      const { syncBuiltinESMExports } = await import("node:module");
+      const { complete, state } = await runtimeCompleter(t, { binding: {}, result: { text: malformedReviewText } });
+      const proofPath = join(state.directory, "reviewer-proof.json");
+      const originalOpen = fs.open;
+      const events = [];
+      const syncFailure = new Error("Synthetic proof sync failure");
+      const mock = t.mock.method(fs, "open", async (path, ...args) => {
+        const handle = await originalOpen(path, ...args);
+        if (path === proofPath) {
+          const sync = handle.sync.bind(handle);
+          t.mock.method(handle, "sync", async () => {
+            events.push("sync");
+            if (failSync) throw syncFailure;
+            await sync();
+            events.push("synced");
+          });
+        }
+        return handle;
+      });
+      syncBuiltinESMExports();
+      t.after(() => { mock.mock.restore(); syncBuiltinESMExports(); });
+      const reported = [], recorded = [];
+      const reviewer = await createGatewayCorpusReviewer({ complete });
+      await assert.rejects(reviewer.reviewCase(input(), reviewContext({
+        reportUsage: (value) => reported.push(value),
+        recordReviewCompletion(value) {
+          assert.ok(events.includes("synced"), "persist and fsync proof before exposing it to callbacks");
+          recorded.push(value);
+        },
+      })), (error) => {
+        if (failSync) {
+          assert.notEqual(error.code, "REVIEW_JSON_INVALID");
+          assert.notEqual(error.budgetAccounting?.usageStatus, "complete");
+          assert.notEqual(error.budgetAttestation?.status, "verified");
+        } else {
+          assertParseFailure(error, malformedReviewText, "REVIEW_JSON_INVALID");
+          assertCompleteReviewAccounting(error, settledReviewUsage, recorded[0].receipt);
+        }
+        return true;
+      });
+      assert.ok(events.includes("sync"), "real proof file must be flushed, not only written");
+      assert.equal(recorded.length, failSync ? 0 : 1);
+      assert.ok(reported.length <= 1);
+    });
+  }
+});
+
+test("legacy malformed review remains unattested despite complete reported usage and claimed native receipt", async () => {
+  const reported = [], recorded = [];
+  const reviewer = await createGatewayCorpusReviewer({ async complete() {
+    return { text: malformedReviewText, usage, zeroToolsEnforced: true,
+      receipt: { budgetStatus: "verified", hardLimitsVerified: true, quiescent: true } };
+  } });
+  await assert.rejects(reviewer.reviewCase(privateReviewInput(), {
+    reportUsage: (value) => reported.push(value), recordReviewCompletion: (value) => recorded.push(value),
+  }), (error) => {
+    assertParseFailure(error, malformedReviewText, "REVIEW_JSON_INVALID");
+    assert.notEqual(error.budgetAccounting?.usageStatus, "complete");
+    assert.notEqual(error.budgetAttestation?.status, "verified");
+    assert.equal(error.reviewer?.reviewerProofPath, undefined);
+    return true;
+  });
+  assert.deepEqual(reported, [usage]);
+  assert.equal(recorded.length, 1);
+  assert.equal(recorded[0].receipt.budgetStatus, "legacy-unattested");
+  assert.equal(recorded[0].receipt.hardLimitsVerified, false);
+  assert.equal(recorded[0].receipt.reviewerProofPath, undefined);
+});
+
+test("bound drained malformed review retains unresolved exposure on caller abort or deadline", async (t) => {
+  for (const mode of ["abort", "timeout"]) {
+    await t.test(mode, async (t) => {
+      const controller = new AbortController();
+      if (mode === "timeout") t.mock.timers.enable({ apis: ["setTimeout"] });
+      const { complete, state } = await runtimeCompleter(t, {
+        binding: {}, result: { text: malformedReviewText },
+        async afterSettlement(_state, context) {
+          if (mode === "abort") controller.abort(new Error("Synthetic caller abort"));
+          else t.mock.timers.tick(2000);
+          context.signal.throwIfAborted();
+        },
+      });
+      const reviewer = await createGatewayCorpusReviewer({ complete });
+      const reported = [], recorded = [];
+      await assert.rejects(reviewer.reviewCase(input(), reviewContext({
+        signal: controller.signal, timeoutMs: 2000,
+        reportUsage: (value) => reported.push(value), recordReviewCompletion: (value) => recorded.push(value),
+      })), (error) => {
+        assertUnreleasedReviewAccounting(error);
+        assert.deepEqual(error.budgetAccounting.observedLowerBound, settledReviewUsage);
+        assert.deepEqual(error.budgetAccounting.reserved, noReservations);
+        assert.deepEqual(error.budgetAccounting.unresolvedExposure, exposureOf(state.runtimeConfig.operationalBudget));
+        return true;
+      });
+      assert.deepEqual(reported, []);
+      assert.deepEqual(recorded, []);
+      assert.equal(existsSync(join(state.directory, "reviewer-proof.json")), false);
+      await assert.rejects(reviewer.reviewCase(input(), reviewContext()), /cannot be reused/);
+      assert.equal(state.calls, 1);
+    });
+  }
+});
+
+test("bound parser recovery rejects interruption during usage or completion callbacks", async (t) => {
+  for (const callback of ["reportUsage", "recordReviewCompletion"]) {
+    for (const mode of ["abort", "timeout"]) {
+      await t.test(`${callback}: ${mode}`, async (t) => {
+        const controller = new AbortController();
+        if (mode === "timeout") t.mock.timers.enable({ apis: ["setTimeout"] });
+        const { complete, state } = await runtimeCompleter(t, { binding: {}, result: { text: malformedReviewText } });
+        const reviewer = await createGatewayCorpusReviewer({ complete });
+        const reported = [], recorded = [];
+        const interrupt = () => {
+          if (mode === "abort") controller.abort(new Error("Synthetic callback abort"));
+          else t.mock.timers.tick(2000);
+        };
+        await assert.rejects(reviewer.reviewCase(input(), reviewContext({
+          signal: controller.signal, timeoutMs: 2000,
+          reportUsage(value) { reported.push(value); if (callback === "reportUsage") interrupt(); },
+          recordReviewCompletion(value) { recorded.push(value); if (callback === "recordReviewCompletion") interrupt(); },
+        })), (error) => {
+          assertUnreleasedReviewAccounting(error);
+          assert.deepEqual(error.budgetAccounting.observedLowerBound, settledReviewUsage);
+          assert.deepEqual(error.budgetAccounting.unresolvedExposure, exposureOf(state.runtimeConfig.operationalBudget));
+          return true;
+        });
+        assert.deepEqual(reported, [settledReviewUsage]);
+        assert.ok(recorded.length <= 1);
+        await assert.rejects(reviewer.reviewCase(input(), reviewContext()), /cannot be reused/);
+        assert.equal(state.calls, 1);
+      });
+    }
+  }
+});
+
+test("throwing callbacks cannot release cached settlement after fencing the native proof", async (t) => {
+  for (const callback of ["reportUsage", "recordReviewCompletion"]) {
+    await t.test(callback, async (t) => {
+      const { complete, state } = await runtimeCompleter(t, { binding: {}, result: { text: malformedReviewText } });
+      const reviewer = await createGatewayCorpusReviewer({ complete });
+      const failure = new Error("Synthetic callback failure");
+      let reports = 0;
+      const fence = async () => {
+        await writeFile(join(state.directory, "owner.lock"), "{}");
+        throw failure;
+      };
+      await assert.rejects(reviewer.reviewCase(input(), reviewContext({
+        async reportUsage() { reports++; if (callback === "reportUsage") await fence(); },
+        async recordReviewCompletion() { if (callback === "recordReviewCompletion") await fence(); },
+      })), (error) => {
+        assert.equal(error, failure);
+        assertUnreleasedReviewAccounting(error);
+        return true;
+      });
+      assert.equal(reports, 1);
+      assert.equal(existsSync(join(state.directory, "reviewer-proof.json")), false);
+    });
+  }
+});
+
+test("a stalled completion callback is cancelled and its durable proof is invalidated on timeout", async (t) => {
+  const { complete, state } = await runtimeCompleter(t, { binding: {}, result: { text: malformedReviewText } });
+  const reviewer = await createGatewayCorpusReviewer({ complete });
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  let reports = 0;
+  await assert.rejects(reviewer.reviewCase(input(), reviewContext({
+    timeoutMs: 2000,
+    reportUsage() { reports++; },
+    async recordReviewCompletion() {
+      assert.equal(existsSync(join(state.directory, "reviewer-proof.json")), true);
+      t.mock.timers.tick(2000);
+      await new Promise(() => {});
+    },
+  })), (error) => {
+    assertUnreleasedReviewAccounting(error);
+    return true;
+  });
+  assert.equal(reports, 1);
+  assert.equal(existsSync(join(state.directory, "reviewer-proof.json")), false);
+  await assert.rejects(reviewer.reviewCase(input(), reviewContext()), /cannot be reused/);
+});
+
+test("completion callbacks cannot replace the output bound by the durable proof", async (t) => {
+  const source = input();
+  const { complete } = await runtimeCompleter(t, { binding: {}, result: { text: malformedReviewText } });
+  let retained;
+  const wrapped = async (...args) => (retained = await complete(...args));
+  wrapped.prepareOperationalBudget = complete.prepareOperationalBudget;
+  const reviewer = await createGatewayCorpusReviewer({ complete: wrapped });
+  let receipt;
+  await assert.rejects(reviewer.reviewCase(source, reviewContext({
+    recordReviewCompletion(value) { receipt = value.receipt; retained.text = reviewText; },
+  })), (error) => {
+    assertParseFailure(error, malformedReviewText, "REVIEW_JSON_INVALID");
+    assertCompleteReviewAccounting(error, settledReviewUsage, receipt);
+    return true;
+  });
+  await assertDurableReviewProof(receipt, source, malformedReviewText, settledReviewUsage);
+});
+
+async function runFreshDistNativeTest(t) {
+  if (process.env.DSH_REVIEWER_DIST_PROCESS === t.name) return false;
+  const { execFile } = await import("node:child_process");
+  const pattern = t.name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const env = { ...process.env, DSH_REVIEWER_DIST_PROCESS: t.name };
+  delete env.NODE_TEST_CONTEXT;
+  // Source fixtures cache transpiled modules under dist URLs; a fresh process is the isolation boundary.
+  const { error, stdout, stderr } = await new Promise((resolve) => {
+    execFile(process.execPath, ["--test", "--test-concurrency=1", "--test-reporter=tap",
+      `--test-name-pattern=^${pattern}$`, fileURLToPath(import.meta.url)], {
+      cwd: process.cwd(), env,
+      timeout: 580000, maxBuffer: 4 * 1024 * 1024,
+    }, (error, stdout, stderr) => resolve({ error, stdout, stderr }));
+  });
+  assert.equal(error, null, `Fresh dist-native process failed:\n${stdout}\n${stderr}`);
+  assert.ok(stdout.includes(`# Subtest: ${t.name}`), "fresh process must execute the selected native regression");
+  assert.match(stdout, /^# pass [1-9]\d*\s*$/m, "an empty or recursively skipped test run is not verification");
+  return true;
+}
+
+test("dist-native parser failures retain genuine child proof, exact identities, and durable accounting", { timeout: 600000 }, async (t) => {
+  if (await runFreshDistNativeTest(t)) return;
+  for (const [name, text, code] of [
+    ["malformed JSON", malformedReviewText, "REVIEW_JSON_INVALID"],
+    ["invalid business identity", invalidBusinessReviewText, "REVIEW_RECORD_INVALID"],
+  ]) {
+    await t.test(name, async (t) => {
+      const source = privateReviewInput();
+      const proofBytes = [];
+      const fixture = await sourceNativeReviewFixture(t, {
+        distOnly: true, text, input: source, reasoning: reviewCanaries.reasoning,
+        context: { async recordReviewCompletion(value) {
+          proofBytes.push(await assertDurableReviewProof(value.receipt, source, text, nativeReviewUsage));
+        } },
+      });
+      const { error, result, recorded, reported, state, model } = fixture;
+      assert.equal(result, undefined);
+      assertParseFailure(error, text, code);
+      assert.equal(model.requests.length, 1, "the real native child must make exactly one loopback request");
+      assert.equal(state.nativeRuns, 1);
+      assert.equal(state.nativeDisposals, 1);
+      assert.equal(state.preparedContext.bindAuthOwner, true);
+      assert.equal(state.sdkRunCalls, 0);
+      assert.ok(model.requests[0].headers.authorization === "Bearer synthetic-fixture-key");
+      assert.deepEqual(reported, [nativeReviewUsage]);
+      assert.equal(recorded.length, 1);
+      const receipt = recorded[0].receipt;
+      const nativeReceipt = state.nativeResult.budgetReceipt;
+      assert.equal(receipt.kind, "host-prepared-isolated-completion");
+      assert.equal(receipt.runtimeBudgetDirectory, nativeReceipt.directory);
+      for (const key of ["runId", "sessionKey", "agentId"]) assert.equal(receipt[key], nativeReceipt[key]);
+      assertCompleteReviewAccounting(error, nativeReviewUsage, receipt);
+      assert.equal(await assertDurableReviewProof(receipt, source, text, nativeReviewUsage), proofBytes[0]);
+      const history = join(nativeReceipt.directory, "budgets", sha256(nativeReceipt.runId));
+      for (const name of ["operational-budget-config.json", "operational-budget-ledger.json"]) {
+        assert.equal(await readFile(join(nativeReceipt.directory, name), "utf8"), await readFile(join(history, name), "utf8"));
+      }
+      state.replayNativeResult = state.nativeResult;
+      const duplicateReports = [];
+      await assert.rejects(fixture.reviewer.reviewCase(source, reviewContext({
+        reportUsage: (value) => duplicateReports.push(value),
+      })), /reused a previous review run/);
+      assert.deepEqual(duplicateReports, [], "replaying the genuine receipt must not report usage twice");
+      assert.equal(model.requests.length, 1);
+      assert.equal(state.nativeRuns, 1);
+      assert.equal(await readFile(receipt.reviewerProofPath, "utf8"), proofBytes[0]);
+    });
+  }
+});
+
+test("dist-native generated proof mutations cannot release parser-failure accounting", { timeout: 600000 }, async (t) => {
+  if (await runFreshDistNativeTest(t)) return;
+  for (const mode of ["missing receipt", "missing ledger", "pending request", "foreign runId",
+    "foreign sessionKey", "foreign agentId", "config fingerprint", "blocked binding"]) {
+    await t.test(mode, async (t) => {
+      let originalProof;
+      const fixture = await sourceNativeReviewFixture(t, {
+        distOnly: true, text: malformedReviewText, input: privateReviewInput(),
+        async afterNativeRun(result) {
+          const receipt = result.budgetReceipt;
+          originalProof = await readRuntimeBudgetProof(receipt.directory, { ...receipt, settled: true });
+          assert.deepEqual(originalProof.usage, nativeReviewUsage, "mutations must start from genuine settled child usage");
+          if (mode === "missing receipt") { delete result.budgetReceipt; return; }
+          if (mode.startsWith("foreign ")) { receipt[mode.slice("foreign ".length)] = "other-identity"; return; }
+          if (mode === "blocked binding") {
+            const path = join(receipt.directory, "binding.json");
+            const binding = JSON.parse(await readFile(path, "utf8"));
+            binding.status = "blocked";
+            await writeFile(path, JSON.stringify(binding));
+            return;
+          }
+          const path = join(receipt.directory, "operational-budget-ledger.json");
+          if (mode === "missing ledger") return rm(path);
+          const ledger = JSON.parse(await readFile(path, "utf8"));
+          if (mode === "pending request") {
+            const index = ledger.entries.findIndex((entry) => entry.type === "request_reserved");
+            assert.ok(index >= 1);
+            ledger.entries = ledger.entries.slice(0, index + 1);
+          }
+          if (mode === "config fingerprint") ledger.configSha256 = "0".repeat(64);
+          await writeFile(path, JSON.stringify(ledger));
+        },
+      });
+      assert.ok(originalProof, "run the child before mutating any proof");
+      assert.equal(fixture.result, undefined);
+      assertUnreleasedReviewAccounting(fixture.error);
+      assert.equal(fixture.model.requests.length, 1);
+      assert.equal(fixture.state.nativeRuns, 1);
+      assert.equal(fixture.state.nativeDisposals, 1);
+      assert.equal(fixture.state.sdkRunCalls, 0);
+      assert.ok(fixture.reported.length <= 1);
+      assert.equal(existsSync(join(fixture.state.nativeResult.budgetReceipt.directory, "reviewer-proof.json")), false);
     });
   }
 });

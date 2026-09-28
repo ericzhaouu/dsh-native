@@ -60,7 +60,7 @@ export async function copySafePluginTree(source, destination) {
   await assertSafePluginArtifact(destination);
 }
 
-export async function createPatchedHostFixture(root, { compactionAuth = false } = {}) {
+export async function createPatchedHostFixture(root, { compactionAuth = false, chatFinalText = true } = {}) {
   const source = join(projectRoot, "node_modules", "openclaw");
   const host = join(root, "openclaw");
   await mkdir(host);
@@ -74,6 +74,8 @@ export async function createPatchedHostFixture(root, { compactionAuth = false } 
   await patchSourceReply(host, { action: "apply", offlineConfirmed: true });
   const { patchHost: patchTablePolicy } = await import("../../host-patch/table-policy/apply.mjs");
   await patchTablePolicy(host, { action: "apply", offlineConfirmed: true });
+  const { patchHost: patchChatFinalText } = await import("../../host-patch/chat-final-text/apply.mjs");
+  if (chatFinalText) await patchChatFinalText(host, { action: "apply", offlineConfirmed: true });
   if (compactionAuth) {
     const { patchHost: patchCompactionAuth } = await import("../../host-patch/compact-auth/apply.mjs");
     await patchCompactionAuth(host, { action: "apply", offlineConfirmed: true });
@@ -85,7 +87,7 @@ export async function createPluginFixture(root, host) {
   const pluginSource = process.env.DSH_NATIVE_PACKAGED_ROOT ?? projectRoot;
   const plugin = join(root, "plugin");
   await mkdir(plugin, { mode: safeDirectoryMode });
-  for (const name of ["package.json", "openclaw.plugin.json", "dist"]) {
+  for (const name of ["package.json", "openclaw.plugin.json", "dist", "host-patch"]) {
     await copySafePluginTree(join(pluginSource, name), join(plugin, name));
   }
   await securePluginModes(plugin);

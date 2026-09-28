@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { registerHooks } from "node:module";
 import test from "node:test";
 import { prepareSourceReplyOwnership } from "../dist/native/source-reply-ownership.js";
 
@@ -32,6 +33,76 @@ test("proof binds exact committed assistant, run and active reset without changi
   assert.equal(proof.assistantKey, f.key);
   assert.ok(Object.isFrozen(proof));
   await proof.assertCurrent();
+});
+test("proof concatenates committed text blocks exactly, preserving empty blocks, CRLF and trailing LF", async () => {
+  const f = fixture();
+  f.assistant.content = [
+    { type: "text", text: "" },
+    { type: "text", text: "Answer" },
+    { type: "text", text: "  \r" },
+    { type: "text", text: "" },
+    { type: "text", text: "\ncontinuation\n" },
+    { type: "text", text: "" },
+  ];
+  const committed = structuredClone(f.assistant);
+  const proof = await prepareSourceReplyOwnership(f.p, f.assistant, f.key, () => {}, f.transport);
+  assert.equal(proof.text, "Answer  \r\ncontinuation\n");
+  assert.deepEqual(f.assistant, committed);
+  await proof.assertCurrent();
+});
+test("ownership text projection excludes thinking without inserting separators or normalizing whitespace", async () => {
+  const f = fixture();
+  f.assistant.content = [
+    { type: "thinking", thinking: "Private reasoning before text" },
+    { type: "text", text: "" },
+    { type: "text", text: "Answer" },
+    { type: "text", text: "  \r" },
+    { type: "thinking", thinking: "Private reasoning between text blocks" },
+    { type: "text", text: "" },
+    { type: "text", text: "\ncontinuation\n" },
+    { type: "text", text: "" },
+    { type: "thinking", thinking: "Private reasoning after text" },
+  ];
+  const committed = structuredClone(f.assistant);
+  const ownershipUrl = new URL("../dist/native/source-reply-ownership.js?projection-test", import.meta.url).href;
+  // Isolate projection: real transcript validation still rejects thinking blocks.
+  const context = {
+    assistantKeyPrefix: "dsh-native:reset:reset-one:",
+    nativeStateId: "session\0reset\0reset-one",
+    contextMessages: [committed],
+  };
+  const transcriptUrl = `data:text/javascript,${encodeURIComponent(
+    `export async function readNativeMaintenanceContext() {
+      return { ...${JSON.stringify(context)}, assertCurrent: async () => {} };
+    }`,
+  )}`;
+  const hooks = registerHooks({
+    resolve(specifier, context, next) {
+      if (context.parentURL === ownershipUrl && specifier === "./transcript.js") {
+        return { url: transcriptUrl, shortCircuit: true };
+      }
+      return next(specifier, context);
+    },
+  });
+  try {
+    const { prepareSourceReplyOwnership: prepareProjection } = await import(ownershipUrl);
+    const proof = await prepareProjection(f.p, f.assistant, f.key, () => {}, f.transport);
+    assert.equal(proof.text, "Answer  \r\ncontinuation\n");
+    assert.equal(proof.assistantKey, f.key);
+    assert.deepEqual(f.assistant, committed);
+  } finally {
+    hooks.deregister();
+  }
+});
+test("thinking blocks remain unsupported in the real committed transcript", async () => {
+  const f = fixture();
+  f.assistant.content.push(
+    { type: "thinking", thinking: "Private reasoning" },
+    { type: "text", text: "" },
+    { type: "text", text: "\r\ncontinuation\n" },
+  );
+  await assert.rejects(prepareSourceReplyOwnership(f.p, f.assistant, f.key, () => {}, f.transport),
+    /unsupported assistant history/);
 });
 test("proof derives omitted agent identity from the same validated session scope", async () => {
   const f = fixture();

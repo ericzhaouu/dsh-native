@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createConnection, createServer } from "node:net";
 import { get } from "node:http";
-import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { cp, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { createHash, generateKeyPairSync, randomUUID } from "node:crypto";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -31,6 +31,36 @@ export function messageText(message) {
     .filter((block) => block?.type === "text" && typeof block.text === "string")
     .map((block) => block.text).join("");
   return typeof message?.text === "string" ? message.text : "";
+}
+
+async function installSplitAssistantTextBlocks(plugin) {
+  const entry = join(plugin, "dist", "index.js");
+  await cp(entry, join(plugin, "dist", "dashboard-unsplit-entry.js"));
+  await writeFile(entry, `
+import original from "./dashboard-unsplit-entry.js";
+export default { ...original, register(api) {
+  api.on("before_message_write", ({ message }) => {
+    const key = message?.idempotencyKey ?? message?.__openclaw?.idempotencyKey;
+    if (message?.role !== "assistant" || typeof key !== "string" ||
+        !/^dsh-native:.+:assistant$/.test(key) || !Array.isArray(message.content) ||
+        message.content.some(block => block?.type !== "text" || typeof block.text !== "string")) return;
+    const text = message.content.map(block => block.text).join("");
+    if (text.length < 3) return;
+    const crlf = text.indexOf("\\r\\n");
+    const split = crlf >= 0 ? crlf + 1 : Math.floor(text.length / 2);
+    return { message: { ...message, content: [
+      { type: "text", text: "" },
+      { type: "text", text: text.slice(0, split) },
+      { type: "text", text: "" },
+      { type: "text", text: text.slice(split, -1) },
+      { type: "text", text: "" },
+      { type: "text", text: text.slice(-1) },
+      { type: "text", text: "" },
+    ] } };
+  });
+  return original.register(api);
+} };
+`);
 }
 
 async function createNetworkGuard(root) {
@@ -160,6 +190,8 @@ export async function startDashboardGateway(responder, {
   additionalAgentIds = [], setupWorkspaces, modelContextWindow = 1_000_000,
   compaction, memoryFixture = false, copilotAuthFixture = false,
   compactionAuthPatch = copilotAuthFixture, copilotAuthProfile = false, sourceReplyFixture,
+  splitAssistantTextBlocks = false,
+  chatFinalTextPatch = true,
 } = {}) {
   assert.equal(OPENCLAW_VERSION, "2026.9.2", "Dashboard fixture must use the inspected genuine SDK");
   assert.ok(!copilotAuthFixture || agentPinned, "Synthetic provider replacement requires a private copied host");
@@ -251,7 +283,9 @@ export async function startDashboardGateway(responder, {
       catch (error) { failFixture(error); throw error; }
     });
     const originalHost = join(packageRoot, "node_modules", "openclaw");
-    const fixture = agentPinned || sourceReplyFixture ? await createPatchedHostFixture(root, { compactionAuth: compactionAuthPatch })
+    const fixture = agentPinned || sourceReplyFixture ? await createPatchedHostFixture(root, {
+      compactionAuth: compactionAuthPatch, chatFinalText: chatFinalTextPatch,
+    })
       : { host: originalHost, plugin: await createPluginFixture(root, originalHost) };
     if (copilotAuthFixture) {
       // Replace the copied provider, not the installed SDK or its ownership checks.
@@ -266,6 +300,7 @@ export async function startDashboardGateway(responder, {
     const memory = memoryFixture ? await createHostMemoryFixture(root, fixture.host) : undefined;
     const sourceReply = sourceReplyFixture ? await createSourceReplyChannelFixture(root, fixture.host) : undefined;
     await sourceReply?.observeHarness(fixture.plugin);
+    if (splitAssistantTextBlocks) await installSplitAssistantTextBlocks(fixture.plugin);
     const port = await reserveLoopbackPort();
     const configPath = join(root, "openclaw.json");
     const logPath = join(root, "openclaw.log");
