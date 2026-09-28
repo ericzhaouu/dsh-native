@@ -4,9 +4,9 @@ import { link, lstat, mkdir, mkdtemp, open, readFile, readdir, rename, rm, stat,
 import { isAbsolute, join, resolve, sep } from "node:path";
 import test from "node:test";
 import { createAcceptanceExecutor } from "../scripts/lib/acceptance-campaign-executor.mjs";
+import { campaignEnvironment } from "./fixtures/campaign-environment.mjs";
 
-const root = process.env.DSH_CAMPAIGN_TEST_ROOT;
-const skip = !root && "Filesystem tests require explicit DSH_CAMPAIGN_TEST_ROOT";
+const { root, skip } = campaignEnvironment(process.platform, process.env.DSH_CAMPAIGN_TEST_ROOT);
 const digest = (value) => createHash("sha256").update(value).digest("hex");
 
 async function syncDirectory(path) {

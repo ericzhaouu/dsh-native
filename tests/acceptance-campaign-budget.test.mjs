@@ -9,9 +9,9 @@ import {
 import { allocateCampaignCase, resolveHostContextWindow } from "../scripts/lib/acceptance-campaign-budget-plan.mjs";
 import { CampaignError, createJournal, hash, immutable, journalWriter, readJournal } from "../scripts/lib/acceptance-campaign-state.mjs";
 import { prepareCampaign, runCampaign } from "../scripts/lib/acceptance-campaign.mjs";
+import { campaignEnvironment } from "./fixtures/campaign-environment.mjs";
 
-const harness = process.env.DSH_CAMPAIGN_TEST_ROOT;
-const skip = !harness && "Filesystem tests require explicit DSH_CAMPAIGN_TEST_ROOT";
+const { root: harness, skip } = campaignEnvironment(process.platform, process.env.DSH_CAMPAIGN_TEST_ROOT);
 const vector = (userTurns = 0, modelRequests = 0, inputTokens = 0, outputTokens = 0) =>
   ({ userTurns, modelRequests, inputTokens, outputTokens });
 const attempt = { maxModelRequests: 8, maxInputTokens: 2000000, maxOutputTokens: 8000,
@@ -613,12 +613,7 @@ test("concurrent controllers cannot both acquire the shared authorization lock",
 });
 
 test("default production policy preflights actual configured caps offline and reserves before executor", { skip }, async (t) => {
-  try { await import("../scripts/run-acceptance.mjs"); }
-  catch (error) {
-    if (error.code !== "ERR_MODULE_NOT_FOUND") throw error;
-    t.skip("Full runner preflight requires the existing installed dependencies/build");
-    return;
-  }
+  await import("../scripts/run-acceptance.mjs");
   const f = await fixture(t);
   const sourceRoot = resolve(".");
   const oracles = await immutable(join(f.directory, "oracles.json"),

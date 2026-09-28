@@ -93,6 +93,8 @@ jobs:
       - name: Pinned SDK tests and freshly packed clean-source manifest
         env:
           DSH_RUN_ISOLATED_SDK_TRANSPORT: "1"
+          DSH_CI_PRIVATE_ROOT: ${{ github.workspace }}/artifacts/release-private/linux-node-${{ matrix.node }}
+          DSH_CAMPAIGN_TEST_ROOT: ${{ github.workspace }}/artifacts/release-private/linux-node-${{ matrix.node }}/campaign-tests
         run: node scripts/release-ci.mjs full
       - name: Upload allowlisted nonsecret evidence only
         if: always()
@@ -101,6 +103,7 @@ jobs:
           name: linux-sdk-evidence-node-${{ matrix.node }}
           path: |
             artifacts/release-evidence/full-sdk-results.json
+            artifacts/release-evidence/test-coverage.json
             artifacts/release-evidence/release-manifest.json
             artifacts/release-evidence/verification.json
             artifacts/release-evidence/reproducibility.json

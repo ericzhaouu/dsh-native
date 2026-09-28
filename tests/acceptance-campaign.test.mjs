@@ -14,9 +14,9 @@ import {
 } from "../scripts/lib/acceptance-campaign-health.mjs";
 import { hash, immutable, readJournal, readJson } from "../scripts/lib/acceptance-campaign-state.mjs";
 import { campaignCli, campaignHelp } from "../scripts/run-acceptance-campaign.mjs";
+import { campaignEnvironment } from "./fixtures/campaign-environment.mjs";
 
-const harness = process.env.DSH_CAMPAIGN_TEST_ROOT;
-const skip = !harness && "Filesystem tests require explicit DSH_CAMPAIGN_TEST_ROOT";
+const { root: harness, skip } = campaignEnvironment(process.platform, process.env.DSH_CAMPAIGN_TEST_ROOT);
 const save = (path, value) => writeFile(path, typeof value === "string" ? value : `${JSON.stringify(value)}\n`,
   { mode: 0o600 });
 const healthConfig = { url: "http://127.0.0.1:1/readyz", headers: {}, totalWaitMs: 1000,

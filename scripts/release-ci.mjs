@@ -1,10 +1,11 @@
 #!/usr/bin/env node
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { basename, dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { closeSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { APPROVED_SDK_SHA256, createReleaseManifest, verifyReleaseManifest } from "./lib/release-manifest.mjs";
+import { verifyLinuxCoverage } from "./lib/release-test-reporter.mjs";
 
 const evidenceDirectory = resolve("artifacts", "release-evidence");
 const hash = (bytes) => createHash("sha256").update(bytes).digest("hex");
@@ -56,6 +57,45 @@ export function sdkTransportRequirement(platform, optIn) {
     throw new Error("Required Linux SDK transport coverage must be explicitly enabled.");
   }
   return platform === "linux";
+}
+
+export function prepareLinuxStage(stage, campaignRoot) {
+  if (!stage || !isAbsolute(stage) || !campaignRoot || !isAbsolute(campaignRoot) ||
+      resolve(campaignRoot) !== join(resolve(stage), "campaign-tests")) {
+    throw new Error("Required Linux SDK stage needs explicit absolute private and campaign directories.");
+  }
+  const parent = dirname(resolve(stage));
+  if (realpathSync(parent) !== parent) throw new Error("Private SDK stage parent must not contain symlinks.");
+  mkdirSync(stage, { mode: 0o700 });
+  mkdirSync(campaignRoot, { mode: 0o700 });
+  for (const path of [stage, campaignRoot]) {
+    const info = lstatSync(path);
+    if (!info.isDirectory() || info.isSymbolicLink() || (info.mode & 0o777) !== 0o700 ||
+        info.uid !== process.getuid()) throw new Error("Linux SDK stage must be owner-private (0700).");
+  }
+  const probe = join(campaignRoot, ".write-probe");
+  const fd = openSync(probe, "wx", 0o600);
+  try { writeFileSync(fd, "private-stage"); }
+  finally { closeSync(fd); rmSync(probe); }
+  return stage;
+}
+
+export function fullSdkTests() {
+  const reportPath = join(evidenceDirectory, "test-coverage.json");
+  mkdirSync(evidenceDirectory, { recursive: true });
+  rmSync(reportPath, { force: true });
+  const files = readdirSync("tests").filter((name) => name.endsWith(".test.mjs")).sort().map((name) => join("tests", name));
+  let result;
+  try {
+    run(process.execPath, ["--test", "--test-concurrency=1",
+      "--test-reporter=spec", "--test-reporter-destination=stdout",
+      `--test-reporter=${pathToFileURL(resolve("scripts", "lib", "release-test-reporter.mjs")).href}`,
+      `--test-reporter-destination=${reportPath}`, ...files]);
+  } finally {
+    if (existsSync(reportPath)) result = JSON.parse(readFileSync(reportPath, "utf8"));
+    evidence("test-coverage.json", result ?? { counts: null });
+  }
+  return process.platform === "linux" ? verifyLinuxCoverage(result) : result;
 }
 
 export function sdkCompanionPaths(root = process.cwd()) {
@@ -111,15 +151,23 @@ async function pack(release) {
 async function full() {
   let ok = false;
   let sdkTransportRequired = false;
+  let coverage;
+  let dependencyPins;
   try {
     sdkTransportRequired = sdkTransportRequirement(process.platform, process.env.DSH_RUN_ISOLATED_SDK_TRANSPORT);
     if (!process.env.SDK_PACKAGE || hash(readFileSync(process.env.SDK_PACKAGE)) !== APPROVED_SDK_SHA256) {
       throw new Error("Approved SDK is required.");
     }
-    npm(["ci", "--ignore-scripts"]);
     const parent = resolve("artifacts", "release-private");
-    mkdirSync(parent, { recursive: true });
-    const sdkRoot = mkdtempSync(join(parent, "install-"));
+    mkdirSync(parent, { recursive: true, mode: 0o700 });
+    const sdkRoot = process.platform === "linux"
+      ? prepareLinuxStage(process.env.DSH_CI_PRIVATE_ROOT, process.env.DSH_CAMPAIGN_TEST_ROOT)
+      : mkdtempSync(join(parent, "install-"));
+    dependencyPins = { projectShrinkwrapSha256: hash(readFileSync("npm-shrinkwrap.json")), sdkSha256: APPROVED_SDK_SHA256 };
+    npm(["ci", "--ignore-scripts"]);
+    if (hash(readFileSync("npm-shrinkwrap.json")) !== dependencyPins.projectShrinkwrapSha256) {
+      throw new Error("Pinned project dependencies changed during installation.");
+    }
     npm(["install", "--prefix", sdkRoot, "--no-save", "--package-lock=false", "--ignore-scripts", process.env.SDK_PACKAGE]);
     const target = resolve("node_modules", "openclaw");
     if (existsSync(target)) throw new Error("Refusing to replace an existing SDK installation.");
@@ -129,13 +177,14 @@ async function full() {
     }
     npm(["run", "typecheck"]);
     npm(["run", "build"]);
-    npm(["test"]);
+    coverage = fullSdkTests();
     await pack(true);
     ok = true;
   } finally {
     evidence("full-sdk-results.json", {
       ok, suite: "generated-fixtures-with-pinned-sdk", sdkSha256: APPROVED_SDK_SHA256,
       node: process.version, platform: process.platform, realAccountTests: false,
+      dependencyPins, coverage,
       isolatedSdkTransport: {
         required: process.platform === "linux", passed: ok && sdkTransportRequired,
         evidenceClass: "isolated-sdk", channelCertified: false,
@@ -148,6 +197,11 @@ async function main() {
   const [command, ...options] = process.argv.slice(2);
   if (command === "fixtures" && options.length === 0) return fixtures();
   if (command === "full" && options.length === 0) return full();
+  if (command === "test-full" && options.length === 0) {
+    const coverage = fullSdkTests();
+    evidence("test-coverage.json", coverage);
+    return;
+  }
   if (command === "pack" && (options.length === 0 || options.length === 1 && options[0] === "--release")) return pack(options.length === 1);
   if (command === "gate" && options.length === 0) {
     const result = evaluateGate(process.env.CI_EVENT, process.env.CI_FIXTURE_RESULT, process.env.CI_SDK_RESULT);
@@ -156,7 +210,7 @@ async function main() {
     if (!result.ok) process.exitCode = 1;
     return;
   }
-  throw new Error("Usage: node scripts\\release-ci.mjs fixtures|full|pack [--release]|gate");
+  throw new Error("Usage: node scripts\\release-ci.mjs fixtures|full|test-full|pack [--release]|gate");
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

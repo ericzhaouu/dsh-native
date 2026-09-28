@@ -21,8 +21,13 @@ async function regularFile(root, path) {
 async function atomicWrite(path, contents, mode = 0o600) {
   const temp = `${path}.${randomUUID()}.tmp`;
   try {
-    const file = await open(temp, "wx", mode);
-    try { await file.writeFile(contents); await file.sync(); }
+    const file = await open(temp, "wx", 0o600);
+    try {
+      await file.writeFile(contents);
+      // Creation modes are filtered by umask. Set the original mode on our own inode, not the target.
+      await file.chmod(mode);
+      await file.sync();
+    }
     finally { await file.close(); }
     await rename(temp, path);
   } finally { await rm(temp, { force: true }); }
@@ -59,7 +64,7 @@ function validateReceipt(receipt, spec) {
       receipt?.sourceCommit !== spec.SOURCE_COMMIT || !Array.isArray(receipt.files) ||
       receipt.files.length !== spec.edits.length ||
       !receipt.files.every((file, i) => file.file === spec.edits[i].file && file.original === spec.edits[i].sha256 &&
-        /^[a-f0-9]{64}$/.test(file.patched) && Number.isInteger(file.mode))) {
+        /^[a-f0-9]{64}$/.test(file.patched) && Number.isInteger(file.mode) && file.mode >= 0 && file.mode <= 0o777)) {
     throw new Error("Invalid host-patch receipt; refusing to overwrite or restore host files.");
   }
 }
@@ -117,11 +122,14 @@ export function createHostPatcher(spec) {
       const info = await regularFile(root, path);
       const contents = await readFile(path);
       const currentHash = hash(contents);
+      const recorded = receipt?.files.find((file) => file.file === edit.file);
       if (currentHash === edit.sha256) {
         const patched = Buffer.from(spec.transform(contents.toString("utf8"), edit));
-        files.push({ ...edit, path, contents, patched, mode: info.mode & 0o777, current: "original" });
+        if (recorded && recorded.patched !== hash(patched)) {
+          throw new Error(`Patched file does not match this patch implementation: ${edit.file}`);
+        }
+        files.push({ ...edit, path, contents, patched, mode: recorded?.mode ?? (info.mode & 0o777), current: "original" });
       } else {
-        const recorded = receipt?.files.find((file) => file.file === edit.file);
         if (!recorded || recorded.patched !== currentHash) {
           throw new Error(`Host file has an unsupported build or local changes: ${edit.file}`);
         }
