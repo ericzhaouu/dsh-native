@@ -238,6 +238,9 @@ test("workflow keeps required Linux independent from Windows and uploads exact n
   assert.match(jobs.get("full-sdk-acceptance"), /DSH_RUN_ISOLATED_SDK_TRANSPORT: "1"/);
   assert.match(jobs.get("full-sdk-acceptance"), /DSH_CI_PRIVATE_ROOT:.*linux-node-\$\{\{ matrix.node \}\}/);
   assert.match(jobs.get("full-sdk-acceptance"), /DSH_CAMPAIGN_TEST_ROOT:.*linux-node-\$\{\{ matrix.node \}\}\/campaign-tests/);
+  assert.match(jobs.get("full-sdk-acceptance"), /DSH_CI_PRIVATE_ROOT: \$\{\{ runner.temp \}\}\//);
+  assert.match(jobs.get("full-sdk-acceptance"), /DSH_CAMPAIGN_TEST_ROOT: \$\{\{ runner.temp \}\}\//);
+  assert.doesNotMatch(jobs.get("full-sdk-acceptance"), /DSH_(?:CI_PRIVATE_ROOT|CAMPAIGN_TEST_ROOT):.*github.workspace/);
   assert.match(jobs.get("full-sdk-acceptance"), /artifacts\/release-evidence\/test-coverage\.json/);
   assert.doesNotMatch(jobs.get("full-sdk-windows-experimental"), /DSH_CAMPAIGN_TEST_ROOT|DSH_CI_PRIVATE_ROOT/);
   for (const key of ["full-sdk-acceptance", "full-sdk-windows-experimental"]) {
